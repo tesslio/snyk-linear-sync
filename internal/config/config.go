@@ -101,6 +101,18 @@ type DueDateConfig struct {
 	HighDays     int
 	MediumDays   int
 	LowDays      int
+
+	// MinRunway*Days optionally floor a computed due date at the ticket's
+	// own creation date plus N days, so a ticket is never born overdue.
+	// Due dates are normally derived from the Snyk detection timestamp, so
+	// the first ticket for a finding detected months ago would otherwise
+	// carry a due date already in the past — a true statement about SLA
+	// exposure, but a useless triage deadline. 0 (the default) disables the
+	// floor for that severity and preserves the historical behavior.
+	MinRunwayCriticalDays int
+	MinRunwayHighDays     int
+	MinRunwayMediumDays   int
+	MinRunwayLowDays      int
 }
 
 type SyncConfig struct {
@@ -175,10 +187,14 @@ func Load(args []string) (Config, error) {
 				AwaitingFix:   normalizeManagedLabel(getEnv("LINEAR_AWAITING_FIX_LABEL", defaultAwaitingFixLabel)),
 			},
 			Due: DueDateConfig{
-				CriticalDays: getEnvInt("LINEAR_DUE_DAYS_CRITICAL", defaultCriticalDueDays),
-				HighDays:     getEnvInt("LINEAR_DUE_DAYS_HIGH", defaultHighDueDays),
-				MediumDays:   getEnvInt("LINEAR_DUE_DAYS_MEDIUM", defaultMediumDueDays),
-				LowDays:      getEnvInt("LINEAR_DUE_DAYS_LOW", defaultLowDueDays),
+				CriticalDays:          getEnvInt("LINEAR_DUE_DAYS_CRITICAL", defaultCriticalDueDays),
+				HighDays:              getEnvInt("LINEAR_DUE_DAYS_HIGH", defaultHighDueDays),
+				MediumDays:            getEnvInt("LINEAR_DUE_DAYS_MEDIUM", defaultMediumDueDays),
+				LowDays:               getEnvInt("LINEAR_DUE_DAYS_LOW", defaultLowDueDays),
+				MinRunwayCriticalDays: getEnvInt("LINEAR_DUE_MIN_RUNWAY_CRITICAL", 0),
+				MinRunwayHighDays:     getEnvInt("LINEAR_DUE_MIN_RUNWAY_HIGH", 0),
+				MinRunwayMediumDays:   getEnvInt("LINEAR_DUE_MIN_RUNWAY_MEDIUM", 0),
+				MinRunwayLowDays:      getEnvInt("LINEAR_DUE_MIN_RUNWAY_LOW", 0),
 			},
 			ArchiveLookbackDays: getEnvInt("LINEAR_ARCHIVE_LOOKBACK_DAYS", defaultArchiveLookbackDays),
 		},
@@ -248,6 +264,19 @@ func (c Config) Validate() error {
 	}
 	if c.Linear.ArchiveLookbackDays <= 0 {
 		errs = append(errs, fmt.Errorf("LINEAR_ARCHIVE_LOOKBACK_DAYS must be > 0, got %d", c.Linear.ArchiveLookbackDays))
+	}
+	for _, runway := range []struct {
+		name string
+		days int
+	}{
+		{"LINEAR_DUE_MIN_RUNWAY_CRITICAL", c.Linear.Due.MinRunwayCriticalDays},
+		{"LINEAR_DUE_MIN_RUNWAY_HIGH", c.Linear.Due.MinRunwayHighDays},
+		{"LINEAR_DUE_MIN_RUNWAY_MEDIUM", c.Linear.Due.MinRunwayMediumDays},
+		{"LINEAR_DUE_MIN_RUNWAY_LOW", c.Linear.Due.MinRunwayLowDays},
+	} {
+		if runway.days < 0 {
+			errs = append(errs, fmt.Errorf("%s must be >= 0, got %d", runway.name, runway.days))
+		}
 	}
 
 	if len(errs) > 0 {

@@ -293,6 +293,133 @@ func TestNormalizeDescriptionForCompareTreatsLinearBoldRewriteAsEqual(t *testing
 	}
 }
 
+func TestApplyDueDateFloor(t *testing.T) {
+	dueCfg := config.DueDateConfig{
+		CriticalDays: 15, HighDays: 30, MediumDays: 45, LowDays: 90,
+		MinRunwayCriticalDays: 3, MinRunwayHighDays: 7, MinRunwayMediumDays: 14, MinRunwayLowDays: 21,
+	}
+	created := time.Date(2026, time.July, 10, 9, 30, 0, 0, time.UTC)
+
+	tests := []struct {
+		name      string
+		dueCfg    config.DueDateConfig
+		due       string
+		severity  string
+		createdAt time.Time
+		wantDue   string
+	}{
+		{"born-overdue raised to creation+runway", dueCfg, "2026-05-23", "low", created, "2026-07-31"},
+		{"future due date untouched", dueCfg, "2026-10-03", "low", created, "2026-10-03"},
+		{"due date exactly at floor untouched", dueCfg, "2026-07-31", "low", created, "2026-07-31"},
+		{"severity-scaled runway (critical)", dueCfg, "2026-05-30", "critical", created, "2026-07-13"},
+		{"no due date (awaiting fix) untouched", dueCfg, "", "high", created, ""},
+		{"zero createdAt disables floor", dueCfg, "2026-05-23", "low", time.Time{}, "2026-05-23"},
+		{"runway 0 (default) preserves current behavior", config.DueDateConfig{CriticalDays: 15, HighDays: 30, MediumDays: 45, LowDays: 90}, "2026-05-23", "low", created, "2026-05-23"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			desired := model.DesiredIssue{DueDate: tt.due, DueDateBase: tt.due, DueDateReason: "sla"}
+			applyDueDateFloor(&desired, tt.dueCfg, tt.severity, tt.createdAt)
+			if desired.DueDate != tt.wantDue {
+				t.Fatalf("DueDate = %q, want %q", desired.DueDate, tt.wantDue)
+			}
+			// Idempotence: the floor is a fixed date, so a second application
+			// (a later sync run) must not move it again.
+			applyDueDateFloor(&desired, tt.dueCfg, tt.severity, tt.createdAt)
+			if desired.DueDate != tt.wantDue {
+				t.Fatalf("DueDate after second application = %q, want %q (floor must be stable)", desired.DueDate, tt.wantDue)
+			}
+			if desired.DueDate != "" && desired.DueDateBase != desired.DueDate {
+				t.Fatalf("DueDateBase = %q, want %q (cache hash must track the floored value)", desired.DueDateBase, desired.DueDate)
+			}
+		})
+	}
+}
+
+// TestRunFloorsBornOverdueDueDates exercises both floor paths end to end:
+// a new ticket for an old finding is created with due = today + runway, and
+// a matched existing ticket with a stale (born-overdue) due date is re-dated
+// to its own creation date + runway.
+func TestRunFloorsBornOverdueDueDates(t *testing.T) {
+	cfg := config.Config{
+		Linear: config.LinearConfig{
+			Due: config.DueDateConfig{
+				CriticalDays: 15, HighDays: 30, MediumDays: 45, LowDays: 90,
+				MinRunwayCriticalDays: 3, MinRunwayHighDays: 7, MinRunwayMediumDays: 14, MinRunwayLowDays: 21,
+			},
+		},
+		Sync: config.SyncConfig{Workers: 1},
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	// Detected long ago: raw SLA due dates are deep in the past.
+	detected := time.Date(2026, time.January, 1, 12, 0, 0, 0, time.UTC)
+	snyk := fakeSnyk{
+		snapshot: model.SnykSnapshot{
+			Findings: []model.Finding{
+				{
+					Fingerprint: "snyk:project-a:issue-new",
+					SnykIssueID: "issue-new",
+					ProjectID:   "project-a",
+					IssueTitle:  "Old finding, first ticket",
+					Severity:    "low",
+					Status:      model.FindingOpen,
+					CreatedAt:   detected,
+				},
+				{
+					Fingerprint: "snyk:project-a:issue-matched",
+					SnykIssueID: "issue-matched",
+					ProjectID:   "project-a",
+					IssueTitle:  "Old finding, existing ticket",
+					Severity:    "low",
+					Status:      model.FindingOpen,
+					CreatedAt:   detected,
+				},
+			},
+			ProjectIDs: map[string]struct{}{"project-a": {}},
+		},
+	}
+	ticketCreated := time.Date(2026, time.July, 10, 9, 30, 0, 0, time.UTC)
+	linear := &fakeLinear{
+		snapshot: []model.ExistingIssue{
+			{
+				ID:          "existing-1",
+				Identifier:  "SEC-1",
+				Title:       "stale title",
+				Description: "old description",
+				StateName:   "Todo",
+				DueDate:     "2026-04-01",
+				Fingerprint: "snyk:project-a:issue-matched",
+				CreatedAt:   ticketCreated,
+			},
+		},
+	}
+
+	service := New(cfg, logger, snyk, linear, nil)
+	if _, err := service.Run(context.Background()); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if len(linear.created) != 1 {
+		t.Fatalf("created = %d, want 1", len(linear.created))
+	}
+	now := time.Now().UTC()
+	wantCreateDue := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC).AddDate(0, 0, 21).Format(time.DateOnly)
+	if got := linear.created[0].DueDate; got != wantCreateDue {
+		t.Fatalf("created due date = %q, want %q (today + 21d low runway, not the past SLA date)", got, wantCreateDue)
+	}
+
+	var matchedDue string
+	for _, u := range linear.updated {
+		if u.Fingerprint == "snyk:project-a:issue-matched" {
+			matchedDue = u.DueDate
+		}
+	}
+	if matchedDue != "2026-07-31" {
+		t.Fatalf("matched ticket due date = %q, want %q (ticket createdAt 2026-07-10 + 21d)", matchedDue, "2026-07-31")
+	}
+}
+
 func TestRunSkipsCachedUnchangedIssue(t *testing.T) {
 	cfg := config.Config{
 		Cache: config.CacheConfig{},

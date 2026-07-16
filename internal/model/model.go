@@ -107,6 +107,12 @@ type ExistingIssue struct {
 	ManagedLabels []string
 	Labels        []IssueLabel
 	Priority      int
+	// CreatedAt is the ticket's own creation time in Linear (distinct from
+	// the Snyk finding's detection time). It anchors the optional due-date
+	// floor: ticket creation + minimum runway is a fixed date, so flooring
+	// against it never churns, unlike the historical floor-to-today. Zero
+	// when the source did not provide it; the floor is skipped then.
+	CreatedAt time.Time
 	// ArchivedAt is non-nil when the issue has been auto-archived by Linear.
 	// Archived issues are excluded from the default Linear API response; the
 	// sync includes them (via includeArchived: true) filtered to those

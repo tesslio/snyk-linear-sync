@@ -288,6 +288,20 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 
 		}
 
+		// Minimum-runway due-date floor (opt-in, LINEAR_DUE_MIN_RUNWAY_*).
+		// Applied last so it also lifts the sticky/kept due dates above, and
+		// only for non-terminal desired states — a ticket being resolved does
+		// not need its due date rewritten on the way out. Runs after all
+		// other due-date decisions and before hashing so the cache sees the
+		// final value.
+		if isNonTerminalModelState(desired.State) {
+			floorBase := time.Now()
+			if matched {
+				floorBase = existing.CreatedAt
+			}
+			applyDueDateFloor(&desired, s.cfg.Linear.Due, finding.Severity, floorBase)
+		}
+
 		desiredByFingerprint[finding.Fingerprint] = desired
 		snykHashes[finding.Fingerprint] = desiredIssueHash(desired)
 		if matched {
@@ -1175,6 +1189,58 @@ func issueDueDateFromFixAvailability(dueCfg config.DueDateConfig, finding model.
 	reason := fmt.Sprintf("%s severity SLA: %d days from fix availability", severityName, days)
 
 	return dueDateStr, dueDateStr, reason
+}
+
+// severityMinRunwayDays returns the configured minimum-runway day count for a
+// severity, or 0 when the floor is disabled for it. Sibling of
+// severitySLADays.
+func severityMinRunwayDays(dueCfg config.DueDateConfig, severity string) int {
+	switch issuePriority(severity) {
+	case 1:
+		return dueCfg.MinRunwayCriticalDays
+	case 2:
+		return dueCfg.MinRunwayHighDays
+	case 3:
+		return dueCfg.MinRunwayMediumDays
+	case 4:
+		return dueCfg.MinRunwayLowDays
+	default:
+		return 0
+	}
+}
+
+// applyDueDateFloor raises a due date that would be in the past relative to
+// the ticket's own creation, so a ticket is never born overdue. Due dates
+// derive from the Snyk detection timestamp; the first ticket for a finding
+// detected months ago is otherwise created already past its SLA — a true
+// statement about exposure, but a useless triage deadline.
+//
+// The floor is ticket creation + severity minimum runway: a FIXED date, so
+// repeated runs compute the same value and nothing churns (the historical
+// floor-to-today advanced daily and was removed for exactly that reason).
+// For not-yet-created tickets the caller passes now, which equals the
+// creation date the ticket is about to get; for matched tickets it passes
+// the ticket's Linear createdAt. A zero ticketCreatedAt (source did not
+// provide one) disables the floor rather than risking a moving base.
+// Tickets whose due date is already at or past the floor, tickets with no
+// due date (awaiting-fix), and severities with runway 0 are untouched.
+func applyDueDateFloor(desired *model.DesiredIssue, dueCfg config.DueDateConfig, severity string, ticketCreatedAt time.Time) {
+	if desired.DueDate == "" || ticketCreatedAt.IsZero() {
+		return
+	}
+	runway := severityMinRunwayDays(dueCfg, severity)
+	if runway <= 0 {
+		return
+	}
+	createdUTC := ticketCreatedAt.UTC()
+	floor := time.Date(createdUTC.Year(), createdUTC.Month(), createdUTC.Day(), 0, 0, 0, 0, time.UTC).
+		AddDate(0, 0, runway).Format(time.DateOnly)
+	if desired.DueDate >= floor {
+		return
+	}
+	desired.DueDate = floor
+	desired.DueDateBase = floor
+	desired.DueDateReason = fmt.Sprintf("%s; floored to ticket creation + %d day minimum runway", desired.DueDateReason, runway)
 }
 
 // pendingTerminalTransition reports whether the issue still needs to move into

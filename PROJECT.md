@@ -236,6 +236,16 @@ Default offsets:
 - medium: 45 days
 - low: 90 days
 
+An optional minimum-runway floor (`LINEAR_DUE_MIN_RUNWAY_CRITICAL` / `_HIGH` /
+`_MEDIUM` / `_LOW`, default 0 = disabled) prevents tickets from being born
+overdue: the effective due date is never earlier than the ticket's own Linear
+creation date plus the configured runway. The floor is anchored to the
+ticket's fixed creation date, not to "today", so repeated runs compute the
+same value and nothing churns. Findings whose SLA date is already in the
+future, tickets with no due date (awaiting fix), and severities with runway 0
+are unaffected; the raw detection-based SLA date remains visible in the
+ticket body.
+
 ## Performance Model
 
 The project is designed for thousands of issues.

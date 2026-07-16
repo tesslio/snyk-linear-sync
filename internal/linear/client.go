@@ -48,6 +48,7 @@ type linearIssueNode struct {
 	URL         string  `json:"url"`
 	Priority    int     `json:"priority"`
 	DueDate     *string `json:"dueDate"`
+	CreatedAt   *string `json:"createdAt"`
 	ArchivedAt  *string `json:"archivedAt"`
 	State       struct {
 		ID   string `json:"id"`
@@ -120,6 +121,7 @@ query issueByIdentifier($filter: IssueFilter!) {
       url
       priority
       dueDate
+      createdAt
       archivedAt
       state {
         id
@@ -186,6 +188,12 @@ func linearIssueToModel(issue linearIssueNode) model.ExistingIssue {
 			Name: label.Name,
 		})
 	}
+	var createdAt time.Time
+	if issue.CreatedAt != nil && *issue.CreatedAt != "" {
+		if t, err := time.Parse(time.RFC3339, *issue.CreatedAt); err == nil {
+			createdAt = t
+		}
+	}
 	var archivedAt *time.Time
 	if issue.ArchivedAt != nil && *issue.ArchivedAt != "" {
 		if t, err := time.Parse(time.RFC3339, *issue.ArchivedAt); err == nil {
@@ -205,6 +213,7 @@ func linearIssueToModel(issue linearIssueNode) model.ExistingIssue {
 		Fingerprint:   extractFingerprint(description),
 		ManagedLabels: extractManagedLabels(description),
 		Labels:        labels,
+		CreatedAt:     createdAt,
 		ArchivedAt:    archivedAt,
 	}
 }
@@ -599,6 +608,7 @@ query existingIssues($filter: IssueFilter!, $after: String) {
       url
       priority
       dueDate
+      createdAt
       archivedAt
       state {
         id

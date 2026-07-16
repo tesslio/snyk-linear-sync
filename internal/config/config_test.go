@@ -66,6 +66,18 @@ func TestLoadDefaultsAndValidation(t *testing.T) {
 	if cfg.Linear.Due.LowDays != defaultLowDueDays {
 		t.Fatalf("Low due days = %d, want %d", cfg.Linear.Due.LowDays, defaultLowDueDays)
 	}
+	// The due-date floor defaults to disabled (0) for every severity so the
+	// historical behavior is preserved unless explicitly configured.
+	for name, got := range map[string]int{
+		"MinRunwayCriticalDays": cfg.Linear.Due.MinRunwayCriticalDays,
+		"MinRunwayHighDays":     cfg.Linear.Due.MinRunwayHighDays,
+		"MinRunwayMediumDays":   cfg.Linear.Due.MinRunwayMediumDays,
+		"MinRunwayLowDays":      cfg.Linear.Due.MinRunwayLowDays,
+	} {
+		if got != 0 {
+			t.Fatalf("%s = %d, want 0 (floor disabled by default)", name, got)
+		}
+	}
 	if cfg.Sync.Workers != defaultWorkerCount {
 		t.Fatalf("Workers = %d, want %d", cfg.Sync.Workers, defaultWorkerCount)
 	}
@@ -90,6 +102,19 @@ func TestLoadRequiresCredentials(t *testing.T) {
 
 	if _, err := Load(nil); err == nil {
 		t.Fatal("Load() error = nil, want validation error")
+	}
+}
+
+func TestLoadRejectsNegativeMinRunway(t *testing.T) {
+	t.Setenv("SNYK_CLIENT_ID", "client-id")
+	t.Setenv("SNYK_CLIENT_SECRET", "client-secret")
+	t.Setenv("SNYK_ORG_ID", "org-id")
+	t.Setenv("LINEAR_API_KEY", "linear-key")
+	t.Setenv("LINEAR_TEAM_ID", "team-id")
+	t.Setenv("LINEAR_DUE_MIN_RUNWAY_HIGH", "-1")
+
+	if _, err := Load(nil); err == nil {
+		t.Fatal("Load() error = nil, want negative min-runway validation error")
 	}
 }
 
