@@ -265,17 +265,27 @@ func (c Config) Validate() error {
 	if c.Linear.ArchiveLookbackDays <= 0 {
 		errs = append(errs, fmt.Errorf("LINEAR_ARCHIVE_LOOKBACK_DAYS must be > 0, got %d", c.Linear.ArchiveLookbackDays))
 	}
+	// Runway must stay within the severity's SLA window: that bound is what
+	// guarantees the floor can only ever raise born-overdue due dates — a
+	// ticket that received its full SLA window always has due >= creation +
+	// SLA >= creation + runway, so it is mathematically out of the floor's
+	// reach. A runway above the SLA would also hand freshly-detected
+	// findings a later deadline than the SLA itself promises.
 	for _, runway := range []struct {
-		name string
-		days int
+		name    string
+		days    int
+		slaName string
+		slaDays int
 	}{
-		{"LINEAR_DUE_MIN_RUNWAY_CRITICAL", c.Linear.Due.MinRunwayCriticalDays},
-		{"LINEAR_DUE_MIN_RUNWAY_HIGH", c.Linear.Due.MinRunwayHighDays},
-		{"LINEAR_DUE_MIN_RUNWAY_MEDIUM", c.Linear.Due.MinRunwayMediumDays},
-		{"LINEAR_DUE_MIN_RUNWAY_LOW", c.Linear.Due.MinRunwayLowDays},
+		{"LINEAR_DUE_MIN_RUNWAY_CRITICAL", c.Linear.Due.MinRunwayCriticalDays, "LINEAR_DUE_DAYS_CRITICAL", c.Linear.Due.CriticalDays},
+		{"LINEAR_DUE_MIN_RUNWAY_HIGH", c.Linear.Due.MinRunwayHighDays, "LINEAR_DUE_DAYS_HIGH", c.Linear.Due.HighDays},
+		{"LINEAR_DUE_MIN_RUNWAY_MEDIUM", c.Linear.Due.MinRunwayMediumDays, "LINEAR_DUE_DAYS_MEDIUM", c.Linear.Due.MediumDays},
+		{"LINEAR_DUE_MIN_RUNWAY_LOW", c.Linear.Due.MinRunwayLowDays, "LINEAR_DUE_DAYS_LOW", c.Linear.Due.LowDays},
 	} {
 		if runway.days < 0 {
 			errs = append(errs, fmt.Errorf("%s must be >= 0, got %d", runway.name, runway.days))
+		} else if runway.days > runway.slaDays {
+			errs = append(errs, fmt.Errorf("%s (%d) must not exceed %s (%d)", runway.name, runway.days, runway.slaName, runway.slaDays))
 		}
 	}
 

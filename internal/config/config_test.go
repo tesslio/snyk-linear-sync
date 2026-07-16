@@ -118,6 +118,24 @@ func TestLoadRejectsNegativeMinRunway(t *testing.T) {
 	}
 }
 
+// TestLoadRejectsMinRunwayAboveSLA guards the invariant that makes the floor
+// safe for existing tickets: with runway <= SLA days, a ticket that received
+// its full SLA window can never be floored, so enabling the floor only ever
+// re-dates born-overdue tickets.
+func TestLoadRejectsMinRunwayAboveSLA(t *testing.T) {
+	t.Setenv("SNYK_CLIENT_ID", "client-id")
+	t.Setenv("SNYK_CLIENT_SECRET", "client-secret")
+	t.Setenv("SNYK_ORG_ID", "org-id")
+	t.Setenv("LINEAR_API_KEY", "linear-key")
+	t.Setenv("LINEAR_TEAM_ID", "team-id")
+	t.Setenv("LINEAR_DUE_DAYS_CRITICAL", "15")
+	t.Setenv("LINEAR_DUE_MIN_RUNWAY_CRITICAL", "16")
+
+	if _, err := Load(nil); err == nil {
+		t.Fatal("Load() error = nil, want runway-exceeds-SLA validation error")
+	}
+}
+
 func TestSplitCSV(t *testing.T) {
 	got := splitCSV("  a, b ,,c ")
 	want := []string{"a", "b", "c"}
