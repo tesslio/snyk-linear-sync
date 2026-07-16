@@ -288,6 +288,22 @@ func TestExtractFingerprintPrefersMetadataBlock(t *testing.T) {
 	}
 }
 
+// TestExtractFingerprintCanonicalizesLinearMangledMarkdown reproduces the
+// stored form observed via the live Linear API: the sync wrote a fingerprint
+// containing "__main__.py" and Linear's editor re-serialized it inside the
+// metadata comment as "**main**.py". Extraction must return the canonical
+// form or the ticket can never be matched again (hourly close-and-recreate
+// flapping).
+func TestExtractFingerprintCanonicalizesLinearMangledMarkdown(t *testing.T) {
+	description := "## Path Traversal [LOW]\n\nFile: [sim/**main**.py (line 92:17-21)](<https://github.com/example/repo/blob/abc/sim/__main__.py#L92>)\n\n<!-- snyk-linear-sync\nfingerprint: snyk:project-a:issue-1:sim/**main**.py\nmanaged_labels: snyk-automation,snyk-code\n-->"
+
+	got := extractFingerprint(description)
+
+	if want := "snyk:project-a:issue-1:sim/__main__.py"; got != want {
+		t.Fatalf("extractFingerprint() = %q, want %q", got, want)
+	}
+}
+
 func TestExtractManagedLabelsSupportsLegacyAndNewMetadata(t *testing.T) {
 	if got := extractManagedLabels("<!-- snyk-linear-sync\nmanaged_label: snyk-automation\n-->"); !slices.Equal(got, []string{"snyk-automation"}) {
 		t.Fatalf("extractManagedLabels(legacy) = %#v", got)

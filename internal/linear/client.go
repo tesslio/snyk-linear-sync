@@ -796,14 +796,18 @@ func (c *Client) teamRef() string {
 	return c.cfg.TeamID
 }
 
+// extractFingerprint returns the canonical form of the stored fingerprint:
+// Linear's editor rewrites markdown-equivalent sequences inside the stored
+// description (e.g. __main__.py becomes **main**.py), so the raw stored
+// value cannot be compared against computed fingerprints directly.
 func extractFingerprint(description string) string {
 	for line := range metadataBlockLines(description) {
 		trimmed := strings.TrimSpace(line)
 		if after, ok := strings.CutPrefix(trimmed, "fingerprint:"); ok {
-			return strings.TrimSpace(after)
+			return model.CanonicalFingerprint(strings.TrimSpace(after))
 		}
 		if after, ok := strings.CutPrefix(trimmed, "Fingerprint:"); ok {
-			return strings.TrimSpace(after)
+			return model.CanonicalFingerprint(strings.TrimSpace(after))
 		}
 	}
 	return ""

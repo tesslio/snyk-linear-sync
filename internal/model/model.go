@@ -2,6 +2,7 @@ package model
 
 import (
 	"fmt"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -228,7 +229,33 @@ func Fingerprint(projectID, issueID, locationKey string) string {
 	if locationKey == "" {
 		return fmt.Sprintf("snyk:%s:%s", projectID, issueID)
 	}
-	return fmt.Sprintf("snyk:%s:%s:%s", projectID, issueID, locationKey)
+	return CanonicalFingerprint(fmt.Sprintf("snyk:%s:%s:%s", projectID, issueID, locationKey))
+}
+
+// fingerprintEscapePattern matches the backslash escapes Linear's markdown
+// serializer inserts before punctuation. Mirrors markdownEscapePattern in
+// internal/sync.
+var fingerprintEscapePattern = regexp.MustCompile(`\\([\\` + "`" + `*_{}\[\]()#+\-.!~])`)
+
+// CanonicalFingerprint returns the fingerprint in the canonical form used
+// for matching. Linear round-trips issue descriptions through its rich-text
+// editor, which rewrites markdown-equivalent character sequences even inside
+// the HTML-comment metadata block: __x__ (bold) is re-serialized as **x**,
+// _x_ (italic) as *x*, and punctuation may gain backslash escapes. A stored
+// fingerprint whose location segment contains such a sequence (e.g. a Python
+// __main__.py path) therefore reads back different from what the sync wrote
+// and never matches the fingerprint computed from the live Snyk finding, so
+// every run closes the "orphaned" ticket and creates a fresh copy.
+//
+// Canonicalization makes matching immune to the rewrite: backslash escapes
+// are stripped and every '*' becomes '_'. Asterisks do not occur in real
+// file paths or package@version identities, so the mapping loses nothing,
+// and it is applied symmetrically — to computed fingerprints on construction
+// and to stored fingerprints on read — so even a location that genuinely
+// contained '*' would still compare equal.
+func CanonicalFingerprint(fingerprint string) string {
+	fingerprint = fingerprintEscapePattern.ReplaceAllString(fingerprint, "$1")
+	return strings.ReplaceAll(fingerprint, "*", "_")
 }
 
 // CoarseFingerprint returns the 2-segment snyk:<projectID>:<issueID> prefix

@@ -138,6 +138,15 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 		slog.Int("existing_issues", len(existingIssues)),
 	)
 
+	// Stored fingerprints are canonicalized before any comparison: Linear's
+	// editor rewrites markdown-equivalent sequences in stored descriptions
+	// (e.g. __main__.py becomes **main**.py), and computed fingerprints are
+	// canonical by construction. extractFingerprint already canonicalizes,
+	// but this pass also covers issues arriving from any other source.
+	for i := range existingIssues {
+		existingIssues[i].Fingerprint = model.CanonicalFingerprint(existingIssues[i].Fingerprint)
+	}
+
 	existingByFingerprint := map[string]model.ExistingIssue{}
 	// existingByCoarseFingerprint indexes non-terminal tickets by their coarse
 	// (location-stripped) fingerprint. It is used only for migration: when a
@@ -1330,6 +1339,11 @@ func normalizeDescriptionForCompare(description string) string {
 	description = strings.TrimSpace(strings.ReplaceAll(description, "\r\n", "\n"))
 	description = linearAutoLinkPattern.ReplaceAllString(description, "[$1]($2)")
 	description = markdownEscapePattern.ReplaceAllString(description, "$1")
+	// Linear re-serializes underscore emphasis as asterisks (__x__ -> **x**,
+	// _x_ -> *x*). Mapping '*' to '_' on both sides makes the written and
+	// stored forms compare equal; it can only ever suppress a spurious
+	// difference, never hide a real one, because it is applied to both sides.
+	description = strings.ReplaceAll(description, "*", "_")
 	description = strings.ReplaceAll(description, "DO NOT EDIT OR REMOVE THIS BLOCK. Used by snyk-linear-sync for deduplication.", "__SNYK_LINEAR_METADATA_WARNING__")
 	description = strings.ReplaceAll(description, "DO NOT EDIT, REMOVE, OR REFORMAT THIS BLOCK. It is required by snyk-linear-sync for deduplication and safe updates.", "__SNYK_LINEAR_METADATA_WARNING__")
 	return description

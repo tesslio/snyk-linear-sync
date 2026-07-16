@@ -201,6 +201,98 @@ func TestRunPlansCreateUpdateAndResolve(t *testing.T) {
 	}
 }
 
+// TestRunMatchesFingerprintMangledByLinearMarkdown is the regression test
+// for the hourly close-and-recreate loop: Linear's editor rewrites the
+// stored fingerprint's "__main__.py" as "**main**.py", so without
+// canonicalization the open ticket never matches the live finding — every
+// run resolves the "orphaned" ticket and creates a fresh copy. With
+// canonicalization the mangled ticket must match: no create, no resolve.
+func TestRunMatchesFingerprintMangledByLinearMarkdown(t *testing.T) {
+	cfg := config.Config{
+		Linear: config.LinearConfig{
+			Due: config.DueDateConfig{
+				CriticalDays: 15,
+				HighDays:     30,
+				MediumDays:   45,
+				LowDays:      90,
+			},
+		},
+		Sync: config.SyncConfig{
+			Workers: 1,
+		},
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	snyk := fakeSnyk{
+		snapshot: model.SnykSnapshot{
+			Findings: []model.Finding{
+				{
+					Fingerprint: model.Fingerprint("project-a", "issue-1", "sim/__main__.py"),
+					SnykIssueID: "issue-1",
+					ProjectID:   "project-a",
+					ProjectName: "Project A",
+					IssueTitle:  "Path Traversal",
+					Severity:    "low",
+					Status:      model.FindingOpen,
+					IssueURL:    "https://example.test/issue-1",
+					CreatedAt:   time.Date(2026, time.July, 5, 14, 0, 0, 0, time.UTC),
+				},
+			},
+			ProjectIDs: map[string]struct{}{
+				"project-a": {},
+			},
+		},
+	}
+	linear := &fakeLinear{
+		snapshot: []model.ExistingIssue{
+			{
+				ID:          "existing-1",
+				Identifier:  "SEC-1",
+				Title:       "stale title",
+				Description: "old description",
+				StateName:   "Todo",
+				// Stored form as returned by the Linear API after its
+				// markdown round-trip mangled the written __main__.py.
+				Fingerprint: "snyk:project-a:issue-1:sim/**main**.py",
+			},
+		},
+	}
+
+	service := New(cfg, logger, snyk, linear, nil)
+
+	result, err := service.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if result.PlannedCreates != 0 {
+		t.Fatalf("PlannedCreates = %d, want 0 (mangled fingerprint must match existing ticket)", result.PlannedCreates)
+	}
+	if result.PlannedResolves != 0 {
+		t.Fatalf("PlannedResolves = %d, want 0 (matched ticket must not be resolved as missing)", result.PlannedResolves)
+	}
+	if len(linear.created) != 0 {
+		t.Fatalf("created = %d, want 0", len(linear.created))
+	}
+	if containsDesiredState(linear.updated, model.StateDone) {
+		t.Fatalf("updated states = %#v, matched open ticket must not be transitioned to Done", desiredStates(linear.updated))
+	}
+}
+
+// TestNormalizeDescriptionForCompareTreatsLinearBoldRewriteAsEqual verifies
+// that a description written with underscore emphasis compares equal to the
+// asterisk form Linear stores, so re-matched tickets do not trigger a
+// description rewrite on every run.
+func TestNormalizeDescriptionForCompareTreatsLinearBoldRewriteAsEqual(t *testing.T) {
+	written := "File: sim/__main__.py\n\n<!-- snyk-linear-sync\nfingerprint: snyk:p:i:sim/__main__.py\n-->"
+	stored := "File: sim/**main**.py\n\n<!-- snyk-linear-sync\nfingerprint: snyk:p:i:sim/**main**.py\n-->"
+
+	if normalizeDescriptionForCompare(written) != normalizeDescriptionForCompare(stored) {
+		t.Fatalf("normalizeDescriptionForCompare: written and Linear-stored forms should compare equal\nwritten: %q\nstored:  %q",
+			normalizeDescriptionForCompare(written), normalizeDescriptionForCompare(stored))
+	}
+}
+
 func TestRunSkipsCachedUnchangedIssue(t *testing.T) {
 	cfg := config.Config{
 		Cache: config.CacheConfig{},
