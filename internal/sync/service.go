@@ -16,9 +16,9 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
-	"github.com/RichardoC/snyk-linear-sync/internal/cache"
-	"github.com/RichardoC/snyk-linear-sync/internal/config"
-	"github.com/RichardoC/snyk-linear-sync/internal/model"
+	"github.com/tesslio/snyk-linear-sync/internal/cache"
+	"github.com/tesslio/snyk-linear-sync/internal/config"
+	"github.com/tesslio/snyk-linear-sync/internal/model"
 )
 
 type SnykClient interface {

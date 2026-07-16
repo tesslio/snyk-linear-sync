@@ -7,8 +7,11 @@ This project exists to keep Linear aligned with Snyk.
 Canonical module path:
 
 ```text
-github.com/RichardoC/snyk-linear-sync
+github.com/tesslio/snyk-linear-sync
 ```
+
+This repository is a detached operational copy of
+github.com/RichardoC/snyk-linear-sync; fixes are contributed back upstream.
 
 The intended outcome is:
 

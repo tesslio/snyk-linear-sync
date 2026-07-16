@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/RichardoC/snyk-linear-sync/internal/cache"
-	"github.com/RichardoC/snyk-linear-sync/internal/model"
+	"github.com/tesslio/snyk-linear-sync/internal/cache"
+	"github.com/tesslio/snyk-linear-sync/internal/model"
 )
 
 func TestMapStatusTemporaryIgnoreOpen(t *testing.T) {

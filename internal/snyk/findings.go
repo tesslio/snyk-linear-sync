@@ -14,8 +14,8 @@ import (
 
 	snyksdk "github.com/pavel-snyk/snyk-sdk-go/v2/snyk"
 
-	"github.com/RichardoC/snyk-linear-sync/internal/cache"
-	"github.com/RichardoC/snyk-linear-sync/internal/model"
+	"github.com/tesslio/snyk-linear-sync/internal/cache"
+	"github.com/tesslio/snyk-linear-sync/internal/model"
 )
 
 type projectRef struct {

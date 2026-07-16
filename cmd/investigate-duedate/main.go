@@ -10,13 +10,13 @@ import (
 	"strings"
 	"time"
 
-	"github.com/RichardoC/snyk-linear-sync/internal/cache"
-	"github.com/RichardoC/snyk-linear-sync/internal/config"
-	linearclient "github.com/RichardoC/snyk-linear-sync/internal/linear"
-	"github.com/RichardoC/snyk-linear-sync/internal/logx"
-	"github.com/RichardoC/snyk-linear-sync/internal/model"
-	snykclient "github.com/RichardoC/snyk-linear-sync/internal/snyk"
-	syncsvc "github.com/RichardoC/snyk-linear-sync/internal/sync"
+	"github.com/tesslio/snyk-linear-sync/internal/cache"
+	"github.com/tesslio/snyk-linear-sync/internal/config"
+	linearclient "github.com/tesslio/snyk-linear-sync/internal/linear"
+	"github.com/tesslio/snyk-linear-sync/internal/logx"
+	"github.com/tesslio/snyk-linear-sync/internal/model"
+	snykclient "github.com/tesslio/snyk-linear-sync/internal/snyk"
+	syncsvc "github.com/tesslio/snyk-linear-sync/internal/sync"
 )
 
 func main() {
