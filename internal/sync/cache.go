@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/RichardoC/snyk-linear-sync/internal/model"
+	"github.com/tesslio/snyk-linear-sync/internal/model"
 )
 
 const metadataSchemaVersion = "2026-06-30-issue-details-v2"

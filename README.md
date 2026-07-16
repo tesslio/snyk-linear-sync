@@ -5,7 +5,7 @@ Sync Snyk findings with Linear issues since there isn't an official integration.
 Repo:
 
 ```text
-github.com/RichardoC/snyk-linear-sync
+github.com/tesslio/snyk-linear-sync
 ```
 
 ## What It Does
@@ -37,13 +37,13 @@ Quickstart without cloning:
 Create a local `.env`, then run directly with the repo path:
 
 ```bash
-go run github.com/RichardoC/snyk-linear-sync/cmd/snyk-linear-sync@latest --env-file .env --dry-run
+go run github.com/tesslio/snyk-linear-sync/cmd/snyk-linear-sync@latest --env-file .env --dry-run
 ```
 
 Or install the binary:
 
 ```bash
-go install github.com/RichardoC/snyk-linear-sync/cmd/snyk-linear-sync@latest
+go install github.com/tesslio/snyk-linear-sync/cmd/snyk-linear-sync@latest
 snyk-linear-sync --env-file .env --dry-run
 ```
 

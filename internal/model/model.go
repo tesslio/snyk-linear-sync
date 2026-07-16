@@ -53,7 +53,7 @@ type Finding struct {
 
 	// Issue detail fields surfaced from the Snyk REST issue resource so
 	// consumers of the Linear ticket do not each need Snyk API credentials.
-	// See https://github.com/RichardoC/snyk-linear-sync/issues/26.
+	// See https://github.com/tesslio/snyk-linear-sync/issues/26.
 	Classes           []IssueClass
 	CVEs              []string
 	Description       string

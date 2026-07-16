@@ -14,9 +14,9 @@ import (
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/clientcredentials"
 
-	"github.com/RichardoC/snyk-linear-sync/internal/cache"
-	"github.com/RichardoC/snyk-linear-sync/internal/config"
-	"github.com/RichardoC/snyk-linear-sync/internal/httpx"
+	"github.com/tesslio/snyk-linear-sync/internal/cache"
+	"github.com/tesslio/snyk-linear-sync/internal/config"
+	"github.com/tesslio/snyk-linear-sync/internal/httpx"
 )
 
 const issuesAPIVersion = "2024-10-15"

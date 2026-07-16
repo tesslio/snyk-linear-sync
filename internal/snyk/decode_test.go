@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/RichardoC/snyk-linear-sync/internal/model"
+	"github.com/tesslio/snyk-linear-sync/internal/model"
 )
 
 // TestFindingFromIssueDecodesRealIssueShape is the decode-layer guard that
