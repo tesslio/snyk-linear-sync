@@ -1040,7 +1040,20 @@ func parseIssueTimestamp(raw string) time.Time {
 }
 
 func mapStatus(issue issueAttributes, ignoreExpiresAt time.Time, disregardIfFixable bool) model.FindingStatus {
-	if issue.Ignored {
+	resolutionType := strings.ToLower(issue.Resolution.Type)
+	resolutionDetails := strings.ToLower(issue.Resolution.Details)
+	status := strings.ToLower(issue.Status)
+
+	// A finding Snyk no longer reports (resolved/fixed/disappeared) is terminal,
+	// full stop — ignores only matter for findings that still exist. This check
+	// must precede the ignore handling below: a resolved finding can still carry
+	// an ignore (active, expired, or disregard-if-fixable), and letting the
+	// ignore branches win would map a vulnerability that is already gone to a
+	// non-terminal state, resurrecting it as a permanently-open (and often
+	// birth-overdue) ticket.
+	resolved := status == "resolved" || status == "fixed" || coordinateResolved(issue.Coordinates) || resolutionType == "fixed"
+
+	if issue.Ignored && !resolved {
 		// "Ignore until a fix is available" maps to FindingAwaitingFix so the
 		// sync places the issue in Backlog with no due date, signalling that the
 		// issue is blocked on an upstream fix. When a fix appears, Snyk flips
@@ -1065,14 +1078,10 @@ func mapStatus(issue issueAttributes, ignoreExpiresAt time.Time, disregardIfFixa
 		return model.FindingIgnored
 	}
 
-	resolutionType := strings.ToLower(issue.Resolution.Type)
-	resolutionDetails := strings.ToLower(issue.Resolution.Details)
-	status := strings.ToLower(issue.Status)
-
 	switch {
 	case strings.Contains(resolutionType, "snooz") || strings.Contains(resolutionDetails, "snooz"):
 		return model.FindingSnoozed
-	case status == "resolved" || status == "fixed" || coordinateResolved(issue.Coordinates) || resolutionType == "fixed":
+	case resolved:
 		return model.FindingFixed
 	default:
 		return model.FindingOpen

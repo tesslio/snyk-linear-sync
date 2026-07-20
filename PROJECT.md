@@ -198,12 +198,14 @@ The current workflow mapping is:
 - `ignored until fix available` (disregardIfFixable) -> `Backlog` (no due date, `triage-dependency` label)
 - `temporarily ignored` (snoozed with future expiry) -> `Todo`
 - `permanently ignored` -> `Cancelled`
-- `fixed` -> `Done`
+- `fixed` (or `resolved`/disappeared) -> `Done`
 - missing finding in an existing active Snyk project -> `Done`
 - missing finding because the Snyk project no longer exists -> `Cancelled`
 - Snyk project is inactive (de-activated) -> `Cancelled`
 
 The sync also normalizes workflow naming differences such as `Canceled` vs `Cancelled`.
+
+Resolution takes precedence over ignore state: if Snyk reports a finding as resolved (status `resolved`/`fixed`, resolution `fixed`, or all coordinates resolved), it maps to `Done` even when the finding still carries an ignore. The ignore branches (`until fix available`, `temporarily ignored`, `permanently ignored`) apply only to findings that still exist in Snyk. Without this precedence, a resolved finding that still has an active or expired ignore would map to a non-terminal state and resurface as a permanently-open, birth-overdue ticket for a vulnerability that no longer exists.
 
 The `ignored until fix available` state is distinct from other ignored states because the ignore is conditional on an upstream fix. These issues are placed in `Backlog` with no due date and the `triage-dependency` label (configurable via `LINEAR_AWAITING_FIX_LABEL`). The description renders `Status: ignored (no fix available)` so the Snyk-side reality is visible in Linear. When a fix becomes available, Snyk flips `ignored=false` and the next run moves the issue to `Todo` with a recalculated due date.
 
