@@ -106,6 +106,120 @@ func TestMapStatusDisregardIfFixableTakesPrecedenceOverExpiry(t *testing.T) {
 	}
 }
 
+func TestMapStatusResolvedIgnoredWithExpiryIsFixed(t *testing.T) {
+	// A finding Snyk reports as resolved must be terminal even when it still
+	// carries an ignore with an expiry. Without the resolved-first check this
+	// hit the expired-snooze branch and returned FindingOpen, producing an
+	// open (and immediately overdue) ticket for a vulnerability that no longer
+	// exists.
+	past := time.Now().Add(-24 * time.Hour)
+	issue := issueAttributes{
+		Ignored:    true,
+		Status:     "resolved",
+		Resolution: resolution{Type: "disappeared"},
+	}
+	got := mapStatus(issue, past, false)
+	if got != model.FindingFixed {
+		t.Fatalf("mapStatus() = %q, want %q for resolved finding with expired ignore", got, model.FindingFixed)
+	}
+}
+
+func TestMapStatusResolvedIgnoredActiveSnoozeIsFixed(t *testing.T) {
+	// An active (future-dated) snooze must not keep a resolved finding open
+	// either — the finding is gone regardless of the snooze window.
+	future := time.Now().Add(24 * time.Hour)
+	issue := issueAttributes{
+		Ignored:    true,
+		Status:     "resolved",
+		Resolution: resolution{Type: "disappeared"},
+	}
+	got := mapStatus(issue, future, false)
+	if got != model.FindingFixed {
+		t.Fatalf("mapStatus() = %q, want %q for resolved finding with active snooze", got, model.FindingFixed)
+	}
+}
+
+func TestMapStatusResolvedIgnoredDisregardIfFixableIsFixed(t *testing.T) {
+	// disregard-if-fixable normally routes to FindingAwaitingFix (Backlog), a
+	// non-terminal state. A resolved finding must still be terminal: the vuln
+	// disappeared, so it is no longer awaiting anything.
+	issue := issueAttributes{
+		Ignored:    true,
+		Status:     "resolved",
+		Resolution: resolution{Type: "disappeared"},
+	}
+	got := mapStatus(issue, time.Time{}, true)
+	if got != model.FindingFixed {
+		t.Fatalf("mapStatus() = %q, want %q for resolved finding with disregard-if-fixable ignore", got, model.FindingFixed)
+	}
+}
+
+func TestMapStatusResolvedCoordinatesIgnoredIsFixed(t *testing.T) {
+	// The resolved signal can come from the coordinates alone (all resolved),
+	// with an empty top-level status. That must also override an ignore.
+	past := time.Now().Add(-24 * time.Hour)
+	issue := issueAttributes{
+		Ignored: true,
+		Coordinates: []coordinate{
+			{State: "resolved"},
+			{State: "resolved"},
+		},
+	}
+	got := mapStatus(issue, past, false)
+	if got != model.FindingFixed {
+		t.Fatalf("mapStatus() = %q, want %q for finding with all coordinates resolved and an ignore", got, model.FindingFixed)
+	}
+}
+
+func TestMapStatusIgnoredWithUnresolvedCoordinateStaysOpen(t *testing.T) {
+	// Guard against the resolved check over-firing: a finding with a still-open
+	// coordinate is not resolved, so an active ignore must still keep it open.
+	future := time.Now().Add(24 * time.Hour)
+	issue := issueAttributes{
+		Ignored: true,
+		Status:  "open",
+		Coordinates: []coordinate{
+			{State: "resolved"},
+			{State: "open"},
+		},
+	}
+	got := mapStatus(issue, future, false)
+	if got != model.FindingOpen {
+		t.Fatalf("mapStatus() = %q, want %q for ignored finding with a still-open coordinate", got, model.FindingOpen)
+	}
+}
+
+func TestMapStatusResolvedWithSnoozeMarkerIsFixed(t *testing.T) {
+	// Resolved must win over a snooze marker: a finding Snyk no longer reports
+	// is terminal even if its resolution type or details still mentions a snooze.
+	for _, res := range []resolution{
+		{Type: "snoozed"},
+		{Type: "disappeared", Details: "snoozed then disappeared"},
+	} {
+		issue := issueAttributes{
+			Status:     "resolved",
+			Resolution: res,
+		}
+		got := mapStatus(issue, time.Time{}, false)
+		if got != model.FindingFixed {
+			t.Fatalf("mapStatus(%+v) = %q, want %q for resolved finding with snooze marker", res, got, model.FindingFixed)
+		}
+	}
+}
+
+func TestMapStatusUnresolvedSnoozeStaysSnoozed(t *testing.T) {
+	// The reordering must not change behaviour for still-open findings: a snooze
+	// marker on an unresolved finding still maps to FindingSnoozed.
+	issue := issueAttributes{
+		Status:     "open",
+		Resolution: resolution{Type: "snoozed"},
+	}
+	got := mapStatus(issue, time.Time{}, false)
+	if got != model.FindingSnoozed {
+		t.Fatalf("mapStatus() = %q, want %q for unresolved snoozed finding", got, model.FindingSnoozed)
+	}
+}
+
 func TestMaxExpiryIgnoreMeta(t *testing.T) {
 	cases := []struct {
 		name    string

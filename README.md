@@ -260,7 +260,7 @@ This setting only controls the issue subscriber list. Linear will still record t
 - ignored until fix available (disregardIfFixable) -> `Backlog` (no due date, `triage-dependency` label)
 - temporarily ignored (snoozed with future expiry) -> `Todo`
 - permanently ignored -> `Cancelled`
-- fixed -> `Done`
+- fixed (or resolved/disappeared) -> `Done`
 - missing finding in an existing active Snyk project -> `Done`
 - missing finding because the Snyk project no longer exists -> `Cancelled`
 - Snyk project is inactive (de-activated) -> `Cancelled`
@@ -270,7 +270,7 @@ The configured Linear state names are resolved by name first, then by workflow t
 These distinctions are intentional:
 
 - Issues ignored "until fix is available" are placed in `Backlog` with no due date because the team cannot act on them until an upstream fix ships. The `triage-dependency` label (configurable via `LINEAR_AWAITING_FIX_LABEL`) makes them filterable. When a fix becomes available, Snyk flips `ignored=false` and the next run moves the issue to `Todo` with a due date.
-- Temporarily ignored issues (those with a scheduled expiry) are kept open in `Todo` rather than cancelled, because they require attention once the ignore expires.
+- Temporarily ignored issues (those with a scheduled expiry) are kept open in `Todo` rather than cancelled, because they require attention once the ignore expires. This applies only while the finding still exists in Snyk: a finding Snyk reports as resolved is treated as `Done` regardless of any ignore (active, expired, or "until fix available") still attached to it, so a vulnerability that no longer exists never lingers as an open or overdue ticket.
 - If a Snyk issue disappears but the project still exists and is active, the tool treats that as the issue being resolved and moves the Linear ticket to `Done`.
 - If the Snyk project itself is gone or has been de-activated (inactive), the tool treats the managed Linear ticket as no longer actionable and moves it to `Cancelled`.
 
