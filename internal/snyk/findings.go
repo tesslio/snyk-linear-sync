@@ -1079,10 +1079,13 @@ func mapStatus(issue issueAttributes, ignoreExpiresAt time.Time, disregardIfFixa
 	}
 
 	switch {
+	case resolved:
+		// Resolved wins over a snooze marker: a finding Snyk no longer reports
+		// is terminal regardless of any lingering snooze metadata, mirroring the
+		// resolved-first gate on the ignore block above.
+		return model.FindingFixed
 	case strings.Contains(resolutionType, "snooz") || strings.Contains(resolutionDetails, "snooz"):
 		return model.FindingSnoozed
-	case resolved:
-		return model.FindingFixed
 	default:
 		return model.FindingOpen
 	}

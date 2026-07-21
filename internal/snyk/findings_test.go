@@ -189,6 +189,37 @@ func TestMapStatusIgnoredWithUnresolvedCoordinateStaysOpen(t *testing.T) {
 	}
 }
 
+func TestMapStatusResolvedWithSnoozeMarkerIsFixed(t *testing.T) {
+	// Resolved must win over a snooze marker: a finding Snyk no longer reports
+	// is terminal even if its resolution type or details still mentions a snooze.
+	for _, res := range []resolution{
+		{Type: "snoozed"},
+		{Type: "disappeared", Details: "snoozed then disappeared"},
+	} {
+		issue := issueAttributes{
+			Status:     "resolved",
+			Resolution: res,
+		}
+		got := mapStatus(issue, time.Time{}, false)
+		if got != model.FindingFixed {
+			t.Fatalf("mapStatus(%+v) = %q, want %q for resolved finding with snooze marker", res, got, model.FindingFixed)
+		}
+	}
+}
+
+func TestMapStatusUnresolvedSnoozeStaysSnoozed(t *testing.T) {
+	// The reordering must not change behaviour for still-open findings: a snooze
+	// marker on an unresolved finding still maps to FindingSnoozed.
+	issue := issueAttributes{
+		Status:     "open",
+		Resolution: resolution{Type: "snoozed"},
+	}
+	got := mapStatus(issue, time.Time{}, false)
+	if got != model.FindingSnoozed {
+		t.Fatalf("mapStatus() = %q, want %q for unresolved snoozed finding", got, model.FindingSnoozed)
+	}
+}
+
 func TestMaxExpiryIgnoreMeta(t *testing.T) {
 	cases := []struct {
 		name    string
