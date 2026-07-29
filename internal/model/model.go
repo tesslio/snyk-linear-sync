@@ -123,11 +123,15 @@ type DesiredIssue struct {
 	DueDateBase   string // raw SLA date from Snyk data (CreatedAt or IgnoreExpiresAt + offset); used for cache hashing so that the floor-to-today adjustment does not cause daily cache churn
 	State         IssueState
 	ManagedLabels []string
-	Priority      int
-	PreserveState bool
-	StateReason   string
-	DueDateReason string
-	LabelReasons  map[string]string // normalized label name → reason
+	// CreateOnlyLabels are stamped once, on create, and never reconciled.
+	// Kept out of ManagedLabels on purpose so they never reach the
+	// managed_labels: metadata and are never re-asserted or removed later.
+	CreateOnlyLabels []string
+	Priority         int
+	PreserveState    bool
+	StateReason      string
+	DueDateReason    string
+	LabelReasons     map[string]string // normalized label name → reason
 	// DueDateUsedUpdatedAtFallback records whether DueDate/DueDateBase were
 	// computed using the updated_at re-detection fallback (Snyk reusing an
 	// issue ID for a new code occurrence) rather than the issue's original

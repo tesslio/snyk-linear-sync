@@ -246,6 +246,51 @@ When an issue is in the awaiting-fix state, the sync:
 
 When tool, origin, or awaiting-fix label mapping is enabled, the sync manages the global automation label plus the derived label set recorded in the metadata block.
 
+### Label ownership
+
+Linear's `issueUpdate` mutation replaces an issue's label set wholesale rather
+than applying a delta, so every update this sync performs has to restate the
+labels the issue should end up with. That set is computed from the board
+snapshot taken at the start of the run, which makes any label another system
+adds mid-run invisible to it — and therefore deleted by the next update.
+
+Two settings bound that:
+
+`LINEAR_PROTECTED_LABELS` lists labels this sync must never add to, or remove
+from, an existing issue:
+
+- default: `df:kikimora-snyk,df:kikimora-snyk-complete,df:kikimora-snyk-invalid`
+- set to `off` to disable protection entirely
+- when any label is protected, each update batch re-reads the current labels of
+  the issues it is about to write, and carries protected labels over from that
+  live read rather than from the snapshot. A protected label added since the
+  snapshot survives; one removed since the snapshot is not re-added.
+- if an issue's live labels cannot be read, its update fails rather than
+  proceeding — writing a label set that might drop a protected label is worse
+  than deferring the update to the next run
+- protected labels are never asserted from the managed set either, so a
+  misconfiguration cannot stamp one onto an issue that does not carry it
+
+These three labels belong to the kikimora Dark Factory harness, which uses them
+as dispatch control state: `df:kikimora-snyk` enrols a finding for automated
+assessment, and the `-complete` / `-invalid` variants are terminal gates that
+stop a finding being re-assessed. Deleting one silently re-opens work that was
+already done.
+
+`LINEAR_CREATE_ONLY_LABELS` lists labels stamped once, when the issue is
+created, and never reconciled afterwards:
+
+- default: none
+- labels must already exist in Linear (the run fails loudly if one does not)
+- create-only labels are deliberately not part of the managed set: they never
+  enter the `managed_labels:` metadata block and never appear in a desired
+  label set, so nothing later tries to re-assert or remove them
+- pair each entry with `LINEAR_PROTECTED_LABELS` so an update cannot drop it
+
+The Tessl deployment sets `LINEAR_CREATE_ONLY_LABELS=df:kikimora-snyk` so every
+newly synced finding carries the enrolment label from birth and kikimora does
+not need to write it itself.
+
 `LINEAR_UNSUBSCRIBE_ACTOR` controls whether the Linear API actor should be kept off the subscriber list for managed issue creates and updates:
 
 - default: `true`
@@ -341,6 +386,8 @@ Optional:
 - `LINEAR_ORIGIN_LABELS`
 - `LINEAR_ORIGIN_LABEL_DEFAULT`
 - `LINEAR_AWAITING_FIX_LABEL`
+- `LINEAR_CREATE_ONLY_LABELS`
+- `LINEAR_PROTECTED_LABELS`
 - `LINEAR_DUE_DAYS_CRITICAL`
 - `LINEAR_DUE_DAYS_HIGH`
 - `LINEAR_DUE_DAYS_MEDIUM`

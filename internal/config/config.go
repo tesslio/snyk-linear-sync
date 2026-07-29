@@ -20,15 +20,23 @@ const (
 	defaultLinearCancelledState = "Cancelled"
 	defaultManagedLabel         = "snyk-automation"
 	defaultAwaitingFixLabel     = "triage-dependency"
-	defaultCriticalDueDays      = 15
-	defaultHighDueDays          = 30
-	defaultMediumDueDays        = 45
-	defaultLowDueDays           = 90
-	defaultWorkerCount          = 16
-	defaultSnykConcurrency      = 6
-	defaultLinearConcurrency    = 8
-	defaultErrorLogFile         = "logs/snyk-linear-sync-errors.log"
-	defaultCacheDBFile          = "data/snyk-linear-sync-cache.db"
+	// defaultProtectedLabels are the labels this sync must never add to or
+	// remove from an existing ticket. They belong to the kikimora Dark Factory
+	// harness, which uses them as dispatch control state: df:kikimora-snyk
+	// enrolls a finding, and the -complete / -invalid variants are terminal
+	// gates that stop it being re-dispatched. Deleting one silently re-opens a
+	// finding kikimora had already assessed, so they are protected by default
+	// rather than by opt-in. Override with LINEAR_PROTECTED_LABELS.
+	defaultProtectedLabels   = "df:kikimora-snyk,df:kikimora-snyk-complete,df:kikimora-snyk-invalid"
+	defaultCriticalDueDays   = 15
+	defaultHighDueDays       = 30
+	defaultMediumDueDays     = 45
+	defaultLowDueDays        = 90
+	defaultWorkerCount       = 16
+	defaultSnykConcurrency   = 6
+	defaultLinearConcurrency = 8
+	defaultErrorLogFile      = "logs/snyk-linear-sync-errors.log"
+	defaultCacheDBFile       = "data/snyk-linear-sync-cache.db"
 	// defaultArchiveLookbackDays is the lookback window for including
 	// auto-archived Linear tickets in the sync snapshot. Linear's auto-archive
 	// runs after the configured inactivity period (commonly 1 month); the
@@ -94,6 +102,17 @@ type LabelConfig struct {
 	Origin        map[string]string
 	OriginDefault string
 	AwaitingFix   string
+	// CreateOnly holds labels stamped once, when the ticket is created, and
+	// never reconciled afterwards. They are deliberately not part of the
+	// managed set: they never enter the ticket's managed_labels: metadata and
+	// never appear in a desired set, so nothing downstream tries to re-assert
+	// them. Pair each entry with Protected so an update cannot drop it.
+	CreateOnly []string
+	// Protected holds labels this sync must never add to, or remove from, an
+	// existing ticket. Because Linear's issueUpdate replaces the whole label
+	// set, preserving these means reading their live state immediately before
+	// each update rather than trusting the run's opening snapshot.
+	Protected []string
 }
 
 type DueDateConfig struct {
@@ -173,6 +192,8 @@ func Load(args []string) (Config, error) {
 				Origin:        originLabels,
 				OriginDefault: normalizeManagedLabel(getEnv("LINEAR_ORIGIN_LABEL_DEFAULT", "")),
 				AwaitingFix:   normalizeManagedLabel(getEnv("LINEAR_AWAITING_FIX_LABEL", defaultAwaitingFixLabel)),
+				CreateOnly:    parseLabelList(os.Getenv("LINEAR_CREATE_ONLY_LABELS")),
+				Protected:     parseLabelList(getEnv("LINEAR_PROTECTED_LABELS", defaultProtectedLabels)),
 			},
 			Due: DueDateConfig{
 				CriticalDays: getEnvInt("LINEAR_DUE_DAYS_CRITICAL", defaultCriticalDueDays),
@@ -325,6 +346,21 @@ func normalizeManagedLabel(raw string) string {
 	default:
 		return value
 	}
+}
+
+// parseLabelList parses a comma-separated list of label names, dropping empty
+// entries and honouring the same "off"/"none" disable words as
+// normalizeManagedLabel (so LINEAR_PROTECTED_LABELS=off disables protection
+// entirely). Unlike parseLabelMap it cannot fail: there is no key:value shape
+// to get wrong, so an absent value simply means "no labels".
+func parseLabelList(raw string) []string {
+	var out []string
+	for part := range strings.SplitSeq(raw, ",") {
+		if label := normalizeManagedLabel(part); label != "" {
+			out = append(out, label)
+		}
+	}
+	return out
 }
 
 func parseLabelMap(envName, raw string) (map[string]string, error) {
