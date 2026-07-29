@@ -935,6 +935,10 @@ func (c *Client) ensureManagedLabelsResolved(ctx context.Context, labels []strin
 	return nil
 }
 
+// resolveManagedLabel resolves one configured label name to its Linear label
+// ID. It serves every label this tool applies — the managed set and the
+// create-only set alike — so its errors name the label configuration as a whole
+// rather than any single environment variable.
 func (c *Client) resolveManagedLabel(ctx context.Context, managedLabel string) error {
 	managedLabel = strings.TrimSpace(managedLabel)
 	if managedLabel == "" {
@@ -1013,13 +1017,13 @@ query managedIssueLabels($name: String!, $after: String) {
 	case len(teamMatches) == 1:
 		resolved = teamMatches[0]
 	case len(teamMatches) > 1:
-		return fmt.Errorf("managed Linear label %q is ambiguous for team %s; keep only one matching label", managedLabel, c.teamRef())
+		return fmt.Errorf("Linear label %q is ambiguous for team %s; keep only one matching label", managedLabel, c.teamRef())
 	case len(globalMatches) == 1:
 		resolved = globalMatches[0]
 	case len(globalMatches) > 1:
-		return fmt.Errorf("managed Linear label %q is ambiguous across workspace labels; keep only one matching label", managedLabel)
+		return fmt.Errorf("Linear label %q is ambiguous across workspace labels; keep only one matching label", managedLabel)
 	default:
-		return fmt.Errorf("managed Linear label %q was not found; create the label in Linear or set LINEAR_MANAGED_LABEL=off", managedLabel)
+		return fmt.Errorf("Linear label %q was not found; create the label in Linear, or remove it from the label configuration (LINEAR_MANAGED_LABEL, LINEAR_TOOL_LABELS, LINEAR_ORIGIN_LABELS, LINEAR_AWAITING_FIX_LABEL, LINEAR_CREATE_ONLY_LABELS)", managedLabel)
 	}
 
 	c.mu.Lock()
@@ -1148,6 +1152,13 @@ func (c *Client) protectedLabelNames() map[string]struct{} {
 // their live state rather than the run's opening snapshot — the window between
 // the two is minutes wide and is exactly when another actor's label edit gets
 // clobbered.
+//
+// The `id in` filter can match at most len(issueIDs) issues, so a single page of
+// that size returns all of them and no pagination is needed. This assumes update
+// batches stay well under Linear's per-page ceiling, which they do at the
+// caller's batch size of 10; a batch larger than the ceiling would fail the
+// request, which degrades to the caller's per-issue retry rather than silently
+// dropping labels.
 func (c *Client) fetchLabelsByIssueID(ctx context.Context, issueIDs []string) (map[string][]model.IssueLabel, error) {
 	if len(issueIDs) == 0 {
 		return nil, nil
