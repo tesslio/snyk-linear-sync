@@ -40,7 +40,7 @@ func TestDesiredLabelIDsReplacesPreviousManagedLabel(t *testing.T) {
 		ManagedLabels: []string{"snyk-automation", "snyk-code"},
 	}
 
-	labelIDs, err := client.desiredLabelIDs(existing, desired)
+	labelIDs, err := client.desiredLabelIDs(existing, desired, nil)
 	if err != nil {
 		t.Fatalf("desiredLabelIDs() error = %v", err)
 	}
@@ -72,7 +72,7 @@ func TestDesiredLabelIDsRemovesManagedLabelWhenDisabled(t *testing.T) {
 		},
 	}
 
-	labelIDs, err := client.desiredLabelIDs(existing, model.DesiredIssue{})
+	labelIDs, err := client.desiredLabelIDs(existing, model.DesiredIssue{}, nil)
 	if err != nil {
 		t.Fatalf("desiredLabelIDs() error = %v", err)
 	}
@@ -566,7 +566,7 @@ func TestDesiredLabelIDsPreservesManuallyAddedLabels(t *testing.T) {
 		ManagedLabels: []string{"snyk-automation"},
 	}
 
-	labelIDs, err := client.desiredLabelIDs(existing, desired)
+	labelIDs, err := client.desiredLabelIDs(existing, desired, nil)
 	if err != nil {
 		t.Fatalf("desiredLabelIDs() error = %v", err)
 	}
@@ -1141,5 +1141,250 @@ func TestPostCommentsPartialAliasFailureReturnsOnlyFailedIndices(t *testing.T) {
 	}
 	if len(failed) != 1 || failed[0] != 2 {
 		t.Fatalf("PostComments() failed indices = %v, want [2] (the second comment maps to updates[2])", failed)
+	}
+}
+
+// protectedTestLabels is the production default set: the three kikimora Dark
+// Factory control labels this sync must never write on an existing ticket.
+var protectedTestLabels = []string{
+	"df:kikimora-snyk",
+	"df:kikimora-snyk-complete",
+	"df:kikimora-snyk-invalid",
+}
+
+func protectedLabelClient() *Client {
+	return &Client{
+		cfg: config.LinearConfig{
+			Labels: config.LabelConfig{
+				Managed:   "snyk-automation",
+				Protected: protectedTestLabels,
+			},
+		},
+		managedLabelIDs: map[string]string{
+			"snyk-automation":  "label-automation",
+			"df:kikimora-snyk": "label-kiki",
+		},
+	}
+}
+
+// TestDesiredLabelIDsPreservesProtectedLabelAddedSinceSnapshot is the
+// SNYK-54304 regression. kikimora added df:kikimora-snyk after this run took
+// its board snapshot, so the label is absent from existing.Labels. Because
+// issueUpdate replaces the whole label set, echoing the snapshot back deleted
+// the label. The live read is the authority for protected labels, so it must
+// survive.
+func TestDesiredLabelIDsPreservesProtectedLabelAddedSinceSnapshot(t *testing.T) {
+	client := protectedLabelClient()
+
+	existing := model.ExistingIssue{
+		ManagedLabels: []string{"snyk-automation"},
+		Labels: []model.IssueLabel{
+			{ID: "label-automation", Name: "snyk-automation"},
+			{ID: "label-security", Name: "Security-Discovery"},
+		},
+	}
+	desired := model.DesiredIssue{ManagedLabels: []string{"snyk-automation"}}
+	live := []model.IssueLabel{
+		{ID: "label-automation", Name: "snyk-automation"},
+		{ID: "label-security", Name: "Security-Discovery"},
+		{ID: "label-kiki", Name: "df:kikimora-snyk"},
+	}
+
+	labelIDs, err := client.desiredLabelIDs(existing, desired, live)
+	if err != nil {
+		t.Fatalf("desiredLabelIDs() error = %v", err)
+	}
+	if !containsString(labelIDs, "label-kiki") {
+		t.Fatalf("labelIDs = %#v, want the protected df:kikimora-snyk label preserved", labelIDs)
+	}
+	if !containsString(labelIDs, "label-security") {
+		t.Fatalf("labelIDs = %#v, want the unrelated label preserved", labelIDs)
+	}
+	if !containsString(labelIDs, "label-automation") {
+		t.Fatalf("labelIDs = %#v, want the managed label present", labelIDs)
+	}
+}
+
+// TestDesiredLabelIDsDoesNotReAddProtectedLabelRemovedSinceSnapshot is the
+// other direction: kikimora's DONE handling removes df:kikimora-snyk (swapping
+// it for -complete). The snapshot still shows the old label, and re-asserting
+// it would undo kikimora's swap. Protection means "never write", not "always
+// keep".
+func TestDesiredLabelIDsDoesNotReAddProtectedLabelRemovedSinceSnapshot(t *testing.T) {
+	client := protectedLabelClient()
+
+	existing := model.ExistingIssue{
+		ManagedLabels: []string{"snyk-automation"},
+		Labels: []model.IssueLabel{
+			{ID: "label-automation", Name: "snyk-automation"},
+			{ID: "label-kiki", Name: "df:kikimora-snyk"},
+		},
+	}
+	desired := model.DesiredIssue{ManagedLabels: []string{"snyk-automation"}}
+	live := []model.IssueLabel{
+		{ID: "label-automation", Name: "snyk-automation"},
+		{ID: "label-complete", Name: "df:kikimora-snyk-complete"},
+	}
+
+	labelIDs, err := client.desiredLabelIDs(existing, desired, live)
+	if err != nil {
+		t.Fatalf("desiredLabelIDs() error = %v", err)
+	}
+	if containsString(labelIDs, "label-kiki") {
+		t.Fatalf("labelIDs = %#v, want the removed protected label left off", labelIDs)
+	}
+	if !containsString(labelIDs, "label-complete") {
+		t.Fatalf("labelIDs = %#v, want the live protected label preserved", labelIDs)
+	}
+}
+
+// TestDesiredLabelIDsNeverAssertsProtectedLabelFromManagedSet guards the
+// blast radius of a misconfiguration: even if a protected label somehow lands
+// in the managed set, an update must not stamp it onto a ticket that does not
+// carry it. Adding df:kikimora-snyk-complete to a live finding would terminally
+// gate it and silently stop it ever being assessed.
+func TestDesiredLabelIDsNeverAssertsProtectedLabelFromManagedSet(t *testing.T) {
+	client := protectedLabelClient()
+
+	existing := model.ExistingIssue{Labels: []model.IssueLabel{}}
+	desired := model.DesiredIssue{
+		ManagedLabels: []string{"snyk-automation", "df:kikimora-snyk"},
+	}
+
+	labelIDs, err := client.desiredLabelIDs(existing, desired, nil)
+	if err != nil {
+		t.Fatalf("desiredLabelIDs() error = %v", err)
+	}
+	if containsString(labelIDs, "label-kiki") {
+		t.Fatalf("labelIDs = %#v, want no protected label asserted from the managed set", labelIDs)
+	}
+	if !containsString(labelIDs, "label-automation") {
+		t.Fatalf("labelIDs = %#v, want the managed label present", labelIDs)
+	}
+}
+
+// TestCreateLabelIDsIncludesCreateOnlyLabels covers the one place a protected
+// label is legitimately written: issue creation. df:kikimora-snyk is stamped at
+// birth so kikimora's watcher can enrol the finding without doing a write of
+// its own.
+func TestCreateLabelIDsIncludesCreateOnlyLabels(t *testing.T) {
+	client := protectedLabelClient()
+
+	labelIDs := client.createLabelIDs(model.DesiredIssue{
+		ManagedLabels:    []string{"snyk-automation"},
+		CreateOnlyLabels: []string{"df:kikimora-snyk"},
+	})
+
+	if !containsString(labelIDs, "label-kiki") {
+		t.Fatalf("labelIDs = %#v, want the create-only label applied on create", labelIDs)
+	}
+	if !containsString(labelIDs, "label-automation") {
+		t.Fatalf("labelIDs = %#v, want the managed label applied on create", labelIDs)
+	}
+}
+
+// TestUpdateIssuesFailsWhenLiveLabelsUnreadable pins the fail-closed path. An
+// issue missing from the live label read is indistinguishable from one carrying
+// no protected label, so the update must not proceed — guessing wrong deletes a
+// kikimora control label. The caller retries the batch item by item.
+func TestUpdateIssuesFailsWhenLiveLabelsUnreadable(t *testing.T) {
+	mutated := false
+	client := &Client{
+		cfg: config.LinearConfig{
+			TeamID: "team-1",
+			States: config.StateConfig{Todo: "Todo"},
+			Labels: config.LabelConfig{Protected: protectedTestLabels},
+		},
+		gql: gqlclient.New("http://linear.test/graphql", &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				var payload struct {
+					Query string `json:"query"`
+				}
+				body, _ := io.ReadAll(req.Body)
+				if err := json.Unmarshal(body, &payload); err != nil {
+					t.Fatalf("json.Unmarshal() error = %v", err)
+				}
+				if strings.Contains(payload.Query, "query issueLabelsByID") {
+					// The issue is absent from the response.
+					return jsonResponse(t, `{"data":{"issues":{"nodes":[]}}}`), nil
+				}
+				if strings.Contains(payload.Query, "mutation issueUpdateBatch") {
+					mutated = true
+					return jsonResponse(t, `{"data":{"issueUpdate0":{"success":true}}}`), nil
+				}
+				t.Fatalf("unexpected GraphQL query: %s", payload.Query)
+				return nil, nil
+			}),
+		}),
+		log:             slog.New(slog.NewTextHandler(io.Discard, nil)),
+		resolvedTeam:    "team-1",
+		statesByName:    map[string]string{"todo": "state-1"},
+		statesByType:    map[string]string{"unstarted": "state-1"},
+		managedLabelIDs: map[string]string{},
+	}
+
+	err := client.UpdateIssues(t.Context(), []model.IssueUpdate{{
+		Existing: model.ExistingIssue{ID: "issue-1", Identifier: "SNYK-1"},
+		Desired: model.DesiredIssue{
+			Fingerprint: "snyk:proj-1:issue-1",
+			Title:       "Snyk: title",
+			Description: "body",
+			State:       model.StateTodo,
+		},
+	}})
+	if err == nil {
+		t.Fatal("UpdateIssues() error = nil, want a failure when live labels cannot be read")
+	}
+	if mutated {
+		t.Fatal("UpdateIssues() sent an update mutation despite being unable to preserve protected labels")
+	}
+}
+
+// TestUpdateIssuesSkipsLiveLabelReadWhenNoProtectedLabels keeps the extra query
+// off the hot path for anyone running without protected labels configured.
+func TestUpdateIssuesSkipsLiveLabelReadWhenNoProtectedLabels(t *testing.T) {
+	labelRead := false
+	client := &Client{
+		cfg: config.LinearConfig{
+			TeamID: "team-1",
+			States: config.StateConfig{Todo: "Todo"},
+		},
+		gql: gqlclient.New("http://linear.test/graphql", &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				var payload struct {
+					Query string `json:"query"`
+				}
+				body, _ := io.ReadAll(req.Body)
+				if err := json.Unmarshal(body, &payload); err != nil {
+					t.Fatalf("json.Unmarshal() error = %v", err)
+				}
+				if strings.Contains(payload.Query, "query issueLabelsByID") {
+					labelRead = true
+					return jsonResponse(t, `{"data":{"issues":{"nodes":[]}}}`), nil
+				}
+				return jsonResponse(t, `{"data":{"issueUpdate0":{"success":true}}}`), nil
+			}),
+		}),
+		log:             slog.New(slog.NewTextHandler(io.Discard, nil)),
+		resolvedTeam:    "team-1",
+		statesByName:    map[string]string{"todo": "state-1"},
+		statesByType:    map[string]string{"unstarted": "state-1"},
+		managedLabelIDs: map[string]string{},
+	}
+
+	err := client.UpdateIssues(t.Context(), []model.IssueUpdate{{
+		Existing: model.ExistingIssue{ID: "issue-1", Identifier: "SNYK-1"},
+		Desired: model.DesiredIssue{
+			Fingerprint: "snyk:proj-1:issue-1",
+			Title:       "Snyk: title",
+			Description: "body",
+			State:       model.StateTodo,
+		},
+	}})
+	if err != nil {
+		t.Fatalf("UpdateIssues() error = %v", err)
+	}
+	if labelRead {
+		t.Fatal("UpdateIssues() read live labels with no protected labels configured")
 	}
 }

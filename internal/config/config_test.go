@@ -198,3 +198,85 @@ func TestLoadRejectsMalformedOriginLabels(t *testing.T) {
 		t.Fatal("Load() error = nil, want parse error")
 	}
 }
+
+// TestLoadProtectsKikimoraLabelsByDefault pins the protected set to the three
+// kikimora Dark Factory control labels. Protection is on by default, not
+// opt-in: an operator who forgets an env var must not end up with a sync that
+// deletes another system's dispatch state.
+func TestLoadProtectsKikimoraLabelsByDefault(t *testing.T) {
+	setRequiredEnv(t)
+
+	cfg, err := Load(nil)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	want := []string{"df:kikimora-snyk", "df:kikimora-snyk-complete", "df:kikimora-snyk-invalid"}
+	if len(cfg.Linear.Labels.Protected) != len(want) {
+		t.Fatalf("Protected = %#v, want %#v", cfg.Linear.Labels.Protected, want)
+	}
+	for i, label := range want {
+		if cfg.Linear.Labels.Protected[i] != label {
+			t.Fatalf("Protected[%d] = %q, want %q", i, cfg.Linear.Labels.Protected[i], label)
+		}
+	}
+}
+
+func TestLoadCreateOnlyLabels(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("LINEAR_CREATE_ONLY_LABELS", " df:kikimora-snyk , ,off,another-label ")
+
+	cfg, err := Load(nil)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	// Blank entries and the "off" disable word are dropped; the rest survive
+	// with surrounding whitespace trimmed.
+	want := []string{"df:kikimora-snyk", "another-label"}
+	if len(cfg.Linear.Labels.CreateOnly) != len(want) {
+		t.Fatalf("CreateOnly = %#v, want %#v", cfg.Linear.Labels.CreateOnly, want)
+	}
+	for i, label := range want {
+		if cfg.Linear.Labels.CreateOnly[i] != label {
+			t.Fatalf("CreateOnly[%d] = %q, want %q", i, cfg.Linear.Labels.CreateOnly[i], label)
+		}
+	}
+}
+
+func TestLoadCreateOnlyLabelsDefaultsToNone(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("LINEAR_CREATE_ONLY_LABELS", "")
+
+	cfg, err := Load(nil)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if len(cfg.Linear.Labels.CreateOnly) != 0 {
+		t.Fatalf("CreateOnly = %#v, want none by default", cfg.Linear.Labels.CreateOnly)
+	}
+}
+
+// TestLoadProtectedLabelsCanBeDisabled keeps the escape hatch working for a
+// deployment with no downstream consumer of the labels.
+func TestLoadProtectedLabelsCanBeDisabled(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("LINEAR_PROTECTED_LABELS", "off")
+
+	cfg, err := Load(nil)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if len(cfg.Linear.Labels.Protected) != 0 {
+		t.Fatalf("Protected = %#v, want none when disabled", cfg.Linear.Labels.Protected)
+	}
+}
+
+func setRequiredEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv("SNYK_CLIENT_ID", "client-id")
+	t.Setenv("SNYK_CLIENT_SECRET", "client-secret")
+	t.Setenv("SNYK_ORG_ID", "org-id")
+	t.Setenv("LINEAR_API_KEY", "linear-key")
+	t.Setenv("LINEAR_TEAM_ID", "team-id")
+}

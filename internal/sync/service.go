@@ -698,6 +698,7 @@ func desiredIssue(cfg config.Config, finding model.Finding) model.DesiredIssue {
 		DueDateReason:                dueDateReason,
 		DueDateUsedUpdatedAtFallback: usedUpdatedAtFallback,
 		ManagedLabels:                managedLabels(cfg.Linear.Labels, finding),
+		CreateOnlyLabels:             cfg.Linear.Labels.CreateOnly,
 		LabelReasons:                 buildLabelReasons(cfg.Linear.Labels, finding),
 		Priority:                     issuePriority(finding.Severity),
 	}
