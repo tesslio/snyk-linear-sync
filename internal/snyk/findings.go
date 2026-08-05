@@ -177,15 +177,6 @@ type orgResponse struct {
 //
 // The custom UnmarshalJSON tries both formats and only extracts the fields
 // we need (created, expires, and disregardIfFixable).
-// projectIssueKey is the composite key for looking up v1 ignore metadata.
-// The same Snyk vulnerability key can appear in multiple projects with
-// different ignore expiries, so the project ID must be part of the key to
-// avoid cross-project collisions.
-type projectIssueKey struct {
-	ProjectID string
-	IssueKey  string
-}
-
 type v1IgnoreEntry struct {
 	Created            string `json:"created"`
 	Expires            string `json:"expires"`
@@ -254,9 +245,12 @@ func (c *Client) LoadSnapshot(ctx context.Context) (model.SnykSnapshot, error) {
 	}
 
 	findings := make([]model.Finding, 0, len(projects))
-	// Build a lookup from issue key / issue ID -> ignore metadata across all
-	// pages. We cache v1 ignores per project ID to avoid redundant API calls
-	// when the same project spans multiple pages of issues.
+	// Cache v1 ignores per project ID to avoid redundant API calls when the
+	// same project spans multiple pages of issues. Keying the per-finding
+	// lookup off this project-scoped map (rather than a global issueKey map)
+	// also removes the cross-project collision risk where the same
+	// vulnerability key in two projects with different expiries overwrote each
+	// other.
 	//
 	// We fetch v1 ignore metadata for all projects that appear in the issues
 	// pages, not just those with currently-ignored issues. This ensures we
@@ -264,12 +258,6 @@ func (c *Client) LoadSnapshot(ctx context.Context) (model.SnykSnapshot, error) {
 	// ignore expires (the REST API flips ignored=false but the v1 record
 	// persists), and also captures disregardIfFixable for "ignore until fix
 	// available" ignores.
-	//
-	// Keyed by (projectID, issueKey) because the same vulnerability key can
-	// appear in multiple projects with different ignore expiries. Using just
-	// the issueKey caused cross-project collisions where whichever project was
-	// processed last overwrote the others, producing flip-flopping due dates.
-	ignoreMetaByProjectIssue := make(map[projectIssueKey]ignoreMetadata)
 	v1IgnoresCache := make(map[string]v1ProjectIgnores)
 
 	nextCursor := ""
@@ -298,11 +286,6 @@ func (c *Client) LoadSnapshot(ctx context.Context) (model.SnykSnapshot, error) {
 					return model.SnykSnapshot{}, fmt.Errorf("fetch v1 ignores for project %s: %w", projectID, err)
 				}
 				v1IgnoresCache[projectID] = ignores
-			}
-			for issueKey, entries := range ignores {
-				if meta := maxExpiryIgnoreMeta(entries); !meta.ExpiresAt.IsZero() || meta.DisregardIfFixable {
-					ignoreMetaByProjectIssue[projectIssueKey{ProjectID: projectID, IssueKey: issueKey}] = meta
-				}
 			}
 		}
 
@@ -335,12 +318,29 @@ func (c *Client) LoadSnapshot(ctx context.Context) (model.SnykSnapshot, error) {
 			}
 			updatedAt := parseIssueTimestamp(issue.Attributes.UpdatedAt)
 
-			ignoreMeta, ok := ignoreMetaByProjectIssue[projectIssueKey{ProjectID: projectID, IssueKey: issueKey}]
-			// The v1 API uses either SNYK-* keys or issue UUIDs as top-level keys
-			// depending on project type. If the first lookup failed, try the issue ID.
-			if !ok && issue.ID != "" && issueKey != issue.ID {
-				ignoreMeta, ok = ignoreMetaByProjectIssue[projectIssueKey{ProjectID: projectID, IssueKey: issue.ID}]
-			}
+			// Snyk files a finding's ignore records under different top-level
+			// keys depending on project type: the issue-key hash, the issue
+			// UUID, or (for config/IaC findings) the Snyk rule ID. A single
+			// finding can have records under more than one of these at once —
+			// e.g. a stale, expired temporary-ignore under its issue-key hash
+			// alongside a *permanent* wont-fix filed under its rule ID. Snyk's
+			// issue.Ignored flag already reflects all of them; the v1 records
+			// only tell us whether that ignore is a timed snooze or permanent.
+			// So we summarise the union of every candidate record (rule keys
+			// gated on issue.Ignored — see ignoreEntriesForIssue), not just the
+			// first that matches — otherwise the expired snooze masks the
+			// permanent ignore and mapStatus treats a permanently-ignored
+			// finding as open, minting a fresh birth-overdue ticket every run.
+			//
+			// Pass issue.Attributes.Key rather than the coalesced issueKey:
+			// when Attributes.Key is empty, issueKey falls back to
+			// firstProblemID, and feeding that in unconditionally would smuggle
+			// a rule/problem key past the issue.Ignored gate. Ignored findings
+			// lose nothing — the problems loop inside ignoreEntriesForIssue
+			// already covers every problem ID, and issue.ID is always added.
+			ignoreEntries := ignoreEntriesForIssue(v1IgnoresCache[projectID], issue.Attributes.Key, issue.ID, issue.Attributes.Problems, issue.Attributes.Ignored)
+			ignoreMeta := maxExpiryIgnoreMeta(ignoreEntries)
+			ok := len(ignoreEntries) > 0
 			// If the issue is ignored but we found no v1 ignore metadata, the
 			// key format didn't match either fallback. Log a warning so
 			// operators can detect key-format mismatches; without metadata we
@@ -738,6 +738,54 @@ func unionIgnoreEntries(first, second []v1IgnoreEntry) []v1IgnoreEntry {
 	}
 
 	return out
+}
+
+// ignoreEntriesForIssue collects every v1 ignore entry that can apply to a
+// single finding. Snyk keys ignore records by issue-key hash, issue UUID, or
+// Snyk rule ID depending on project type, and one finding may have records
+// under several of these at once. Returning their union lets
+// maxExpiryIgnoreMeta weigh them together, so a permanent ignore filed under
+// one key is not masked by an expired snooze under another. Keys are
+// deduplicated so a value that doubles as more than one identifier (e.g.
+// issueKey == issueID for dependency findings) is not counted twice.
+//
+// The issue-key hash and issue UUID identify exactly this finding, so their
+// records always apply. Rule/problem IDs do not: a rule can match several
+// findings in one project (one per resource path), and the v1 records under a
+// rule key are path-scoped in ways v1IgnoreEntry's parsing discards. Rule-key
+// records are therefore consulted only when Snyk itself reports the issue
+// ignored — they refine an ignore Snyk asserts (timed snooze vs permanent)
+// rather than manufacture one. Without that gate, a sibling finding of the
+// same rule that was never ignored could inherit an ExpiresAt and have its
+// due-date base silently switched from creation to ignore expiry.
+//
+// issueKey must be the raw issue.Attributes.Key (empty when Snyk provides
+// none), never a coalesced fallback: a fallback derived from a problem ID
+// would smuggle a rule key past the ignored gate.
+func ignoreEntriesForIssue(projectIgnores v1ProjectIgnores, issueKey, issueID string, problems []problem, ignored bool) []v1IgnoreEntry {
+	if len(projectIgnores) == 0 {
+		return nil
+	}
+	seenKey := make(map[string]struct{})
+	var entries []v1IgnoreEntry
+	add := func(key string) {
+		if key == "" {
+			return
+		}
+		if _, dup := seenKey[key]; dup {
+			return
+		}
+		seenKey[key] = struct{}{}
+		entries = append(entries, projectIgnores[key]...)
+	}
+	add(issueKey)
+	add(issueID)
+	if ignored {
+		for _, p := range problems {
+			add(p.ID)
+		}
+	}
+	return entries
 }
 
 // maxExpiryIgnoreMeta returns the maximum ignore expiry and the metadata of
