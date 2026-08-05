@@ -55,6 +55,68 @@ func TestMapStatusExpiredIgnoreKeepsOpen(t *testing.T) {
 	}
 }
 
+// TestPermanentRuleIgnoreNotMaskedByExpiredKeySnooze reproduces SNYK-56009: a
+// config finding whose issue-key hash carries only long-expired
+// temporary-ignores, while the permanent wont-fix that actually keeps Snyk
+// reporting ignored=true is filed under the Snyk rule ID. Gathering ignore
+// records only under the issue-key hash sees the expired snooze and maps the
+// finding to FindingOpen, minting a fresh birth-overdue ticket every run. The
+// union across candidate keys must instead see the permanent ignore and map it
+// to FindingIgnored (Cancelled).
+func TestPermanentRuleIgnoreNotMaskedByExpiredKeySnooze(t *testing.T) {
+	const (
+		issueKeyHash = "1f9ffd2622ca886d18aebec3c3ca5ba5bb69f61b"
+		issueID      = "d6dc045a-339e-40d3-8f94-095c2ed870fa"
+		ruleID       = "SNYK-CC-K8S-42"
+	)
+	projectIgnores := v1ProjectIgnores{
+		// Two temporary snoozes filed under the issue-key hash, both long expired.
+		issueKeyHash: {
+			{Created: "2026-04-15T13:17:41Z", Expires: "2026-04-29T13:17:39Z"},
+			{Created: "2026-04-15T13:30:25Z", Expires: "2026-04-29T13:30:20Z"},
+		},
+		// The rule-level records: an older expired snooze and the permanent
+		// wont-fix (no expiry) that is the latest action and keeps it ignored.
+		ruleID: {
+			{Created: "2026-04-16T13:22:35Z", Expires: "2026-04-30T13:22:35Z"},
+			{Created: "2026-05-06T14:54:20Z", Expires: ""},
+		},
+	}
+
+	problems := []problem{{ID: ruleID}}
+	entries := ignoreEntriesForIssue(projectIgnores, issueKeyHash, issueID, problems, true)
+	meta := maxExpiryIgnoreMeta(entries)
+	if !meta.ExpiresAt.IsZero() {
+		t.Fatalf("ignore meta ExpiresAt = %v, want zero (permanent) — expired key snooze masked the permanent rule ignore", meta.ExpiresAt)
+	}
+
+	issue := issueAttributes{Ignored: true, Status: "open"}
+	if got := mapStatus(issue, meta.ExpiresAt, meta.DisregardIfFixable); got != model.FindingIgnored {
+		t.Fatalf("mapStatus() = %q, want %q for finding permanently ignored via its rule ID", got, model.FindingIgnored)
+	}
+}
+
+// TestRuleIgnoresNotAppliedToUnignoredFinding pins the other side of the
+// rule-key union: rule IDs identify a class of finding, not one finding, so a
+// sibling issue of the same rule that Snyk does NOT report as ignored must not
+// inherit the rule-keyed records. Without the ignored gate it would pick up an
+// ExpiresAt and have its due-date base silently switched from creation date to
+// ignore expiry.
+func TestRuleIgnoresNotAppliedToUnignoredFinding(t *testing.T) {
+	const ruleID = "SNYK-CC-K8S-8"
+	projectIgnores := v1ProjectIgnores{
+		ruleID: {
+			{Created: "2026-05-06T14:54:20Z", Expires: "2027-01-01T00:00:00Z"},
+		},
+	}
+
+	problems := []problem{{ID: ruleID}}
+	entries := ignoreEntriesForIssue(projectIgnores, "aaaa1111-unrelated-hash", "bbbb2222-issue-uuid", problems, false)
+	if len(entries) != 0 {
+		t.Fatalf("ignoreEntriesForIssue() returned %d entries for an unignored finding, want 0 — rule-keyed records leaked onto a sibling", len(entries))
+	}
+}
+
 func TestMapStatusDisregardIfFixableAwaitingFix(t *testing.T) {
 	issue := issueAttributes{
 		Ignored: true,
