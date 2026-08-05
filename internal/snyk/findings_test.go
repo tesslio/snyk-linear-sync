@@ -115,6 +115,21 @@ func TestRuleIgnoresNotAppliedToUnignoredFinding(t *testing.T) {
 	if len(entries) != 0 {
 		t.Fatalf("ignoreEntriesForIssue() returned %d entries for an unignored finding, want 0 — rule-keyed records leaked onto a sibling", len(entries))
 	}
+
+	// A finding with no issue.Attributes.Key must not smuggle its problem ID
+	// past the gate either: the caller passes the raw (empty) attributes key,
+	// not the coalesced issueKey fallback that resolves to the rule ID.
+	entries = ignoreEntriesForIssue(projectIgnores, "", "bbbb2222-issue-uuid", problems, false)
+	if len(entries) != 0 {
+		t.Fatalf("ignoreEntriesForIssue() returned %d entries for an unignored finding with an empty attributes key, want 0 — rule key smuggled past the ignored gate", len(entries))
+	}
+
+	// Sanity: the same finding, once Snyk reports it ignored, does see the
+	// rule-keyed records.
+	entries = ignoreEntriesForIssue(projectIgnores, "", "bbbb2222-issue-uuid", problems, true)
+	if len(entries) != 1 {
+		t.Fatalf("ignoreEntriesForIssue() returned %d entries for an ignored finding, want 1", len(entries))
+	}
 }
 
 func TestMapStatusDisregardIfFixableAwaitingFix(t *testing.T) {

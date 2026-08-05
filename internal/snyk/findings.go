@@ -331,7 +331,14 @@ func (c *Client) LoadSnapshot(ctx context.Context) (model.SnykSnapshot, error) {
 			// first that matches — otherwise the expired snooze masks the
 			// permanent ignore and mapStatus treats a permanently-ignored
 			// finding as open, minting a fresh birth-overdue ticket every run.
-			ignoreEntries := ignoreEntriesForIssue(v1IgnoresCache[projectID], issueKey, issue.ID, issue.Attributes.Problems, issue.Attributes.Ignored)
+			//
+			// Pass issue.Attributes.Key rather than the coalesced issueKey:
+			// when Attributes.Key is empty, issueKey falls back to
+			// firstProblemID, and feeding that in unconditionally would smuggle
+			// a rule/problem key past the issue.Ignored gate. Ignored findings
+			// lose nothing — the problems loop inside ignoreEntriesForIssue
+			// already covers every problem ID, and issue.ID is always added.
+			ignoreEntries := ignoreEntriesForIssue(v1IgnoresCache[projectID], issue.Attributes.Key, issue.ID, issue.Attributes.Problems, issue.Attributes.Ignored)
 			ignoreMeta := maxExpiryIgnoreMeta(ignoreEntries)
 			ok := len(ignoreEntries) > 0
 			// If the issue is ignored but we found no v1 ignore metadata, the
@@ -751,6 +758,10 @@ func unionIgnoreEntries(first, second []v1IgnoreEntry) []v1IgnoreEntry {
 // rather than manufacture one. Without that gate, a sibling finding of the
 // same rule that was never ignored could inherit an ExpiresAt and have its
 // due-date base silently switched from creation to ignore expiry.
+//
+// issueKey must be the raw issue.Attributes.Key (empty when Snyk provides
+// none), never a coalesced fallback: a fallback derived from a problem ID
+// would smuggle a rule key past the ignored gate.
 func ignoreEntriesForIssue(projectIgnores v1ProjectIgnores, issueKey, issueID string, problems []problem, ignored bool) []v1IgnoreEntry {
 	if len(projectIgnores) == 0 {
 		return nil
