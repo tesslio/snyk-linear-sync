@@ -337,31 +337,29 @@ func (c *Client) UpdateIssues(ctx context.Context, updates []model.IssueUpdate) 
 		return err
 	}
 
-	// Re-read the live label set for this batch when any label is protected.
-	// An update replaces the ticket's whole label set, so this is what keeps a
-	// protected label another actor added since the run's opening snapshot from
-	// being deleted by that replacement.
-	var liveLabels map[string][]model.IssueLabel
-	if len(c.cfg.Labels.Protected) > 0 {
-		issueIDs := make([]string, 0, len(updates))
-		for _, update := range updates {
-			issueIDs = append(issueIDs, update.Existing.ID)
-		}
-		fetched, err := c.fetchLabelsByIssueID(ctx, issueIDs)
-		if err != nil {
-			return err
-		}
-		liveLabels = fetched
+	// Re-read the live label set for this batch, always. An update replaces the
+	// ticket's whole label set, so echoing back the run's opening snapshot
+	// deletes any label another actor added since then. The sync owns only its
+	// managed labels; every other label — protected, human-applied, or from a
+	// different automation — is carried forward from this live read, which is
+	// the ticket's current truth rather than the minutes-old snapshot.
+	issueIDs := make([]string, 0, len(updates))
+	for _, update := range updates {
+		issueIDs = append(issueIDs, update.Existing.ID)
+	}
+	liveLabels, err := c.fetchLabelsByIssueID(ctx, issueIDs)
+	if err != nil {
+		return err
+	}
 
-		// An issue missing from the read is indistinguishable from one that
-		// genuinely carries no protected label, and guessing wrong deletes a
-		// kikimora control label. Fail the batch instead: the caller already
-		// falls back to updating each issue individually, so the rest of the
-		// batch still lands and only the unreadable issue is reported failed.
-		for _, update := range updates {
-			if _, ok := liveLabels[update.Existing.ID]; !ok {
-				return fmt.Errorf("refusing to update Linear issue %s: its current labels could not be read, so protected labels cannot be preserved", update.Existing.Identifier)
-			}
+	// An issue missing from the read leaves its current labels unknown, and
+	// guessing wrong deletes a label the sync does not own (a kikimora control
+	// label, or a human's). Fail the batch instead: the caller already falls
+	// back to updating each issue individually, so the rest of the batch still
+	// lands and only the unreadable issue is reported failed.
+	for _, update := range updates {
+		if _, ok := liveLabels[update.Existing.ID]; !ok {
+			return fmt.Errorf("refusing to update Linear issue %s: its current labels could not be read, so labels the sync does not own cannot be preserved", update.Existing.Identifier)
 		}
 	}
 
@@ -1060,46 +1058,45 @@ func (c *Client) createLabelIDs(desired model.DesiredIssue) []string {
 // Linear's issueUpdate replaces the ticket's labels wholesale rather than
 // applying a delta.
 //
-// live carries the ticket's label set as read immediately before the write (nil
-// when no labels are protected). Protected labels are taken from live and from
-// nowhere else: the `existing` snapshot was taken at the top of the run, so a
-// protected label another actor added since then is absent from it, and echoing
-// that stale set back to Linear would delete the label. Everything else still
-// comes from the snapshot, which is the pre-existing behaviour.
+// The sync owns only its own managed labels. Every other label on the ticket —
+// protected, human-applied, or from another automation — is carried forward
+// untouched. `live` is the ticket's label set read immediately before the
+// write, and is the authority for what the ticket carries right now: the
+// `existing` snapshot was taken at the top of the run, so any label added since
+// then is absent from it and echoing that stale set back to Linear would delete
+// the label. When `live` is nil (direct callers that do not read live labels)
+// the snapshot's labels are used as the fallback.
+//
+// Reconciliation is scoped to the managed set alone: a previously-managed label
+// no longer desired is dropped, the desired managed set is (re-)asserted, and
+// nothing else is added or removed.
 func (c *Client) desiredLabelIDs(existing model.ExistingIssue, desired model.DesiredIssue, live []model.IssueLabel) ([]string, error) {
 	desiredManaged := normalizeManagedLabelNames(desired.ManagedLabels)
 	protected := c.protectedLabelNames()
-	out := make([]string, 0, len(existing.Labels)+len(desiredManaged))
-	seen := make(map[string]struct{}, len(existing.Labels)+len(desiredManaged))
+
+	// The live read is the current truth; fall back to the snapshot only when a
+	// caller did not supply one (nil, not merely empty — an issue whose labels
+	// were all removed reads back as a non-nil empty slice, and must not fall
+	// back to the stale snapshot).
+	current := live
+	if current == nil {
+		current = existing.Labels
+	}
+
+	out := make([]string, 0, len(current)+len(desiredManaged))
+	seen := make(map[string]struct{}, len(current)+len(desiredManaged))
 	previousManaged := make(map[string]struct{}, len(existing.ManagedLabels))
 	for _, label := range normalizeManagedLabelNames(existing.ManagedLabels) {
 		previousManaged[label] = struct{}{}
 	}
 
-	// Protected labels come from the live read below, so skip them here: the
-	// snapshot's view of them is stale in both directions (it can miss one that
-	// was just added, and carry one that was just removed).
-	for _, label := range existing.Labels {
+	// Carry forward every current label the sync does not own. A previously
+	// managed label is dropped here and only re-added below if still desired,
+	// which is how the sync reconciles its own set; everything else — protected
+	// control labels, human labels, other automations' labels — is preserved.
+	for _, label := range current {
 		normalized := model.NormalizeLabelName(label.Name)
-		if _, isProtected := protected[normalized]; isProtected {
-			continue
-		}
 		if _, managed := previousManaged[normalized]; managed {
-			continue
-		}
-		if _, exists := seen[label.ID]; exists {
-			continue
-		}
-		out = append(out, label.ID)
-		seen[label.ID] = struct{}{}
-	}
-
-	// Carry over every protected label the ticket actually has right now. This
-	// preserves a label kikimora added mid-run and equally respects one it just
-	// removed (an absent label is simply never re-added).
-	for _, label := range live {
-		normalized := model.NormalizeLabelName(label.Name)
-		if _, isProtected := protected[normalized]; !isProtected {
 			continue
 		}
 		if _, exists := seen[label.ID]; exists {
@@ -1118,7 +1115,8 @@ func (c *Client) desiredLabelIDs(existing model.ExistingIssue, desired model.Des
 	for _, managedLabel := range desiredManaged {
 		// A protected label must never be asserted from the managed set — that
 		// would let a misconfiguration stamp a terminal kikimora gate onto a
-		// ticket that does not have one.
+		// ticket that does not have one. It is already carried forward above if
+		// the ticket genuinely has it.
 		if _, isProtected := protected[managedLabel]; isProtected {
 			continue
 		}
@@ -1148,10 +1146,10 @@ func (c *Client) protectedLabelNames() map[string]struct{} {
 }
 
 // fetchLabelsByIssueID reads the current label set of each given issue. It runs
-// immediately before an update batch so protected labels are preserved against
-// their live state rather than the run's opening snapshot — the window between
-// the two is minutes wide and is exactly when another actor's label edit gets
-// clobbered.
+// immediately before an update batch so labels the sync does not own are
+// preserved against their live state rather than the run's opening snapshot —
+// the window between the two is minutes wide and is exactly when another
+// actor's label edit gets clobbered.
 //
 // The `id in` filter can match at most len(issueIDs) issues, so a single page of
 // that size returns all of them and no pagination is needed. This assumes update

@@ -123,6 +123,9 @@ func TestUpdateIssuesClearsManagedLabelsWhenNoneDesired(t *testing.T) {
 				if err := json.Unmarshal(body, &payload); err != nil {
 					t.Fatalf("json.Unmarshal() error = %v", err)
 				}
+				if strings.Contains(payload.Query, "query issueLabelsByID") {
+					return jsonResponse(t, `{"data":{"issues":{"nodes":[{"id":"issue-1","labels":{"nodes":[{"id":"label-1","name":"snyk-automation"}]}}]}}}`), nil
+				}
 				if strings.Contains(payload.Query, "mutation issueUpdateBatch") {
 					for key, val := range payload.Variables {
 						if strings.HasPrefix(key, "input") {
@@ -496,6 +499,9 @@ func TestUpdateIssuesDoesNotSendSubscriberIdsInPayload(t *testing.T) {
 				if err := json.Unmarshal(body, &payload); err != nil {
 					t.Fatalf("json.Unmarshal() error = %v", err)
 				}
+				if strings.Contains(payload.Query, "query issueLabelsByID") {
+					return jsonResponse(t, `{"data":{"issues":{"nodes":[{"id":"issue-1","labels":{"nodes":[{"id":"label-1","name":"snyk-automation"}]}}]}}}`), nil
+				}
 				if strings.Contains(payload.Query, "mutation issueUpdateBatch") {
 					for key, val := range payload.Variables {
 						if !strings.HasPrefix(key, "input") {
@@ -729,6 +735,10 @@ func TestUpdateIssuesOmitsStateIdWhenPreserveStateTrue(t *testing.T) {
 				if err := json.Unmarshal(body, &payload); err != nil {
 					t.Fatalf("json.Unmarshal() error = %v", err)
 				}
+				if strings.Contains(payload.Query, "query issueLabelsByID") {
+					return jsonResponse(t, `{"data":{"issues":{"nodes":[{"id":"issue-1","labels":{"nodes":[{"id":"label-1","name":"snyk-automation"}]}}]}}}`), nil
+				}
+
 				requests = append(requests, struct {
 					Query     string
 					Variables map[string]any
@@ -1340,14 +1350,18 @@ func TestUpdateIssuesFailsWhenLiveLabelsUnreadable(t *testing.T) {
 	}
 }
 
-// TestUpdateIssuesSkipsLiveLabelReadWhenNoProtectedLabels keeps the extra query
-// off the hot path for anyone running without protected labels configured.
-func TestUpdateIssuesSkipsLiveLabelReadWhenNoProtectedLabels(t *testing.T) {
+// TestUpdateIssuesAlwaysReadsLiveLabels pins that the live label read runs for
+// every update batch, not only when protected labels are configured. The read
+// is what makes the live set — rather than the run's opening snapshot — the
+// authority for which labels the ticket carries, so an unmanaged label added by
+// a person or another automation since the snapshot is not clobbered.
+func TestUpdateIssuesAlwaysReadsLiveLabels(t *testing.T) {
 	labelRead := false
 	client := &Client{
 		cfg: config.LinearConfig{
 			TeamID: "team-1",
 			States: config.StateConfig{Todo: "Todo"},
+			// No protected labels configured.
 		},
 		gql: gqlclient.New("http://linear.test/graphql", &http.Client{
 			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
@@ -1360,7 +1374,7 @@ func TestUpdateIssuesSkipsLiveLabelReadWhenNoProtectedLabels(t *testing.T) {
 				}
 				if strings.Contains(payload.Query, "query issueLabelsByID") {
 					labelRead = true
-					return jsonResponse(t, `{"data":{"issues":{"nodes":[]}}}`), nil
+					return jsonResponse(t, `{"data":{"issues":{"nodes":[{"id":"issue-1","labels":{"nodes":[]}}]}}}`), nil
 				}
 				return jsonResponse(t, `{"data":{"issueUpdate0":{"success":true}}}`), nil
 			}),
@@ -1384,7 +1398,101 @@ func TestUpdateIssuesSkipsLiveLabelReadWhenNoProtectedLabels(t *testing.T) {
 	if err != nil {
 		t.Fatalf("UpdateIssues() error = %v", err)
 	}
-	if labelRead {
-		t.Fatal("UpdateIssues() read live labels with no protected labels configured")
+	if !labelRead {
+		t.Fatal("UpdateIssues() did not read live labels; an unmanaged label added since the snapshot would be clobbered")
+	}
+}
+
+// TestUpdateIssuesPreservesUnmanagedLabelAddedSinceSnapshot is the EXP-7834
+// regression (observed on SNYK-59893). A person added the unmanaged
+// Security-Scale label after this run took its board snapshot, so the label is
+// absent from existing.Labels. Because issueUpdate replaces the whole label set,
+// echoing the snapshot back deleted it. The live read taken immediately before
+// the write is the authority, so the label must survive the update.
+func TestUpdateIssuesPreservesUnmanagedLabelAddedSinceSnapshot(t *testing.T) {
+	var capturedInput map[string]any
+	client := &Client{
+		cfg: config.LinearConfig{
+			TeamID: "team-1",
+			States: config.StateConfig{Todo: "Todo"},
+		},
+		gql: gqlclient.New("http://linear.test/graphql", &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				var payload struct {
+					Query     string         `json:"query"`
+					Variables map[string]any `json:"variables"`
+				}
+				body, _ := io.ReadAll(req.Body)
+				if err := json.Unmarshal(body, &payload); err != nil {
+					t.Fatalf("json.Unmarshal() error = %v", err)
+				}
+				if strings.Contains(payload.Query, "query issueLabelsByID") {
+					// Live read: the ticket now carries Security-Scale, which the
+					// opening snapshot below never saw.
+					return jsonResponse(t, `{"data":{"issues":{"nodes":[{"id":"issue-1","labels":{"nodes":[{"id":"label-automation","name":"snyk-automation"},{"id":"label-scale","name":"Security-Scale"}]}}]}}}`), nil
+				}
+				if strings.Contains(payload.Query, "mutation issueUpdateBatch") {
+					for key, val := range payload.Variables {
+						if strings.HasPrefix(key, "input") {
+							capturedInput, _ = val.(map[string]any)
+						}
+					}
+					return jsonResponse(t, `{"data":{"issueUpdate0":{"success":true}}}`), nil
+				}
+				t.Fatalf("unexpected GraphQL query: %s", payload.Query)
+				return nil, nil
+			}),
+		}),
+		log:          slog.New(slog.NewTextHandler(io.Discard, nil)),
+		resolvedTeam: "team-1",
+		statesByName: map[string]string{"todo": "state-1"},
+		statesByType: map[string]string{"unstarted": "state-1"},
+		managedLabelIDs: map[string]string{
+			"snyk-automation": "label-automation",
+		},
+	}
+
+	err := client.UpdateIssues(t.Context(), []model.IssueUpdate{{
+		Existing: model.ExistingIssue{
+			ID:            "issue-1",
+			Identifier:    "SNYK-59893",
+			ManagedLabels: []string{"snyk-automation"},
+			// Opening snapshot: no Security-Scale yet.
+			Labels: []model.IssueLabel{{ID: "label-automation", Name: "snyk-automation"}},
+		},
+		Desired: model.DesiredIssue{
+			Fingerprint:   "snyk:proj-1:issue-1",
+			Title:         "Snyk: updated title",
+			Description:   "updated body",
+			State:         model.StateTodo,
+			ManagedLabels: []string{"snyk-automation"},
+			Priority:      2,
+		},
+	}})
+	if err != nil {
+		t.Fatalf("UpdateIssues() error = %v", err)
+	}
+	if capturedInput == nil {
+		t.Fatal("no update input captured")
+	}
+	rawLabelIds, has := capturedInput["labelIds"]
+	if !has {
+		t.Fatalf("update mutation must include labelIds, got: %#v", capturedInput)
+	}
+	arr, ok := rawLabelIds.([]any)
+	if !ok {
+		t.Fatalf("labelIds must be an array, got: %#v", rawLabelIds)
+	}
+	ids := make([]string, 0, len(arr))
+	for _, v := range arr {
+		if s, ok := v.(string); ok {
+			ids = append(ids, s)
+		}
+	}
+	if !containsString(ids, "label-scale") {
+		t.Fatalf("labelIds = %#v, want the unmanaged Security-Scale label (label-scale) preserved", ids)
+	}
+	if !containsString(ids, "label-automation") {
+		t.Fatalf("labelIds = %#v, want the managed snyk-automation label present", ids)
 	}
 }

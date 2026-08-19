@@ -250,26 +250,35 @@ When tool, origin, or awaiting-fix label mapping is enabled, the sync manages th
 
 Linear's `issueUpdate` mutation replaces an issue's label set wholesale rather
 than applying a delta, so every update this sync performs has to restate the
-labels the issue should end up with. That set is computed from the board
-snapshot taken at the start of the run, which makes any label another system
-adds mid-run invisible to it — and therefore deleted by the next update.
+labels the issue should end up with.
 
-Two settings bound that:
+This sync owns only its own managed labels — the global automation label plus
+the tool, origin, severity, and awaiting-fix labels recorded in the
+`managed_labels:` metadata block. Every other label on a ticket belongs to
+someone else (a person, or another automation) and is carried forward untouched.
 
-`LINEAR_PROTECTED_LABELS` lists labels this sync must never add to, or remove
-from, an existing issue:
+To make that safe against edits made mid-run, each update batch re-reads the
+current labels of the issues it is about to write, immediately before the write.
+That live read — not the board snapshot taken at the start of the run — is the
+authority for which labels the ticket carries. The board snapshot can be minutes
+old, so a label another system added after it is absent from the snapshot;
+restating the snapshot would delete that label. Reading live avoids it:
+
+- a label added since the snapshot (managed or not) survives the update
+- a label removed since the snapshot is not re-added
+- if an issue's live labels cannot be read, its update fails rather than
+  proceeding — writing a label set that might drop a label the sync does not own
+  is worse than deferring the update to the next run. The caller retries the
+  batch item by item, so one unreadable issue does not block the rest.
+
+`LINEAR_PROTECTED_LABELS` lists labels this sync must never *assert* from its
+managed set — a guard against a misconfiguration that puts a control label into
+the managed set stamping it onto a ticket that does not carry it:
 
 - default: `df:kikimora-snyk,df:kikimora-snyk-complete,df:kikimora-snyk-invalid`
-- set to `off` to disable protection entirely
-- when any label is protected, each update batch re-reads the current labels of
-  the issues it is about to write, and carries protected labels over from that
-  live read rather than from the snapshot. A protected label added since the
-  snapshot survives; one removed since the snapshot is not re-added.
-- if an issue's live labels cannot be read, its update fails rather than
-  proceeding — writing a label set that might drop a protected label is worse
-  than deferring the update to the next run
-- protected labels are never asserted from the managed set either, so a
-  misconfiguration cannot stamp one onto an issue that does not carry it
+- set to `off` to disable the guard
+- a protected label already on the ticket is still carried forward like any
+  other unmanaged label; protection only stops the sync *adding* one
 
 These three labels belong to the kikimora Dark Factory harness, which uses them
 as dispatch control state: `df:kikimora-snyk` enrols a finding for automated
@@ -285,7 +294,8 @@ created, and never reconciled afterwards:
 - create-only labels are deliberately not part of the managed set: they never
   enter the `managed_labels:` metadata block and never appear in a desired
   label set, so nothing later tries to re-assert or remove them
-- pair each entry with `LINEAR_PROTECTED_LABELS` so an update cannot drop it
+- because updates carry forward every label the sync does not own, a create-only
+  label already on a ticket is preserved without further configuration
 
 The Tessl deployment sets `LINEAR_CREATE_ONLY_LABELS=df:kikimora-snyk` so every
 newly synced finding carries the enrolment label from birth and kikimora does

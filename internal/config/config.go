@@ -20,13 +20,13 @@ const (
 	defaultLinearCancelledState = "Cancelled"
 	defaultManagedLabel         = "snyk-automation"
 	defaultAwaitingFixLabel     = "triage-dependency"
-	// defaultProtectedLabels are the labels this sync must never add to or
-	// remove from an existing ticket. They belong to the kikimora Dark Factory
-	// harness, which uses them as dispatch control state: df:kikimora-snyk
-	// enrolls a finding, and the -complete / -invalid variants are terminal
-	// gates that stop it being re-dispatched. Deleting one silently re-opens a
-	// finding kikimora had already assessed, so they are protected by default
-	// rather than by opt-in. Override with LINEAR_PROTECTED_LABELS.
+	// defaultProtectedLabels are the labels this sync must never assert from
+	// its managed set. They belong to the kikimora Dark Factory harness, which
+	// uses them as dispatch control state: df:kikimora-snyk enrolls a finding,
+	// and the -complete / -invalid variants are terminal gates that stop it
+	// being re-dispatched. Stamping one onto a ticket that does not have it
+	// would silently re-open or mis-gate a finding, so they are protected by
+	// default rather than by opt-in. Override with LINEAR_PROTECTED_LABELS.
 	defaultProtectedLabels   = "df:kikimora-snyk,df:kikimora-snyk-complete,df:kikimora-snyk-invalid"
 	defaultCriticalDueDays   = 15
 	defaultHighDueDays       = 30
@@ -106,12 +106,15 @@ type LabelConfig struct {
 	// never reconciled afterwards. They are deliberately not part of the
 	// managed set: they never enter the ticket's managed_labels: metadata and
 	// never appear in a desired set, so nothing downstream tries to re-assert
-	// them. Pair each entry with Protected so an update cannot drop it.
+	// them. Because updates carry forward every label the sync does not own,
+	// a create-only label already on a ticket is preserved without pairing it
+	// with Protected.
 	CreateOnly []string
-	// Protected holds labels this sync must never add to, or remove from, an
-	// existing ticket. Because Linear's issueUpdate replaces the whole label
-	// set, preserving these means reading their live state immediately before
-	// each update rather than trusting the run's opening snapshot.
+	// Protected holds labels this sync must never assert from its managed set
+	// — a guard against a misconfiguration that puts a control label into the
+	// managed set and stamps it onto a ticket that does not carry it. A
+	// protected label already on the ticket is carried forward like any other
+	// unmanaged label.
 	Protected []string
 }
 
