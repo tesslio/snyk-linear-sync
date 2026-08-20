@@ -34,7 +34,11 @@ type Client struct {
 	statesByName    map[string]string
 	statesByType    map[string]string
 	managedLabelIDs map[string]string
-	blockedUntil    time.Time
+	// managedLabelGroupIDs maps a normalized managed-label name to the ID of its
+	// Linear exclusive group (or "" when ungrouped), so desiredLabelIDs can drop
+	// a carried-forward sibling when the sync asserts its own child of that group.
+	managedLabelGroupIDs map[string]string
+	blockedUntil         time.Time
 }
 
 // linearIssueNode is the shared GraphQL shape for an issue returned by
@@ -55,8 +59,11 @@ type linearIssueNode struct {
 	} `json:"state"`
 	Labels struct {
 		Nodes []struct {
-			ID   string `json:"id"`
-			Name string `json:"name"`
+			ID     string `json:"id"`
+			Name   string `json:"name"`
+			Parent *struct {
+				ID string `json:"id"`
+			} `json:"parent"`
 		} `json:"nodes"`
 	} `json:"labels"`
 }
@@ -72,12 +79,13 @@ func New(cfg config.LinearConfig, maxConcurrency int, logger *slog.Logger) *Clie
 	}
 
 	return &Client{
-		cfg:             cfg,
-		gql:             gqlclient.New("https://api.linear.app/graphql", httpClient),
-		log:             logger,
-		statesByName:    map[string]string{},
-		statesByType:    map[string]string{},
-		managedLabelIDs: map[string]string{},
+		cfg:                  cfg,
+		gql:                  gqlclient.New("https://api.linear.app/graphql", httpClient),
+		log:                  logger,
+		statesByName:         map[string]string{},
+		statesByType:         map[string]string{},
+		managedLabelIDs:      map[string]string{},
+		managedLabelGroupIDs: map[string]string{},
 	}
 }
 
@@ -129,6 +137,9 @@ query issueByIdentifier($filter: IssueFilter!) {
         nodes {
           id
           name
+          parent {
+            id
+          }
         }
       }
     }
@@ -181,9 +192,14 @@ func linearIssueToModel(issue linearIssueNode) model.ExistingIssue {
 	description := deref(issue.Description)
 	labels := make([]model.IssueLabel, 0, len(issue.Labels.Nodes))
 	for _, label := range issue.Labels.Nodes {
+		groupID := ""
+		if label.Parent != nil {
+			groupID = label.Parent.ID
+		}
 		labels = append(labels, model.IssueLabel{
-			ID:   label.ID,
-			Name: label.Name,
+			ID:      label.ID,
+			Name:    label.Name,
+			GroupID: groupID,
 		})
 	}
 	var archivedAt *time.Time
@@ -649,6 +665,9 @@ query existingIssues($filter: IssueFilter!, $after: String) {
         nodes {
           id
           name
+          parent {
+            id
+          }
         }
       }
     }
@@ -965,9 +984,16 @@ func (c *Client) resolveManagedLabel(ctx context.Context, managedLabel string) e
 	}
 	c.mu.RUnlock()
 
+	// labelRef pairs a resolved label ID with the ID of its exclusive group (or
+	// "" when ungrouped), so the group can be recorded alongside the ID and used
+	// later to keep at most one child of a group in an issueUpdate's labelIds.
+	type labelRef struct {
+		id    string
+		group string
+	}
 	var after *string
-	var teamMatches []string
-	var globalMatches []string
+	var teamMatches []labelRef
+	var globalMatches []labelRef
 	for {
 		op := gqlclient.NewOperation(`
 query managedIssueLabels($name: String!, $after: String) {
@@ -976,6 +1002,9 @@ query managedIssueLabels($name: String!, $after: String) {
       id
       name
       team {
+        id
+      }
+      parent {
         id
       }
     }
@@ -996,6 +1025,9 @@ query managedIssueLabels($name: String!, $after: String) {
 					Team *struct {
 						ID string `json:"id"`
 					} `json:"team"`
+					Parent *struct {
+						ID string `json:"id"`
+					} `json:"parent"`
 				} `json:"nodes"`
 				PageInfo struct {
 					HasNextPage bool    `json:"hasNextPage"`
@@ -1011,11 +1043,15 @@ query managedIssueLabels($name: String!, $after: String) {
 			if !strings.EqualFold(label.Name, managedLabel) {
 				continue
 			}
+			ref := labelRef{id: label.ID}
+			if label.Parent != nil {
+				ref.group = label.Parent.ID
+			}
 			switch {
 			case label.Team != nil && label.Team.ID == c.teamID():
-				teamMatches = append(teamMatches, label.ID)
+				teamMatches = append(teamMatches, ref)
 			case label.Team == nil:
-				globalMatches = append(globalMatches, label.ID)
+				globalMatches = append(globalMatches, ref)
 			}
 		}
 
@@ -1025,7 +1061,7 @@ query managedIssueLabels($name: String!, $after: String) {
 		after = resp.IssueLabels.PageInfo.EndCursor
 	}
 
-	var resolved string
+	var resolved labelRef
 	switch {
 	case len(teamMatches) == 1:
 		resolved = teamMatches[0]
@@ -1040,7 +1076,8 @@ query managedIssueLabels($name: String!, $after: String) {
 	}
 
 	c.mu.Lock()
-	c.managedLabelIDs[model.NormalizeLabelName(managedLabel)] = resolved
+	c.managedLabelIDs[model.NormalizeLabelName(managedLabel)] = resolved.id
+	c.managedLabelGroupIDs[model.NormalizeLabelName(managedLabel)] = resolved.group
 	c.mu.Unlock()
 	return nil
 }
@@ -1085,6 +1122,16 @@ func (c *Client) createLabelIDs(desired model.DesiredIssue) []string {
 // Reconciliation is scoped to the managed set alone: a previously-managed label
 // no longer desired is dropped, the desired managed set is (re-)asserted, and
 // nothing else is added or removed.
+//
+// Linear label groups are mutually exclusive: an issue may carry at most one
+// child of a group, and issueUpdate rejects a labelIds set that names two
+// ("labelIds not exclusive child labels"). Carrying every non-managed label
+// forward can put a second child of a group into the set — a human-applied or
+// stale sibling alongside the child the sync asserts, or two siblings that
+// predate the group being made exclusive. The set is therefore collapsed to at
+// most one child per group. A managed label the sync asserts wins the group
+// (its severity/tool/origin child replaces whatever sibling was carried
+// forward); between two carried-forward siblings the first read wins.
 func (c *Client) desiredLabelIDs(existing model.ExistingIssue, desired model.DesiredIssue, live []model.IssueLabel) ([]string, error) {
 	desiredManaged := normalizeManagedLabelNames(desired.ManagedLabels)
 	protected := c.protectedLabelNames()
@@ -1100,9 +1147,39 @@ func (c *Client) desiredLabelIDs(existing model.ExistingIssue, desired model.Des
 
 	out := make([]string, 0, len(current)+len(desiredManaged))
 	seen := make(map[string]struct{}, len(current)+len(desiredManaged))
+	// groupToIdx maps an exclusive group's ID to the index in `out` of the one
+	// child currently kept for it, so a later member of the same group can be
+	// dropped (or, for a managed label, replace the kept sibling in place).
+	groupToIdx := make(map[string]int, len(current)+len(desiredManaged))
 	previousManaged := make(map[string]struct{}, len(existing.ManagedLabels))
 	for _, label := range normalizeManagedLabelNames(existing.ManagedLabels) {
 		previousManaged[label] = struct{}{}
+	}
+
+	// addLabel adds one label ID to the result unless it would be the second
+	// child of an exclusive group. group is the label's group ID ("" when
+	// ungrouped). A managed label evicts an already-kept sibling of its group; a
+	// non-managed one yields to whatever is already kept.
+	addLabel := func(id, group string, managed bool) {
+		if id == "" {
+			return
+		}
+		if _, exists := seen[id]; exists {
+			return
+		}
+		if group != "" {
+			if idx, clash := groupToIdx[group]; clash {
+				if managed {
+					delete(seen, out[idx])
+					out[idx] = id
+					seen[id] = struct{}{}
+				}
+				return
+			}
+			groupToIdx[group] = len(out)
+		}
+		out = append(out, id)
+		seen[id] = struct{}{}
 	}
 
 	// Carry forward every current label the sync does not own. A previously
@@ -1114,11 +1191,7 @@ func (c *Client) desiredLabelIDs(existing model.ExistingIssue, desired model.Des
 		if _, managed := previousManaged[normalized]; managed {
 			continue
 		}
-		if _, exists := seen[label.ID]; exists {
-			continue
-		}
-		out = append(out, label.ID)
-		seen[label.ID] = struct{}{}
+		addLabel(label.ID, label.GroupID, false)
 	}
 
 	if len(desiredManaged) == 0 {
@@ -1139,11 +1212,7 @@ func (c *Client) desiredLabelIDs(existing model.ExistingIssue, desired model.Des
 		if managedLabelID == "" {
 			return nil, fmt.Errorf("managed Linear label %q was not resolved", managedLabel)
 		}
-		if _, exists := seen[managedLabelID]; exists {
-			continue
-		}
-		out = append(out, managedLabelID)
-		seen[managedLabelID] = struct{}{}
+		addLabel(managedLabelID, c.managedLabelGroupIDs[managedLabel], true)
 	}
 	return out, nil
 }
@@ -1186,6 +1255,9 @@ query issueLabelsByID($filter: IssueFilter!, $first: Int!) {
         nodes {
           id
           name
+          parent {
+            id
+          }
         }
       }
     }
@@ -1202,8 +1274,11 @@ query issueLabelsByID($filter: IssueFilter!, $first: Int!) {
 				ID     string `json:"id"`
 				Labels struct {
 					Nodes []struct {
-						ID   string `json:"id"`
-						Name string `json:"name"`
+						ID     string `json:"id"`
+						Name   string `json:"name"`
+						Parent *struct {
+							ID string `json:"id"`
+						} `json:"parent"`
 					} `json:"nodes"`
 				} `json:"labels"`
 			} `json:"nodes"`
@@ -1217,7 +1292,11 @@ query issueLabelsByID($filter: IssueFilter!, $first: Int!) {
 	for _, node := range resp.Issues.Nodes {
 		labels := make([]model.IssueLabel, 0, len(node.Labels.Nodes))
 		for _, label := range node.Labels.Nodes {
-			labels = append(labels, model.IssueLabel{ID: label.ID, Name: label.Name})
+			groupID := ""
+			if label.Parent != nil {
+				groupID = label.Parent.ID
+			}
+			labels = append(labels, model.IssueLabel{ID: label.ID, Name: label.Name, GroupID: groupID})
 		}
 		out[node.ID] = labels
 	}
