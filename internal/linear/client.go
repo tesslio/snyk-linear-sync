@@ -566,46 +566,61 @@ func (c *Client) loadIssues(ctx context.Context) ([]model.ExistingIssue, error) 
 	// null: true matches issues where autoArchivedAt IS NULL (i.e. NOT
 	// archived) -- which is what the first two OR clauses below intend.
 	archivedAtIsNull := true
+
+	// Every managed issue's title is built with the titlePrefix, and the managed
+	// label is stamped at create and re-asserted on every update, so either alone
+	// identifies a managed ticket. Both are kept as alternatives so that losing
+	// one -- a retitled issue, or a label removed by hand -- does not hide the
+	// ticket and mint a duplicate.
+	identityArms := []linearapi.IssueFilter{
+		{Title: &linearapi.StringComparator{StartsWith: new(titlePrefix)}},
+	}
+	// Only when label management is enabled: with LINEAR_MANAGED_LABEL=off there
+	// is no label to match, and an arm matching nothing would narrow the snapshot
+	// rather than widen it.
+	if managedLabel := strings.TrimSpace(c.cfg.Labels.Managed); managedLabel != "" {
+		identityArms = append(identityArms, linearapi.IssueFilter{
+			Labels: &linearapi.IssueLabelCollectionFilter{
+				Some: &linearapi.IssueLabelFilter{
+					Name: &linearapi.StringComparator{EqIgnoreCase: &managedLabel},
+				},
+			},
+		})
+	}
+	c.log.Info("Linear loadIssues identity scope",
+		slog.String("title_prefix", titlePrefix),
+		slog.String("managed_label", c.cfg.Labels.Managed),
+		slog.Int("identity_arms", len(identityArms)),
+	)
+
 	filter := linearapi.IssueFilter{
 		Team: &linearapi.TeamFilter{
 			Id: &linearapi.IDComparator{Eq: c.teamID()},
 		},
-		Or: []linearapi.IssueFilter{
+		And: []linearapi.IssueFilter{
+			// Archive window.
 			{
-				// Not-archived issues matching the title prefix.
-				Title: &linearapi.StringComparator{
-					StartsWith: new(titlePrefix),
-				},
-				AutoArchivedAt: &linearapi.NullableDateComparator{
-					Null: &archivedAtIsNull,
+				Or: []linearapi.IssueFilter{
+					{AutoArchivedAt: &linearapi.NullableDateComparator{Null: &archivedAtIsNull}},
+					{AutoArchivedAt: &linearapi.NullableDateComparator{Gte: &archiveCutoffDate}},
 				},
 			},
+			// Identity. Both disjuncts are exact predicates -- a title prefix and
+			// a label name -- so the snapshot is bounded to this sync's own
+			// tickets even when the Linear team is shared with another sync.
+			//
+			// The metadata block that carries the fingerprint is deliberately NOT
+			// used as a query predicate. Filtering on `description: { contains }`
+			// did not bound the result set: the sibling snyk-dast-linear-sync,
+			// which uses this same filter shape against this same team, loaded
+			// 59,866 issues for 7 findings -- effectively every issue in the team.
+			// Linear does not document `description` as supporting the string
+			// comparators at all, so the arm appears to be ignored rather than
+			// applied, silently widening the OR to everything. The metadata block
+			// is still the authority for identity once an issue is loaded; it just
+			// cannot be trusted to select which ones to load.
 			{
-				// Not-archived issues matching the metadata header.
-				Description: &linearapi.NullableStringComparator{
-					Contains: new(metadataHeader),
-				},
-				AutoArchivedAt: &linearapi.NullableDateComparator{
-					Null: &archivedAtIsNull,
-				},
-			},
-			{
-				// Archived issues matching the title prefix, within the lookback window.
-				Title: &linearapi.StringComparator{
-					StartsWith: new(titlePrefix),
-				},
-				AutoArchivedAt: &linearapi.NullableDateComparator{
-					Gte: &archiveCutoffDate,
-				},
-			},
-			{
-				// Archived issues matching the metadata header, within the lookback window.
-				Description: &linearapi.NullableStringComparator{
-					Contains: new(metadataHeader),
-				},
-				AutoArchivedAt: &linearapi.NullableDateComparator{
-					Gte: &archiveCutoffDate,
-				},
+				Or: identityArms,
 			},
 		},
 	}

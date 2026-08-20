@@ -309,6 +309,33 @@ not need to write it itself.
 
 This setting only controls the issue subscriber list. Linear will still record the API user as the issue creator, and the create mutation response may briefly include that creator in `subscribers` even when the persisted issue subscriber list is empty after a refresh.
 
+## Snapshot Scope
+
+Each run loads a snapshot of the sync's own Linear tickets. The query is scoped
+by team, then by an archive window, then by identity:
+
+```text
+team = LINEAR_TEAM_ID
+  AND (not auto-archived OR auto-archived within the lookback window)
+  AND (title starts with "Snyk:" OR carries LINEAR_MANAGED_LABEL)
+```
+
+Both identity predicates are exact -- a title prefix and a label name -- and
+either alone identifies a managed ticket, since the sync builds every title with
+the prefix and re-asserts the managed label on every update. Keeping both means a
+retitled ticket, or one whose label was removed by hand, is still found rather
+than being invisible and duplicated. With `LINEAR_MANAGED_LABEL=off` the label
+clause is omitted rather than matching nothing.
+
+This matters because the Linear team is shared with `snyk-dast-linear-sync`: the
+scope must exclude the other tool's tickets. The fingerprint metadata block is
+deliberately **not** used as a query predicate -- `description: { contains: ... }`
+does not bound the result set (the DAST sync, using this same filter shape
+against this same team, loaded 59,866 issues for 7 findings), and Linear does not
+document `description` as supporting the string comparators at all. The metadata
+block remains the authority for identity once an issue is loaded; it just cannot
+be trusted to select which issues to load.
+
 ## State Mapping
 
 - open -> `Todo`
