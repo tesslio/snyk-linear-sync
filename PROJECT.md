@@ -195,7 +195,7 @@ This only affects the persisted subscriber list. Linear still records the API us
 Each run loads a snapshot of the sync's own Linear tickets. The query is scoped
 by team, then by an archive window, then by identity:
 
-```
+```text
 team = LINEAR_TEAM_ID
   AND (not auto-archived OR auto-archived within the lookback window)
   AND (title starts with "Snyk:" OR carries LINEAR_MANAGED_LABEL)
