@@ -528,7 +528,9 @@ func TestFetchProjectCluster(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		// Shape observed from the live v1 API (subset).
-		fmt.Fprint(w, `{"name":"backend/deployment.apps/backend:/app/package.json","origin":"kubernetes","imageCluster":"production","imageTag":"1.0.0"}`)
+		if _, err := fmt.Fprint(w, `{"name":"backend/deployment.apps/backend:/app/package.json","origin":"kubernetes","imageCluster":"production","imageTag":"1.0.0"}`); err != nil {
+			t.Errorf("write response: %v", err)
+		}
 	}))
 	defer server.Close()
 
@@ -556,7 +558,9 @@ func TestFetchProjectClusterEmptyWhenNotReported(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		fmt.Fprint(w, `{"name":"x","origin":"github"}`)
+		if _, err := fmt.Fprint(w, `{"name":"x","origin":"github"}`); err != nil {
+			t.Errorf("write response: %v", err)
+		}
 	}))
 	defer server.Close()
 
