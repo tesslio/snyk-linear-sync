@@ -122,7 +122,7 @@ func TestFindingFromIssueDecodesRealIssueShape(t *testing.T) {
 		t.Fatalf("parse created_at: %v", err)
 	}
 
-	finding := c.findingFromIssue(issue, "project-a", project, "myorg", "SNYK-JS-DEBUG-12552895", "SNYK-JS-DEBUG-12552895", createdAt, time.Time{}, ignoreMetadata{})
+	finding := c.findingFromIssue(issue, "project-a", project, "", "myorg", "SNYK-JS-DEBUG-12552895", "SNYK-JS-DEBUG-12552895", createdAt, time.Time{}, ignoreMetadata{})
 
 	// CVSS: Snyk score (9.3) must win over NVD (7.5) per selectCVSS (Snyk > Red Hat > NVD).
 	if finding.CVSS != 9.3 {
@@ -234,7 +234,7 @@ func TestFindingFromIssueCodeFindingRemediationProse(t *testing.T) {
 	}
 	c := &Client{restBase: mustParseURL(t, "https://api.snyk.io/rest/")}
 	createdAt, _ := time.Parse(time.RFC3339, "2026-01-01T00:00:00Z")
-	finding := c.findingFromIssue(issue, "project-code", projectRef{ID: "project-code", Name: "owner/repo"}, "myorg", "SNYK-CODE-1", "SNYK-CODE-1", createdAt, time.Time{}, ignoreMetadata{})
+	finding := c.findingFromIssue(issue, "project-code", projectRef{ID: "project-code", Name: "owner/repo"}, "", "myorg", "SNYK-CODE-1", "SNYK-CODE-1", createdAt, time.Time{}, ignoreMetadata{})
 
 	if finding.CVSS != 0 {
 		t.Fatalf("CVSS = %v, want 0 when no severities reported (code finding)", finding.CVSS)
@@ -250,6 +250,48 @@ func TestFindingFromIssueCodeFindingRemediationProse(t *testing.T) {
 	}
 	if finding.SourceFile != "src/io.go" || finding.SourceLineStart != 42 {
 		t.Fatalf("source = %q:%d, want src/io.go:42", finding.SourceFile, finding.SourceLineStart)
+	}
+}
+
+// TestFindingFromIssueMapsKubernetesContext verifies that the cluster passed
+// in from the v1 project detail and the namespace parsed into the projectRef
+// land on the resulting Finding for kubernetes-origin projects, and that
+// non-kubernetes findings stay empty.
+func TestFindingFromIssueMapsKubernetesContext(t *testing.T) {
+	issue := issueResource{
+		ID: "issue-1",
+		Attributes: issueAttributes{
+			CreatedAt: "2026-01-01T00:00:00Z",
+			Status:    "open",
+			Title:     "CVE-2026-63075",
+			Type:      "package_vulnerability",
+		},
+	}
+	c := &Client{restBase: mustParseURL(t, "https://api.snyk.io/rest/")}
+	createdAt, _ := time.Parse(time.RFC3339, "2026-01-01T00:00:00Z")
+
+	k8s := c.findingFromIssue(issue, "project-k8s", projectRef{
+		ID:        "project-k8s",
+		Name:      "backend/deployment.apps/backend:/app/package.json",
+		Origin:    "kubernetes",
+		Namespace: "backend",
+		Active:    true,
+	}, "production", "myorg", "SNYK-1", "SNYK-1", createdAt, time.Time{}, ignoreMetadata{})
+	if k8s.ProjectCluster != "production" {
+		t.Fatalf("ProjectCluster = %q, want production", k8s.ProjectCluster)
+	}
+	if k8s.ProjectNamespace != "backend" {
+		t.Fatalf("ProjectNamespace = %q, want backend", k8s.ProjectNamespace)
+	}
+
+	gh := c.findingFromIssue(issue, "project-gh", projectRef{
+		ID:     "project-gh",
+		Name:   "owner/repo",
+		Origin: "github",
+		Active: true,
+	}, "", "myorg", "SNYK-1", "SNYK-1", createdAt, time.Time{}, ignoreMetadata{})
+	if gh.ProjectCluster != "" || gh.ProjectNamespace != "" {
+		t.Fatalf("non-kubernetes finding got cluster=%q namespace=%q, want both empty", gh.ProjectCluster, gh.ProjectNamespace)
 	}
 }
 

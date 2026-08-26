@@ -1171,6 +1171,67 @@ func TestIssueDescriptionOmitsFixAvailabilityWithoutCoordinates(t *testing.T) {
 	}
 }
 
+func TestIssueDescriptionIncludesKubernetesClusterAndNamespace(t *testing.T) {
+	cfg := config.Config{
+		Linear: config.LinearConfig{
+			Labels: config.LabelConfig{Managed: "snyk-automation"},
+		},
+	}
+	finding := model.Finding{
+		Fingerprint:       "snyk:project-k8s:issue-1",
+		SnykIssueID:       "issue-1",
+		ProjectID:         "project-k8s",
+		ProjectName:       "backend/deployment.apps/backend:/app/package.json",
+		ProjectOrigin:     "kubernetes",
+		ProjectCluster:    "production",
+		ProjectNamespace:  "backend",
+		ProjectReference:  "637423609965.dkr.ecr.us-east-1.amazonaws.com/central-registry/tessl/backend",
+		ProjectTargetFile: "/app/package.json",
+		IssueTitle:        "Prototype Pollution",
+		Severity:          "high",
+		Status:            model.FindingOpen,
+		IssueURL:          "https://app.example.test/issue-1",
+	}
+
+	desired := desiredIssue(cfg, finding)
+
+	if !strings.Contains(desired.Description, "Cluster: `production`") {
+		t.Fatalf("description should include the kubernetes cluster:\n%s", desired.Description)
+	}
+	if !strings.Contains(desired.Description, "Namespace: `backend`") {
+		t.Fatalf("description should include the kubernetes namespace:\n%s", desired.Description)
+	}
+}
+
+func TestIssueDescriptionOmitsClusterAndNamespaceForOtherOrigins(t *testing.T) {
+	cfg := config.Config{
+		Linear: config.LinearConfig{
+			Labels: config.LabelConfig{Managed: "snyk-automation"},
+		},
+	}
+	finding := model.Finding{
+		Fingerprint: "snyk:project-a:issue-1",
+		SnykIssueID: "issue-1",
+		ProjectID:   "project-a",
+		ProjectName: "owner/repo",
+		// ProjectCluster/ProjectNamespace left empty, as they are for
+		// non-kubernetes origins.
+		IssueTitle: "Some issue",
+		Severity:   "medium",
+		Status:     model.FindingOpen,
+		IssueURL:   "https://app.example.test/issue-1",
+	}
+
+	desired := desiredIssue(cfg, finding)
+
+	if strings.Contains(desired.Description, "Cluster:") {
+		t.Fatalf("description should omit cluster when not reported:\n%s", desired.Description)
+	}
+	if strings.Contains(desired.Description, "Namespace:") {
+		t.Fatalf("description should omit namespace when not reported:\n%s", desired.Description)
+	}
+}
+
 func TestDesiredIssueAddsGitHubProjectTargetFileLinkWhenNoSourceLocationExists(t *testing.T) {
 	cfg := config.Config{
 		Source: config.SourceConfig{

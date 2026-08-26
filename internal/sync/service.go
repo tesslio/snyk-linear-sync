@@ -736,6 +736,15 @@ func issueDescription(sourceCfg config.SourceConfig, managedLabels []string, fin
 		fmt.Sprintf("## %s [%s]", strings.TrimSpace(finding.IssueTitle), strings.ToUpper(strings.TrimSpace(finding.Severity))),
 	}
 
+	// Kubernetes deployment context leads: knowing which cluster and
+	// namespace a workload runs in is the first thing a triager needs for
+	// container/kubernetes findings, before the image or target file.
+	if finding.ProjectCluster != "" {
+		lines = append(lines, fmt.Sprintf("Cluster: `%s`", finding.ProjectCluster))
+	}
+	if finding.ProjectNamespace != "" {
+		lines = append(lines, fmt.Sprintf("Namespace: `%s`", finding.ProjectNamespace))
+	}
 	if finding.Repository != "" {
 		if repositoryURL != "" {
 			lines = append(lines, fmt.Sprintf("Repository: [%s](%s)", finding.Repository, repositoryURL))

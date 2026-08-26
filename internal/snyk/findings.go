@@ -25,7 +25,10 @@ type projectRef struct {
 	TargetReference string
 	TargetFile      string
 	Repository      string
-	Active          bool
+	// Namespace is the Kubernetes namespace, populated only for projects
+	// with origin "kubernetes" (parsed from the project name).
+	Namespace string
+	Active    bool
 }
 
 type issueListResponse struct {
@@ -260,6 +263,13 @@ func (c *Client) LoadSnapshot(ctx context.Context) (model.SnykSnapshot, error) {
 	// available" ignores.
 	v1IgnoresCache := make(map[string]v1ProjectIgnores)
 
+	// k8sClusterCache holds the cluster name for kubernetes-origin projects,
+	// fetched lazily from the v1 project detail endpoint (the REST project
+	// resource does not expose it). In-memory only: one GET per kubernetes
+	// project per run, mirroring the v1IgnoresCache pattern. A failed fetch
+	// is cached as "" so we don't retry a broken project for every finding.
+	k8sClusterCache := make(map[string]string)
+
 	nextCursor := ""
 	for {
 		page, cursor, err := c.listIssuesPage(ctx, nextCursor)
@@ -354,7 +364,27 @@ func (c *Client) LoadSnapshot(ctx context.Context) (model.SnykSnapshot, error) {
 				)
 			}
 
-			finding := c.findingFromIssue(issue, projectID, project, orgSlug, issueKey, urlKey, createdAt, updatedAt, ignoreMeta)
+			cluster := ""
+			if project.Origin == "kubernetes" {
+				var ok bool
+				cluster, ok = k8sClusterCache[projectID]
+				if !ok {
+					cluster, err = c.fetchProjectCluster(ctx, projectID)
+					if err != nil {
+						// Cluster is ticket enrichment, not sync-critical: log
+						// and continue with an empty value rather than failing
+						// the whole run.
+						c.logger.Warn("could not fetch kubernetes cluster for project; cluster omitted from tickets",
+							slog.String("project_id", projectID),
+							slog.String("error", err.Error()),
+						)
+						cluster = ""
+					}
+					k8sClusterCache[projectID] = cluster
+				}
+			}
+
+			finding := c.findingFromIssue(issue, projectID, project, cluster, orgSlug, issueKey, urlKey, createdAt, updatedAt, ignoreMeta)
 
 			findings = append(findings, finding)
 		}
@@ -390,6 +420,7 @@ func (c *Client) findingFromIssue(
 	issue issueResource,
 	projectID string,
 	project projectRef,
+	cluster string,
 	orgSlug, issueKey, urlKey string,
 	createdAt, updatedAt time.Time,
 	ignoreMeta ignoreMetadata,
@@ -408,6 +439,8 @@ func (c *Client) findingFromIssue(
 		ProjectReference:   project.TargetReference,
 		ProjectTargetFile:  project.TargetFile,
 		Repository:         project.Repository,
+		ProjectCluster:     cluster,
+		ProjectNamespace:   project.Namespace,
 		IssueTitle:         coalesce(issue.Attributes.Title, problemTitle(issue.Attributes.Problems), issue.Attributes.Key, issue.ID),
 		Severity:           coalesce(issue.Attributes.EffectiveSeverity, firstProblemSeverity(issue.Attributes.Problems), "unknown"),
 		CVSS:               selectCVSS(issue.Attributes.Severities),
@@ -525,6 +558,46 @@ func (c *Client) fetchProjectIgnores(ctx context.Context, projectID string) (v1P
 	}
 
 	return merged, nil
+}
+
+// v1ProjectDetail is the subset of the Snyk v1 API project resource
+// (GET /v1/org/{org_id}/project/{project_id}) that the sync needs beyond
+// what the REST project resource exposes.
+type v1ProjectDetail struct {
+	// ImageCluster is the Kubernetes cluster name, reported only for
+	// projects imported through the Snyk Kubernetes integration.
+	ImageCluster string `json:"imageCluster"`
+}
+
+// fetchProjectCluster returns the Kubernetes cluster name for a project
+// from the v1 project detail endpoint. The REST project resource does not
+// expose the cluster, and the v1 projects LIST endpoint is deprecated
+// (410 Gone), so this is one GET per kubernetes-origin project per run
+// (cached in-memory by the caller). An empty string with nil error means
+// Snyk reported no cluster for the project.
+func (c *Client) fetchProjectCluster(ctx context.Context, projectID string) (string, error) {
+	endpoint, err := c.v1Base.Parse(fmt.Sprintf("org/%s/project/%s", c.orgID, projectID))
+	if err != nil {
+		return "", fmt.Errorf("build v1 project URL: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
+	if err != nil {
+		return "", err
+	}
+	// The v1 API returns 406 Not Acceptable for the JSON:API media type.
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+
+	var detail v1ProjectDetail
+	if err := c.decodeJSON(resp, &detail); err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(detail.ImageCluster), nil
 }
 
 // flattenIgnores returns all entries from a v1ProjectIgnores map as a single
@@ -963,6 +1036,7 @@ func (c *Client) listProjects(ctx context.Context) ([]projectRef, error) {
 				TargetReference: targetReference,
 				TargetFile:      targetFile,
 				Repository:      projectRepository(name, origin),
+				Namespace:       kubernetesNamespace(name, origin),
 				Active:          isActiveProjectStatus(status),
 			})
 		}
@@ -1474,6 +1548,24 @@ func isActiveProjectStatus(status string) bool {
 	default:
 		return true
 	}
+}
+
+// kubernetesNamespace extracts the namespace from a kubernetes-origin
+// project name. The Snyk Kubernetes integration names projects
+// "<namespace>/<kind>.<group>/<workload>:<target>" — e.g.
+// "backend/deployment.apps/backend:/app/package.json" — so the namespace is
+// the first path segment. Returns "" for other origins or names that don't
+// match the shape.
+func kubernetesNamespace(name, origin string) string {
+	if origin != "kubernetes" {
+		return ""
+	}
+	name = strings.TrimSpace(name)
+	namespace, rest, ok := strings.Cut(name, "/")
+	if !ok || namespace == "" || rest == "" {
+		return ""
+	}
+	return namespace
 }
 
 func projectRepository(name, origin string) string {

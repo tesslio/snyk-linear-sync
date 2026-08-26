@@ -16,6 +16,7 @@ github.com/tesslio/snyk-linear-sync
 - Stores a stable fingerprint in a hidden metadata block in the Linear issue description.
 - Embeds Snyk issue details (fix availability, CVSS, CWE class(es), CVE identifier(s), vulnerability description, and remediation guidance) in the Linear ticket body so consumers do not each need Snyk API credentials.
 - Optionally renders GitHub source file and commit links when source hosting is configured as `github`.
+- Enriches tickets for Kubernetes-integration projects (`origin: kubernetes`) with the cluster (from the Snyk v1 project detail's `imageCluster`) and namespace (parsed from the `<namespace>/<kind>.<group>/<workload>` project name) at the top of the description.
 - Creates missing Linear issues.
 - Updates existing Linear issues when managed fields change.
 - Ensures a configurable managed label is applied to all managed issues, unless label management is explicitly turned off.
