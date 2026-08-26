@@ -9,7 +9,10 @@ import (
 	"github.com/tesslio/snyk-linear-sync/internal/model"
 )
 
-const metadataSchemaVersion = "2026-06-30-issue-details-v2"
+// Bump when the managed issue rendering (title/description/labels/state
+// mapping) changes so cached hashes from the old format are discarded and
+// every ticket is reconciled once against the new format.
+const metadataSchemaVersion = "2026-08-26-k8s-cluster-namespace"
 
 func managedSchemaSignature() string {
 	return metadataSchemaVersion

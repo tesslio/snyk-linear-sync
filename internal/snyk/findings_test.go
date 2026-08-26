@@ -3,6 +3,7 @@ package snyk
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -484,6 +485,124 @@ func TestV1IgnoreEntryUnmarshalJSON(t *testing.T) {
 				t.Fatalf("UnmarshalJSON() = %+v, want %+v", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestKubernetesNamespace(t *testing.T) {
+	cases := []struct {
+		name   string
+		origin string
+		want   string
+	}{
+		// Real shapes observed from the Snyk API (all 42 kubernetes projects
+		// in the org matched ns/kind.group/workload:target).
+		{"backend/deployment.apps/backend:/app/package.json", "kubernetes", "backend"},
+		{"litellm/job.batch/litellm-db-migration:/opt/prisma/binaries/package.json", "kubernetes", "litellm"},
+		{"cert-manager/job.batch/cert-manager-startupapicheck:quay.io/jetstack/cert-manager-startupapicheck", "kubernetes", "cert-manager"},
+		// Other origins never get a namespace.
+		{"owner/repo(main):package-lock.json", "github", ""},
+		{"alpine:3.19", "docker-hub", ""},
+		// Malformed kubernetes names yield no namespace rather than garbage.
+		{"", "kubernetes", ""},
+		{"no-slash", "kubernetes", ""},
+		{"/deployment.apps/x:img", "kubernetes", ""},
+		{"ns/", "kubernetes", ""},
+	}
+	for _, tc := range cases {
+		got := kubernetesNamespace(tc.name, tc.origin)
+		if got != tc.want {
+			t.Errorf("kubernetesNamespace(%q, %q) = %q, want %q", tc.name, tc.origin, got, tc.want)
+		}
+	}
+}
+
+func TestFetchProjectCluster(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The v1 API 406s the JSON:API media type; assert we ask for plain JSON.
+		if got := r.Header.Get("Accept"); got != "application/json" {
+			t.Errorf("Accept = %q, want application/json", got)
+		}
+		if r.URL.Path != "/org/test-org/project/test-project" {
+			t.Errorf("path = %q, want /org/test-org/project/test-project", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		// Shape observed from the live v1 API (subset).
+		if _, err := fmt.Fprint(w, `{"name":"backend/deployment.apps/backend:/app/package.json","origin":"kubernetes","imageCluster":"production","imageTag":"1.0.0"}`); err != nil {
+			t.Errorf("write response: %v", err)
+		}
+	}))
+	defer server.Close()
+
+	base, err := url.Parse(server.URL + "/")
+	if err != nil {
+		t.Fatalf("parse server URL: %v", err)
+	}
+	c := &Client{
+		httpClient: server.Client(),
+		v1Base:     base,
+		orgID:      "test-org",
+		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+
+	cluster, err := c.fetchProjectCluster(context.Background(), "test-project")
+	if err != nil {
+		t.Fatalf("fetchProjectCluster() error = %v", err)
+	}
+	if cluster != "production" {
+		t.Fatalf("cluster = %q, want production", cluster)
+	}
+}
+
+func TestFetchProjectClusterEmptyWhenNotReported(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		if _, err := fmt.Fprint(w, `{"name":"x","origin":"github"}`); err != nil {
+			t.Errorf("write response: %v", err)
+		}
+	}))
+	defer server.Close()
+
+	base, err := url.Parse(server.URL + "/")
+	if err != nil {
+		t.Fatalf("parse server URL: %v", err)
+	}
+	c := &Client{
+		httpClient: server.Client(),
+		v1Base:     base,
+		orgID:      "test-org",
+		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+
+	cluster, err := c.fetchProjectCluster(context.Background(), "test-project")
+	if err != nil {
+		t.Fatalf("fetchProjectCluster() error = %v", err)
+	}
+	if cluster != "" {
+		t.Fatalf("cluster = %q, want empty when imageCluster absent", cluster)
+	}
+}
+
+func TestFetchProjectClusterHTTPError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer server.Close()
+
+	base, err := url.Parse(server.URL + "/")
+	if err != nil {
+		t.Fatalf("parse server URL: %v", err)
+	}
+	c := &Client{
+		httpClient: server.Client(),
+		v1Base:     base,
+		orgID:      "test-org",
+		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+
+	if _, err := c.fetchProjectCluster(context.Background(), "test-project"); err == nil {
+		t.Fatal("fetchProjectCluster() error = nil, want non-nil on 403")
 	}
 }
 

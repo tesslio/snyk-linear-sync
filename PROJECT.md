@@ -90,6 +90,12 @@ The Linear issue description is intentionally structured for fast triage first, 
 It includes:
 
 - heading with vulnerability title and severity
+- Kubernetes cluster and namespace near the top for findings whose project
+  origin is `kubernetes` (cluster from the Snyk v1 project detail's
+  `imageCluster` field — the REST project resource does not expose it and
+  the v1 projects list endpoint is deprecated — namespace parsed from the
+  project name, which the Snyk Kubernetes integration builds as
+  `<namespace>/<kind>.<group>/<workload>:<target>`)
 - repository context near the top
 - branch/reference and commit context when available
 - source file or project target file context near the top

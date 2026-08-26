@@ -19,18 +19,28 @@ const (
 )
 
 type Finding struct {
-	Fingerprint        string
-	SnykIssueID        string
-	SnykIssueKey       string
-	IssueType          string
-	CreatedAt          time.Time
-	UpdatedAt          time.Time
-	ProjectID          string
-	ProjectName        string
-	ProjectOrigin      string
-	ProjectReference   string
-	ProjectTargetFile  string
-	Repository         string
+	Fingerprint       string
+	SnykIssueID       string
+	SnykIssueKey      string
+	IssueType         string
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
+	ProjectID         string
+	ProjectName       string
+	ProjectOrigin     string
+	ProjectReference  string
+	ProjectTargetFile string
+	Repository        string
+	// ProjectCluster is the Kubernetes cluster the finding's workload runs
+	// in, populated only for projects with origin "kubernetes" (from the
+	// v1 project detail's imageCluster field). Empty for other origins or
+	// when Snyk does not report a cluster.
+	ProjectCluster string
+	// ProjectNamespace is the Kubernetes namespace of the finding's
+	// workload, populated only for projects with origin "kubernetes".
+	// Parsed from the project name, which the Snyk Kubernetes integration
+	// builds as "<namespace>/<kind>.<group>/<workload>:<target>".
+	ProjectNamespace   string
 	IssueTitle         string
 	Severity           string
 	CVSS               float64
