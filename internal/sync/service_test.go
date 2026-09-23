@@ -5475,8 +5475,8 @@ func TestRunClusterLookupFailureDefersRebindUntilLookupSucceeds(t *testing.T) {
 	if err != nil {
 		t.Fatalf("run 1: Run() error = %v", err)
 	}
-	if result1.Rebound != 0 || len(linear1.created) != 0 {
-		t.Fatalf("run 1: rebound=%d created=%d, want 0/0", result1.Rebound, len(linear1.created))
+	if result1.Rebound != 0 || len(linear1.created) != 0 || result1.DeferredCreates != 1 {
+		t.Fatalf("run 1: rebound=%d created=%d deferred=%d, want 0/0/1", result1.Rebound, len(linear1.created), result1.DeferredCreates)
 	}
 	if len(linear1.updates) != 1 || linear1.updates[0].Desired.State != model.StateCancelled {
 		t.Fatalf("run 1: want the old ticket cancelled, got %v", linear1.updates)
@@ -5523,5 +5523,54 @@ func TestRunClusterLookupFailureStillCreatesWhenNoCandidateCouldMatch(t *testing
 	}
 	if len(linear.created) != 1 || strings.Contains(linear.created[0].Description, "identity:") {
 		t.Fatalf("want one ticket created without an identity line, got %v", linear.created)
+	}
+}
+
+func TestRunClusterLookupFailureDeferralIsCappedAt24Hours(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		closedAgo  time.Duration
+		noClosedAt bool
+		wantDefer  bool
+	}{
+		{name: "candidate closed an hour ago", closedAgo: time.Hour, wantDefer: true},
+		{name: "candidate closed more than 24 hours ago", closedAgo: 25 * time.Hour},
+		{name: "candidate closed at an unknown time", noClosedAt: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := minimalCfg()
+			oldFinding := k8sWorkloadFinding("project-old", "issue-old", "prod", false)
+			cancelled := withClosedReason(storedIssue("old-ticket", "SNYK-100", "Cancelled", desiredIssue(cfg, oldFinding)), model.ClosedReasonProjectMissing)
+			if !tc.noClosedAt {
+				closedAt := time.Now().Add(-tc.closedAgo)
+				cancelled.ClosedAt = &closedAt
+			}
+			linear := &fakeLinear{snapshot: []model.ExistingIssue{cancelled}}
+			snyk := fakeSnyk{snapshot: model.SnykSnapshot{
+				Findings:              []model.Finding{k8sWorkloadFinding("project-new", "issue-new", "", true)},
+				ProjectIDs:            map[string]struct{}{"project-new": {}},
+				ClusterLookupFailures: 1,
+			}}
+
+			result, err := New(cfg, discardLogger(), snyk, linear, nil).Run(context.Background())
+			if err != nil {
+				t.Fatalf("Run() error = %v", err)
+			}
+			if tc.wantDefer {
+				if result.DeferredCreates != 1 || len(linear.created) != 0 {
+					t.Fatalf("deferred=%d created=%d, want 1/0", result.DeferredCreates, len(linear.created))
+				}
+				return
+			}
+			if result.DeferredCreates != 0 || len(linear.created) != 1 {
+				t.Fatalf("deferred=%d created=%d, want 0/1 (the window has passed; create without identity)", result.DeferredCreates, len(linear.created))
+			}
+			if strings.Contains(linear.created[0].Description, "identity:") {
+				t.Fatalf("created ticket must carry no identity:\n%s", linear.created[0].Description)
+			}
+			if result.Rebound != 0 || len(linear.updates) != 0 {
+				t.Fatalf("rebound=%d updates=%d, want 0/0 (candidate left alone)", result.Rebound, len(linear.updates))
+			}
+		})
 	}
 }

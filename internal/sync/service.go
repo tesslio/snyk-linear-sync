@@ -79,7 +79,11 @@ type RunResult struct {
 	// Reopened counts terminal tickets the sync deliberately reopened: sync-
 	// cancelled tickets rebound after project recreation, and tickets closed
 	// while Snyk kept reporting the same occurrence as open.
-	Reopened            int64
+	Reopened int64
+	// DeferredCreates counts findings whose ticket creation was held back
+	// for the run because their cluster lookup failed while a recent rebind
+	// candidate might be theirs (see plausibleRebindCandidate).
+	DeferredCreates     int64
 	PlannedCreates      int64
 	PlannedUpdates      int64
 	PlannedResolves     int64
@@ -343,7 +347,7 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 			}
 		}
 
-		if !matched && finding.ProjectClusterUnknown && plausibleRebindCandidate(rebindCandidates, candidateClusters, finding) {
+		if !matched && finding.ProjectClusterUnknown && plausibleRebindCandidate(rebindCandidates, candidateClusters, finding, s.cfg.Linear.States, time.Now()) {
 			// The cluster lookup failed, so the finding has no identity and
 			// cannot rebind, but a ticket left by a vanished project could be
 			// its own. Creating a fresh ticket now would make the next run
@@ -446,6 +450,7 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 	result.Conflicts = len(duplicatesToCancel)
 	result.Rebound = rebound
 	result.Reopened = reopened
+	result.DeferredCreates = int64(len(deferredFingerprints))
 	var queuedJobs int64
 
 	g, workerCtx := errgroup.WithContext(runCtx)
@@ -1669,17 +1674,36 @@ func rebindCandidateClusters(candidates map[string][]model.ExistingIssue) map[st
 	return out
 }
 
+// deferCreateWindow caps how long a finding whose cluster lookup keeps
+// failing can be held back for a possible rebind: only candidates that are
+// still open, or were closed less than this long ago, justify a deferral.
+// A persistent lookup failure therefore never hides a finding for more than
+// about a day; after that it gets a ticket without an identity as usual.
+const deferCreateWindow = 24 * time.Hour
+
 // plausibleRebindCandidate reports whether a finding whose cluster lookup
-// failed would have an available rebind candidate under the cluster one of
-// the candidates records. It never binds anything: it only decides whether
+// failed would have a recent rebind candidate under the cluster one of the
+// candidates records. It never binds anything: it only decides whether
 // creating a fresh ticket now could pre-empt a correct rebind next run.
-func plausibleRebindCandidate(candidates map[string][]model.ExistingIssue, clusters map[string]struct{}, finding model.Finding) bool {
+// Only candidates that are non-terminal, or were closed within
+// deferCreateWindow of now, count; a terminal candidate with no recorded
+// closed time does not, so visibility wins when the timeline is unknown.
+func plausibleRebindCandidate(candidates map[string][]model.ExistingIssue, clusters map[string]struct{}, finding model.Finding, states config.StateConfig, now time.Time) bool {
 	for cluster := range clusters {
 		probe := finding
 		probe.ProjectClusterUnknown = false
 		probe.ProjectCluster = cluster
-		if identity := model.FindingIdentity(probe); identity != "" && len(candidates[identity]) > 0 {
-			return true
+		identity := model.FindingIdentity(probe)
+		if identity == "" {
+			continue
+		}
+		for _, candidate := range candidates[identity] {
+			if isNonTerminalLinearState(candidate, states) {
+				return true
+			}
+			if candidate.ClosedAt != nil && now.Sub(*candidate.ClosedAt) < deferCreateWindow {
+				return true
+			}
 		}
 	}
 	return false
