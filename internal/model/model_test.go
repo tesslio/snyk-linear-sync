@@ -126,6 +126,8 @@ func TestFindingIdentity(t *testing.T) {
 		"name":       func(f *Finding) { f.ProjectName = "other" },
 		"targetFile": func(f *Finding) { f.ProjectTargetFile = "Dockerfile" },
 		"reference":  func(f *Finding) { f.ProjectReference = "dev" },
+		"repository": func(f *Finding) { f.Repository = "other/repo" },
+		"cluster":    func(f *Finding) { f.ProjectCluster = "prod" },
 		"issueKey":   func(f *Finding) { f.SnykIssueKey = "SNYK-OTHER" },
 		"location":   func(f *Finding) { f.Fingerprint = Fingerprint("proj-old", "issue-old", "glibc@2.42") },
 	} {

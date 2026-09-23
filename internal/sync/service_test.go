@@ -5298,3 +5298,97 @@ func TestRunReopenIsNotSuppressedByCacheFastPath(t *testing.T) {
 		t.Fatalf("updates = %v, want the ticket reopened despite matching cache hashes", linear.updates)
 	}
 }
+
+func TestRunDoesNotRebindAcrossKubernetesClusters(t *testing.T) {
+	cfg := minimalCfg()
+	// Snyk names Kubernetes projects without the cluster, so staging and
+	// prod running the same workload differ only by ProjectCluster.
+	k8sFinding := func(projectID, issueID, cluster string) model.Finding {
+		f := recreatedProjectFinding(projectID, issueID)
+		f.ProjectName = "backend/deployment.apps/api:ghcr.io/tesslio/api"
+		f.ProjectOrigin = "kubernetes"
+		f.ProjectReference = ""
+		f.ProjectTargetFile = ""
+		f.ProjectNamespace = "backend"
+		f.ProjectCluster = cluster
+		return f
+	}
+	staging := k8sFinding("project-staging", "issue-s", "staging")
+	prod := k8sFinding("project-prod", "issue-p", "prod")
+	if model.FindingIdentity(staging) == model.FindingIdentity(prod) {
+		t.Fatalf("staging and prod findings share an identity")
+	}
+
+	// The staging project was deleted earlier and its ticket sync-cancelled;
+	// later a prod project with the same workload appears.
+	cancelled := withClosedReason(storedIssue("staging-ticket", "SNYK-100", "Cancelled", desiredIssue(cfg, staging)), model.ClosedReasonProjectMissing)
+	linear := &fakeLinear{snapshot: []model.ExistingIssue{cancelled}}
+	snyk := fakeSnyk{snapshot: model.SnykSnapshot{
+		Findings:   []model.Finding{prod},
+		ProjectIDs: map[string]struct{}{"project-prod": {}},
+	}}
+
+	result, err := New(cfg, discardLogger(), snyk, linear, nil).Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if result.Rebound != 0 || len(linear.created) != 1 || len(linear.updates) != 0 {
+		t.Fatalf("rebound=%d created=%d updates=%d, want 0/1/0 (no cross-cluster rebind)", result.Rebound, len(linear.created), len(linear.updates))
+	}
+}
+
+func TestRunReopensNewestTerminalDuplicateInsteadOfCreatingAnother(t *testing.T) {
+	cfg := minimalCfg()
+	finding := recreatedProjectFinding("project-a", "issue-a")
+	// Snyk resolved an earlier occurrence in May; the current open period
+	// started after that and is tracked by the newest copy.
+	finding.LastResolvedAt = time.Date(2026, time.May, 15, 0, 0, 0, 0, time.UTC)
+	desired := desiredIssue(cfg, finding)
+	at := func(month time.Month) *time.Time {
+		t := time.Date(2026, month, 1, 0, 0, 0, 0, time.UTC)
+		return &t
+	}
+	// The original ticket predates the May resolution; the later copy was
+	// created by an earlier run's reopen guard and then closed early by an
+	// automation. All copies are terminal, so the lowest identifier (the
+	// original) is canonical and fails the created-time check.
+	original := storedIssue("original", "SNYK-100", "Done", desired)
+	original.CreatedAt, original.ClosedAt = at(time.April), at(time.May)
+	middle := storedIssue("middle", "SNYK-200", "Done", desired)
+	middle.CreatedAt, middle.ClosedAt = at(time.June), at(time.July)
+	newest := storedIssue("newest", "SNYK-300", "Done", desired)
+	newest.CreatedAt, newest.ClosedAt = at(time.August), at(time.September)
+	snyk := fakeSnyk{snapshot: model.SnykSnapshot{
+		Findings:   []model.Finding{finding},
+		ProjectIDs: map[string]struct{}{"project-a": {}},
+	}}
+
+	linear := &fakeLinear{snapshot: []model.ExistingIssue{original, newest, middle}}
+	result, err := New(cfg, discardLogger(), snyk, linear, nil).Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if len(linear.created) != 0 {
+		t.Fatalf("created = %d, want 0 (must reopen the newest copy, not add another)", len(linear.created))
+	}
+	if result.Reopened != 1 || result.CancelledDuplicates != 0 {
+		t.Fatalf("reopened=%d cancelledDuplicates=%d, want 1 and 0", result.Reopened, result.CancelledDuplicates)
+	}
+	if len(linear.updates) != 1 || linear.updates[0].Existing.ID != "newest" || linear.updates[0].Desired.State != model.StateTodo {
+		t.Fatalf("updates = %v, want only the newest copy moved to todo (older copies untouched)", updatedIdentifiers(linear.updates))
+	}
+
+	// Next run: the reopened copy is canonical, older copies stay terminal
+	// and untouched, and nothing new is created.
+	reopenedTicket := newest
+	reopenedTicket.StateName = "Todo"
+	reopenedTicket.ClosedAt = nil
+	linear2 := &fakeLinear{snapshot: []model.ExistingIssue{original, reopenedTicket, middle}}
+	result2, err := New(cfg, discardLogger(), snyk, linear2, nil).Run(context.Background())
+	if err != nil {
+		t.Fatalf("run 2: Run() error = %v", err)
+	}
+	if len(linear2.created) != 0 || len(linear2.updates) != 0 || result2.Reopened != 0 {
+		t.Fatalf("run 2: created=%d updates=%v reopened=%d, want none", len(linear2.created), updatedIdentifiers(linear2.updates), result2.Reopened)
+	}
+}

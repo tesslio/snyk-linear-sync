@@ -324,8 +324,9 @@ func FingerprintLocation(fingerprint string) string {
 const identityLength = 32
 
 // FindingIdentity returns a project-independent identity for a finding,
-// derived only from Snyk data: the project's origin, name, target file and
-// target reference, the issue key, and the fingerprint's location segment.
+// derived only from Snyk data: the project's origin, name, target file,
+// target reference, repository and Kubernetes cluster, the issue key, and
+// the fingerprint's location segment.
 //
 // Snyk sometimes recreates a project (same name, same target) under a new
 // project ID, which also mints new issue IDs, so every fingerprint changes
@@ -335,6 +336,13 @@ const identityLength = 32
 // The issue key is Snyk's coalesced key (attributes.key, else the first
 // problem ID, else the issue ID); only in the last case does the identity
 // change on recreation, which merely falls back to today's behavior.
+//
+// The cluster matters because Snyk names Kubernetes projects
+// "<namespace>/<kind>.<group>/<workload>:<target>" with no cluster in the
+// name: the same workload in staging and prod would otherwise share an
+// identity, so a recreation could swap tickets between clusters and a
+// deleted staging project's cancelled tickets could be rebound to prod
+// findings.
 //
 // It returns "" when the project name or issue key is missing, since the
 // remaining fields are too generic to identify a finding across projects.
@@ -351,6 +359,8 @@ func FindingIdentity(finding Finding) string {
 		name,
 		strings.TrimSpace(finding.ProjectTargetFile),
 		strings.TrimSpace(finding.ProjectReference),
+		strings.TrimSpace(finding.Repository),
+		strings.TrimSpace(finding.ProjectCluster),
 		key,
 		FingerprintLocation(finding.Fingerprint),
 	} {

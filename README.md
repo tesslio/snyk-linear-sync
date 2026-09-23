@@ -165,7 +165,7 @@ closed_reason: project-missing
 ```
 
 - `fingerprint` is the exact join key to the Snyk finding.
-- `identity` is a project-independent hash of the finding (project origin, name, target file and target reference, issue key, and location). It is written on every create and update and lets the sync find the ticket again if Snyk recreates the project under a new project ID. Tickets created before this line existed gain it on their next update; the first run after upgrading therefore updates every matched ticket once (a metadata-only change, so no change comment is posted).
+- `identity` is a project-independent hash of the finding (project origin, name, target file, target reference, repository and Kubernetes cluster, issue key, and location). It is written on every create and update and lets the sync find the ticket again if Snyk recreates the project under a new project ID. Tickets created before this line existed gain it on their next update; the first run after upgrading therefore updates every matched ticket once (a metadata-only change, so no change comment is posted).
 - `closed_reason` is present only on tickets the sync cancelled because their Snyk project went missing (`project-missing`) or was deactivated (`project-deactivated`). It marks the closure as machine-made, not a fix or a human decision. It is dropped as soon as the ticket tracks a live finding again.
 
 Changing or removing that block can cause duplicate issues or prevent updates from matching the correct Linear issue.
@@ -371,7 +371,7 @@ These distinctions are intentional:
 
 A closed (`Done`/`Cancelled`) ticket is normally never reopened when Snyk reports its finding as open again: Snyk reuses an issue ID when the same problem type reappears on different code, so the sync creates a fresh ticket instead. There are two exceptions, both derived from Snyk data:
 
-- **Closed while still open in Snyk.** When the fingerprint matches exactly and includes a location, the ticket has recorded creation and closed times in Linear, and Snyk's `last_resolved_at` shows no resolution since the ticket was created (empty, or earlier than the ticket's creation), the finding has been open for the ticket's whole life. The closure was premature (for example an automation marked it `Done`), so the sync reopens the ticket instead of minting a duplicate with the same fingerprint. An issue ID reused for a new occurrence always shows a later `last_resolved_at`, because Snyk resolved the old occurrence first, so this cannot reopen the tickets the guard exists to protect. An unparsable `last_resolved_at`, a coarse fingerprint, an archived ticket, or a missing Linear timestamp keeps the default behavior.
+- **Closed while still open in Snyk.** When the fingerprint matches exactly and includes a location, the ticket has recorded creation and closed times in Linear, and Snyk's `last_resolved_at` shows no resolution since the ticket was created (empty, or earlier than the ticket's creation), the finding has been open for the ticket's whole life. The closure was premature (for example an automation marked it `Done`), so the sync reopens the ticket (when earlier runs already left several closed copies with that fingerprint, the check runs against the most recently created one, which then becomes the canonical ticket; older copies are left untouched) instead of minting a duplicate with the same fingerprint. An issue ID reused for a new occurrence always shows a later `last_resolved_at`, because Snyk resolved the old occurrence first, so this cannot reopen the tickets the guard exists to protect. An unparsable `last_resolved_at`, a coarse fingerprint, an archived ticket, or a missing Linear timestamp keeps the default behavior.
 - **Project recreation.** See below.
 
 ### Project Recreation
@@ -469,7 +469,7 @@ See [.env.example](/workspace/.env.example).
 ## Logs
 
 - Console logs show startup, load progress, work progress, cache refresh, and final summary.
-- The final `sync complete` line reports `findings`, `existing_issues`, `active_projects`, `inactive_projects`, `conflicts`, `rebound`, `planned_creates`, `planned_updates`, `planned_resolves`, `cancelled_duplicates`, and `failed_ops`. Each rebind is also logged individually with the old and new project ID and the Linear identifier.
+- The final `sync complete` line reports `findings`, `existing_issues`, `active_projects`, `inactive_projects`, `conflicts`, `rebound`, `reopened`, `planned_creates`, `planned_updates`, `planned_resolves`, `cancelled_duplicates`, and `failed_ops`. Each rebind is also logged individually with the old and new project ID and the Linear identifier.
 - Error logs are appended to `ERROR_LOG_FILE`.
 - Default error log path: `logs/snyk-linear-sync-errors.log`
 

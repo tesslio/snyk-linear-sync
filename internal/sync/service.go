@@ -72,7 +72,11 @@ type RunResult struct {
 	Conflicts        int
 	// Rebound counts tickets matched to a finding by identity after Snyk
 	// recreated the finding's project under a new project ID.
-	Rebound             int64
+	Rebound int64
+	// Reopened counts terminal tickets the sync deliberately reopened: sync-
+	// cancelled tickets rebound after project recreation, and tickets closed
+	// while Snyk kept reporting the same occurrence as open.
+	Reopened            int64
 	PlannedCreates      int64
 	PlannedUpdates      int64
 	PlannedResolves     int64
@@ -169,7 +173,16 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 	// would both bind to it (ticket stealing + perpetual churn).
 	existingByCoarseFingerprint := map[string]model.ExistingIssue{}
 	var duplicatesToCancel []model.ExistingIssue
+	// terminalByFingerprint lists every non-archived terminal ticket per
+	// fingerprint, duplicates included. When all copies of a fingerprint are
+	// terminal, preferCanonicalDuplicate keeps the lowest identifier (the
+	// original ticket), but the copy an automation closed prematurely is the
+	// newest one; the reopen check must be able to consider it.
+	terminalByFingerprint := map[string][]model.ExistingIssue{}
 	for _, issue := range existingIssues {
+		if issue.Fingerprint != "" && issue.ArchivedAt == nil && isTerminalLinearState(issue, s.cfg.Linear.States) {
+			terminalByFingerprint[issue.Fingerprint] = append(terminalByFingerprint[issue.Fingerprint], issue)
+		}
 		if issue.Fingerprint != "" {
 			if prior, exists := existingByFingerprint[issue.Fingerprint]; exists {
 				canonical, duplicate := preferCanonicalDuplicate(prior, issue, s.cfg.Linear.States)
@@ -216,7 +229,7 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 	// rather than creating a duplicate.
 	matchedExisting := make(map[string]model.ExistingIssue, len(findings))
 	snykHashes := make(map[string]string, len(findings))
-	var rebound int64
+	var rebound, reopened int64
 	for _, finding := range findings {
 		desired := desiredIssue(s.cfg, finding)
 
@@ -282,7 +295,7 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 				// the same one in the recreated project; reopen the ticket.
 				desired.Reopen = true
 				desired.StateReason = "Snyk recreated this finding's project under a new project ID and still reports the finding as open; reopened the ticket cancelled when the old project disappeared"
-			case kind == matchExact && continuouslyOpenSinceTicketCreated(existing, finding):
+			case kind == matchExact && reopenCandidate(terminalByFingerprint[finding.Fingerprint], finding, &existing):
 				// The ticket was closed (typically by an automation outside
 				// the sync) while Snyk kept reporting this exact occurrence as
 				// open. Creating a fresh ticket would mint a duplicate with
@@ -292,6 +305,11 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 				// cannot resurrect a #28 zombie ticket.
 				desired.Reopen = true
 				desired.StateReason = "Snyk still reports this finding as open; reopened instead of creating a duplicate"
+				// The reopened copy becomes canonical; older terminal copies
+				// stay untouched (the duplicate-cancel loop skips terminal
+				// tickets), and next run preferCanonicalDuplicate keeps this
+				// now-open ticket.
+				existingByFingerprint[finding.Fingerprint] = existing
 				s.logger.Info("reopening ticket closed while Snyk still reports the finding as open",
 					slog.String("fingerprint", finding.Fingerprint),
 					slog.String("existing", existing.Identifier),
@@ -365,6 +383,9 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 
 		}
 
+		if desired.Reopen {
+			reopened++
+		}
 		desiredByFingerprint[finding.Fingerprint] = desired
 		snykHashes[finding.Fingerprint] = desiredIssueHash(desired)
 		if matched {
@@ -385,6 +406,7 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 	result.InactiveProjects = len(snykSnapshot.InactiveProjectIDs)
 	result.Conflicts = len(duplicatesToCancel)
 	result.Rebound = rebound
+	result.Reopened = reopened
 	var queuedJobs int64
 
 	g, workerCtx := errgroup.WithContext(runCtx)
@@ -1646,6 +1668,30 @@ func continuouslyOpenSinceTicketCreated(existing model.ExistingIssue, finding mo
 		return true
 	}
 	return finding.LastResolvedAt.Before(*existing.CreatedAt)
+}
+
+// reopenCandidate picks the ticket the premature-closure reopen check is run
+// against: the most recently created non-archived terminal ticket with the
+// finding's exact fingerprint. That is the copy most likely to have tracked
+// the current open period, and the only one that can pass the created-time
+// check when earlier copies predate a Snyk resolution. On success it stores
+// the ticket in *existing and returns true.
+func reopenCandidate(terminal []model.ExistingIssue, finding model.Finding, existing *model.ExistingIssue) bool {
+	if len(terminal) == 0 {
+		return false
+	}
+	newest := terminal[0]
+	for _, issue := range terminal[1:] {
+		c := compareCreatedDesc(issue.CreatedAt, newest.CreatedAt)
+		if c < 0 || (c == 0 && identifierNum(issue.Identifier) > identifierNum(newest.Identifier)) {
+			newest = issue
+		}
+	}
+	if !continuouslyOpenSinceTicketCreated(newest, finding) {
+		return false
+	}
+	*existing = newest
+	return true
 }
 
 // FingerprintProjectID extracts the project ID portion of a Snyk fingerprint.
