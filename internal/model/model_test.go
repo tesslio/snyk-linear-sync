@@ -81,3 +81,66 @@ func TestCoarseFingerprint(t *testing.T) {
 		})
 	}
 }
+
+func TestFingerprintLocation(t *testing.T) {
+	for fp, want := range map[string]string{
+		"snyk:proj:issue":                 "",
+		"snyk:proj:issue:pkg@1.0.0":       "pkg@1.0.0",
+		"snyk:proj:issue:dir/a:b.py":      "dir/a:b.py",
+		"not-a-fingerprint":               "",
+		"snyk:proj":                       "",
+		"snyk:proj:issue:sim/__main__.py": "sim/__main__.py",
+	} {
+		if got := FingerprintLocation(fp); got != want {
+			t.Errorf("FingerprintLocation(%q) = %q, want %q", fp, got, want)
+		}
+	}
+}
+
+func TestFindingIdentity(t *testing.T) {
+	base := Finding{
+		Fingerprint:       Fingerprint("proj-old", "issue-old", "glibc@2.41-12"),
+		SnykIssueID:       "issue-old",
+		SnykIssueKey:      "SNYK-DEBIAN13-GLIBC-19383357",
+		ProjectID:         "proj-old",
+		ProjectName:       "tesslio/monorepo(main):harness/kikimora/Dockerfile.simulators",
+		ProjectOrigin:     "github",
+		ProjectReference:  "main",
+		ProjectTargetFile: "harness/kikimora/Dockerfile.simulators",
+	}
+	identity := FindingIdentity(base)
+	if len(identity) != identityLength {
+		t.Fatalf("identity %q has length %d, want %d", identity, len(identity), identityLength)
+	}
+
+	recreated := base
+	recreated.ProjectID = "proj-new"
+	recreated.SnykIssueID = "issue-new"
+	recreated.Fingerprint = Fingerprint("proj-new", "issue-new", "glibc@2.41-12")
+	if got := FindingIdentity(recreated); got != identity {
+		t.Fatalf("identity changed across project recreation: %q vs %q", got, identity)
+	}
+
+	for name, mutate := range map[string]func(*Finding){
+		"origin":     func(f *Finding) { f.ProjectOrigin = "gitlab" },
+		"name":       func(f *Finding) { f.ProjectName = "other" },
+		"targetFile": func(f *Finding) { f.ProjectTargetFile = "Dockerfile" },
+		"reference":  func(f *Finding) { f.ProjectReference = "dev" },
+		"issueKey":   func(f *Finding) { f.SnykIssueKey = "SNYK-OTHER" },
+		"location":   func(f *Finding) { f.Fingerprint = Fingerprint("proj-old", "issue-old", "glibc@2.42") },
+	} {
+		changed := base
+		mutate(&changed)
+		if FindingIdentity(changed) == identity {
+			t.Errorf("identity ignores %s", name)
+		}
+	}
+
+	missingKey := base
+	missingKey.SnykIssueKey = ""
+	missingName := base
+	missingName.ProjectName = " "
+	if FindingIdentity(missingKey) != "" || FindingIdentity(missingName) != "" {
+		t.Fatalf("identity must be empty without a project name and issue key")
+	}
+}

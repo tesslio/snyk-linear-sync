@@ -1295,7 +1295,7 @@ func TestIssueTitleUsesReferenceForNonGitHubTargetFileFindings(t *testing.T) {
 func TestUpsertManagedMetadataRemovesVisibleFingerprintFooter(t *testing.T) {
 	description := "Status: `open`\n\n<!-- snyk-linear-sync\nfingerprint: snyk:project-a:issue-1\n-->\nFingerprint: snyk:project-a:issue-1"
 
-	got := upsertManagedMetadata(description, "snyk:project-a:issue-1", []string{"snyk-automation", "snyk-code"})
+	got := upsertManagedMetadata(description, managedMetadata{Fingerprint: "snyk:project-a:issue-1", ManagedLabels: []string{"snyk-automation", "snyk-code"}})
 
 	if strings.Contains(got, "Fingerprint: snyk:project-a:issue-1") {
 		t.Fatalf("upsertManagedMetadata() left visible fingerprint footer: %s", got)
@@ -1311,7 +1311,7 @@ func TestUpsertManagedMetadataRemovesVisibleFingerprintFooter(t *testing.T) {
 func TestUpsertManagedMetadataIgnoresInlineMarker(t *testing.T) {
 	description := "See <!-- snyk-linear-sync notes --> for details\n\nStatus: `open`"
 
-	got := upsertManagedMetadata(description, "snyk:project-a:issue-1", []string{"snyk-automation"})
+	got := upsertManagedMetadata(description, managedMetadata{Fingerprint: "snyk:project-a:issue-1", ManagedLabels: []string{"snyk-automation"}})
 
 	// The inline marker should NOT be replaced; it should remain intact.
 	if !strings.Contains(got, "See <!-- snyk-linear-sync notes -->") {
@@ -1402,7 +1402,7 @@ func TestUpsertManagedMetadataKeepsRealTrailingBlockWithFakeEarlierBlock(t *test
 		"-->",
 	}, "\n")
 
-	got := upsertManagedMetadata(description, "snyk:project-a:issue-2", []string{"snyk-automation"})
+	got := upsertManagedMetadata(description, managedMetadata{Fingerprint: "snyk:project-a:issue-2", ManagedLabels: []string{"snyk-automation"}})
 
 	// The fake earlier block must be left alone.
 	if !strings.Contains(got, "fingerprint: snyk:spoofed:fake") {
@@ -4650,5 +4650,651 @@ func TestRunBatchCommentPartialFailureRetriesOnlyFailedComment(t *testing.T) {
 	retry := linear.commentCallBatches[1]
 	if len(retry) != 1 || retry[0].Desired.Fingerprint != "snyk:project-a:issue-2" {
 		t.Fatalf("comment retry batch = %+v, want only the failed issue-2 update", retry)
+	}
+}
+
+// storedIssue models what the next run reads back after Linear stores
+// desired: the same description, with the metadata fields the Linear client
+// would parse out of it (fingerprint, identity, closed_reason, labels).
+func storedIssue(id, identifier, stateName string, desired model.DesiredIssue) model.ExistingIssue {
+	issue := model.ExistingIssue{
+		ID:            id,
+		Identifier:    identifier,
+		Title:         desired.Title,
+		Description:   desired.Description,
+		DueDate:       desired.DueDate,
+		StateName:     stateName,
+		Fingerprint:   desired.Fingerprint,
+		ManagedLabels: desired.ManagedLabels,
+		Priority:      desired.Priority,
+	}
+	start := findMetadataBlockStart(desired.Description)
+	if start < 0 {
+		return issue
+	}
+	for line := range strings.SplitSeq(desired.Description[start:], "\n") {
+		if after, ok := strings.CutPrefix(line, "identity: "); ok {
+			issue.Identity = after
+		}
+		if after, ok := strings.CutPrefix(line, "closed_reason: "); ok {
+			issue.ClosedReason = after
+		}
+	}
+	return issue
+}
+
+// recreatedProjectFinding returns the same Snyk finding as seen in a project
+// with the given ID: Snyk recreating a project keeps its name, target and
+// issue key but mints a new project ID and new issue IDs.
+func recreatedProjectFinding(projectID, issueID string) model.Finding {
+	return model.Finding{
+		Fingerprint:       model.Fingerprint(projectID, issueID, "glibc@2.41-12"),
+		SnykIssueID:       issueID,
+		SnykIssueKey:      "SNYK-DEBIAN13-GLIBC-19383357",
+		ProjectID:         projectID,
+		ProjectName:       "tesslio/monorepo(main):harness/kikimora/Dockerfile.simulators",
+		ProjectOrigin:     "github",
+		ProjectReference:  "main",
+		ProjectTargetFile: "harness/kikimora/Dockerfile.simulators",
+		IssueTitle:        "Integer Overflow",
+		PackageName:       "glibc",
+		VulnerableVersion: "2.41-12",
+		Severity:          "high",
+		Status:            model.FindingOpen,
+		CreatedAt:         time.Date(2026, time.August, 1, 0, 0, 0, 0, time.UTC),
+	}
+}
+
+// withClosedReason records closedReason in the ticket's metadata block, as
+// the resolve loop does when it cancels a ticket whose project vanished.
+func withClosedReason(issue model.ExistingIssue, closedReason string) model.ExistingIssue {
+	issue.Description = upsertManagedMetadata(issue.Description, managedMetadata{
+		Fingerprint:   issue.Fingerprint,
+		Identity:      issue.Identity,
+		ManagedLabels: issue.ManagedLabels,
+		ClosedReason:  closedReason,
+	})
+	issue.ClosedReason = closedReason
+	return issue
+}
+
+func discardLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+func TestRunRebindsOpenTicketAfterProjectRecreation(t *testing.T) {
+	cfg := minimalCfg()
+	oldFinding := recreatedProjectFinding("project-old", "issue-old")
+	newFinding := recreatedProjectFinding("project-new", "issue-new")
+	if model.FindingIdentity(oldFinding) == "" || model.FindingIdentity(oldFinding) != model.FindingIdentity(newFinding) {
+		t.Fatalf("identity must survive project recreation: old %q new %q", model.FindingIdentity(oldFinding), model.FindingIdentity(newFinding))
+	}
+
+	// The old project vanished in the same run the new one appeared, while
+	// its ticket was still open (a human had moved it to In Progress).
+	existing := storedIssue("existing-1", "SNYK-100", "In Progress", desiredIssue(cfg, oldFinding))
+	linear := &fakeLinear{snapshot: []model.ExistingIssue{existing}}
+	snyk := fakeSnyk{snapshot: model.SnykSnapshot{
+		Findings:   []model.Finding{newFinding},
+		ProjectIDs: map[string]struct{}{"project-new": {}},
+	}}
+
+	result, err := New(cfg, discardLogger(), snyk, linear, nil).Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if result.Rebound != 1 {
+		t.Fatalf("Rebound = %d, want 1", result.Rebound)
+	}
+	if result.PlannedCreates != 0 || len(linear.created) != 0 {
+		t.Fatalf("created = %d, want 0 (the old ticket must be rebound, not copied)", len(linear.created))
+	}
+	if result.PlannedResolves != 0 {
+		t.Fatalf("PlannedResolves = %d, want 0 (the rebound ticket must not also be cancelled)", result.PlannedResolves)
+	}
+	if len(linear.updates) != 1 {
+		t.Fatalf("updates = %d, want 1", len(linear.updates))
+	}
+	update := linear.updates[0]
+	if update.Existing.ID != "existing-1" {
+		t.Fatalf("updated %s, want existing-1", update.Existing.ID)
+	}
+	if update.Desired.Fingerprint != newFinding.Fingerprint {
+		t.Fatalf("fingerprint = %q, want the new project's %q", update.Desired.Fingerprint, newFinding.Fingerprint)
+	}
+	if !strings.Contains(update.Desired.Description, "fingerprint: "+newFinding.Fingerprint) || !strings.Contains(update.Desired.Description, "(`project-new`)") {
+		t.Fatalf("description not rewritten from the new finding:\n%s", update.Desired.Description)
+	}
+	if !update.Desired.PreserveState {
+		t.Fatalf("PreserveState = false, want true (the human's open state is kept)")
+	}
+
+	// Next run: the ticket now carries the new fingerprint and converges.
+	linear2 := &fakeLinear{snapshot: []model.ExistingIssue{storedIssue("existing-1", "SNYK-100", "In Progress", update.Desired)}}
+	result2, err := New(cfg, discardLogger(), snyk, linear2, nil).Run(context.Background())
+	if err != nil {
+		t.Fatalf("run 2: Run() error = %v", err)
+	}
+	if result2.Rebound != 0 || len(linear2.created) != 0 || len(linear2.updates) != 0 {
+		t.Fatalf("run 2: rebound=%d created=%d updates=%d, want all 0", result2.Rebound, len(linear2.created), len(linear2.updates))
+	}
+}
+
+func TestRunRebindsSyncCancelledTicketAfterProjectRecreation(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		inactive   bool
+		wantReason string
+	}{
+		{name: "project deleted", wantReason: model.ClosedReasonProjectMissing},
+		{name: "project deactivated", inactive: true, wantReason: model.ClosedReasonProjectDeactivated},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := minimalCfg()
+			oldFinding := recreatedProjectFinding("project-old", "issue-old")
+			newFinding := recreatedProjectFinding("project-new", "issue-new")
+			existing := storedIssue("existing-1", "SNYK-100", "Todo", desiredIssue(cfg, oldFinding))
+
+			// Run 1: the old project disappears and nothing replaces it yet.
+			// The sync cancels the ticket and records why.
+			snapshot1 := model.SnykSnapshot{ProjectIDs: map[string]struct{}{"project-other": {}}}
+			if tc.inactive {
+				snapshot1.InactiveProjectIDs = map[string]struct{}{"project-old": {}}
+			}
+			linear1 := &fakeLinear{snapshot: []model.ExistingIssue{existing}}
+			if _, err := New(cfg, discardLogger(), fakeSnyk{snapshot: snapshot1}, linear1, nil).Run(context.Background()); err != nil {
+				t.Fatalf("run 1: Run() error = %v", err)
+			}
+			if len(linear1.updates) != 1 || linear1.updates[0].Desired.State != model.StateCancelled {
+				t.Fatalf("run 1: want one cancel, got %v", linear1.updates)
+			}
+			cancelled := storedIssue("existing-1", "SNYK-100", "Cancelled", linear1.updates[0].Desired)
+			if cancelled.ClosedReason != tc.wantReason {
+				t.Fatalf("run 1: closed_reason = %q, want %q:\n%s", cancelled.ClosedReason, tc.wantReason, cancelled.Description)
+			}
+			if cancelled.Identity != existing.Identity {
+				t.Fatalf("run 1: identity = %q, want it kept (%q)", cancelled.Identity, existing.Identity)
+			}
+
+			// Run 2 (possibly weeks later): the recreated project appears.
+			snapshot2 := model.SnykSnapshot{
+				Findings:   []model.Finding{newFinding},
+				ProjectIDs: map[string]struct{}{"project-other": {}, "project-new": {}},
+			}
+			if tc.inactive {
+				snapshot2.InactiveProjectIDs = map[string]struct{}{"project-old": {}}
+			}
+			linear2 := &fakeLinear{snapshot: []model.ExistingIssue{cancelled}}
+			result2, err := New(cfg, discardLogger(), fakeSnyk{snapshot: snapshot2}, linear2, nil).Run(context.Background())
+			if err != nil {
+				t.Fatalf("run 2: Run() error = %v", err)
+			}
+			if result2.Rebound != 1 || len(linear2.created) != 0 {
+				t.Fatalf("run 2: rebound=%d created=%d, want 1 and 0", result2.Rebound, len(linear2.created))
+			}
+			if len(linear2.updates) != 1 {
+				t.Fatalf("run 2: updates = %d, want 1", len(linear2.updates))
+			}
+			update := linear2.updates[0]
+			if update.Desired.State != model.StateTodo || !update.Desired.Reopen || !update.Diff.StateChanged {
+				t.Fatalf("run 2: state=%q reopen=%v stateChanged=%v, want todo/true/true", update.Desired.State, update.Desired.Reopen, update.Diff.StateChanged)
+			}
+			if update.Desired.Fingerprint != newFinding.Fingerprint {
+				t.Fatalf("run 2: fingerprint = %q, want %q", update.Desired.Fingerprint, newFinding.Fingerprint)
+			}
+			if strings.Contains(update.Desired.Description, "closed_reason:") {
+				t.Fatalf("run 2: closed_reason must be cleared once the ticket is active again:\n%s", update.Desired.Description)
+			}
+		})
+	}
+}
+
+func TestRunDoesNotRebindWhenOldProjectStillActive(t *testing.T) {
+	cfg := minimalCfg()
+	// Two live projects scanning the same target: each keeps its own ticket.
+	oldFinding := recreatedProjectFinding("project-a", "issue-a")
+	newFinding := recreatedProjectFinding("project-b", "issue-b")
+	existing := storedIssue("existing-1", "SNYK-100", "Todo", desiredIssue(cfg, oldFinding))
+	linear := &fakeLinear{snapshot: []model.ExistingIssue{existing}}
+	snyk := fakeSnyk{snapshot: model.SnykSnapshot{
+		Findings:   []model.Finding{newFinding},
+		ProjectIDs: map[string]struct{}{"project-a": {}, "project-b": {}},
+	}}
+
+	result, err := New(cfg, discardLogger(), snyk, linear, nil).Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if result.Rebound != 0 || len(linear.created) != 1 {
+		t.Fatalf("rebound=%d created=%d, want 0 and 1", result.Rebound, len(linear.created))
+	}
+	for _, u := range linear.updates {
+		if u.Existing.ID == "existing-1" && u.Desired.Fingerprint != existing.Fingerprint {
+			t.Fatalf("active project's ticket was rebound: %+v", u.Desired)
+		}
+	}
+}
+
+func TestRunDoesNotRebindTicketClosedByFixOrPerson(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		state        string
+		closedReason string
+	}{
+		{name: "done by fix or person", state: "Done"},
+		{name: "cancelled by person", state: "Cancelled"},
+		// A person moved a sync-cancelled ticket to Done: their decision wins.
+		{name: "sync-cancelled then moved to done", state: "Done", closedReason: model.ClosedReasonProjectMissing},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := minimalCfg()
+			existing := storedIssue("existing-1", "SNYK-100", tc.state, desiredIssue(cfg, recreatedProjectFinding("project-old", "issue-old")))
+			existing = withClosedReason(existing, tc.closedReason)
+			linear := &fakeLinear{snapshot: []model.ExistingIssue{existing}}
+			snyk := fakeSnyk{snapshot: model.SnykSnapshot{
+				Findings:   []model.Finding{recreatedProjectFinding("project-new", "issue-new")},
+				ProjectIDs: map[string]struct{}{"project-new": {}},
+			}}
+
+			result, err := New(cfg, discardLogger(), snyk, linear, nil).Run(context.Background())
+			if err != nil {
+				t.Fatalf("Run() error = %v", err)
+			}
+			if result.Rebound != 0 || len(linear.created) != 1 {
+				t.Fatalf("rebound=%d created=%d, want 0 and 1", result.Rebound, len(linear.created))
+			}
+			for _, u := range linear.updates {
+				if isNonTerminalModelState(u.Desired.State) {
+					t.Fatalf("closed ticket was reopened: %+v", u.Desired)
+				}
+			}
+		})
+	}
+}
+
+func TestRunDoesNotRebindArchivedTicket(t *testing.T) {
+	cfg := minimalCfg()
+	archivedAt := time.Date(2026, time.September, 1, 0, 0, 0, 0, time.UTC)
+	existing := storedIssue("existing-1", "SNYK-100", "Cancelled", desiredIssue(cfg, recreatedProjectFinding("project-old", "issue-old")))
+	existing = withClosedReason(existing, model.ClosedReasonProjectMissing)
+	existing.ArchivedAt = &archivedAt
+	linear := &fakeLinear{snapshot: []model.ExistingIssue{existing}}
+	snyk := fakeSnyk{snapshot: model.SnykSnapshot{
+		Findings:   []model.Finding{recreatedProjectFinding("project-new", "issue-new")},
+		ProjectIDs: map[string]struct{}{"project-new": {}},
+	}}
+
+	result, err := New(cfg, discardLogger(), snyk, linear, nil).Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if result.Rebound != 0 || len(linear.created) != 1 || len(linear.updates) != 0 {
+		t.Fatalf("rebound=%d created=%d updates=%d, want 0/1/0", result.Rebound, len(linear.created), len(linear.updates))
+	}
+}
+
+func TestRunRebindCandidatesAreDeterministicAndSingleUse(t *testing.T) {
+	cfg := minimalCfg()
+	older := time.Date(2026, time.July, 1, 0, 0, 0, 0, time.UTC)
+	newer := time.Date(2026, time.August, 1, 0, 0, 0, 0, time.UTC)
+
+	// Three tickets share the identity (earlier recreations left copies).
+	// The same old fingerprint on several tickets would be a duplicate
+	// conflict, so each sits in a different vanished project.
+	openOlder := storedIssue("open-older", "SNYK-10", "Todo", desiredIssue(cfg, recreatedProjectFinding("project-gone-1", "issue-1")))
+	openOlder.CreatedAt = &older
+	openNewer := storedIssue("open-newer", "SNYK-20", "Todo", desiredIssue(cfg, recreatedProjectFinding("project-gone-2", "issue-2")))
+	openNewer.CreatedAt = &newer
+	cancelled := storedIssue("cancelled", "SNYK-30", "Cancelled", desiredIssue(cfg, recreatedProjectFinding("project-gone-3", "issue-3")))
+	cancelled = withClosedReason(cancelled, model.ClosedReasonProjectMissing)
+	cancelled.CreatedAt = &newer
+
+	// Two findings with the same identity (two recreated projects with the
+	// same name) take the two best candidates, one each, in order.
+	first := recreatedProjectFinding("project-new-1", "issue-new-1")
+	second := recreatedProjectFinding("project-new-2", "issue-new-2")
+
+	for range 20 {
+		linear := &fakeLinear{snapshot: []model.ExistingIssue{cancelled, openOlder, openNewer}}
+		snyk := fakeSnyk{snapshot: model.SnykSnapshot{
+			Findings:   []model.Finding{first, second},
+			ProjectIDs: map[string]struct{}{"project-new-1": {}, "project-new-2": {}},
+		}}
+		result, err := New(cfg, discardLogger(), snyk, linear, nil).Run(context.Background())
+		if err != nil {
+			t.Fatalf("Run() error = %v", err)
+		}
+		if result.Rebound != 2 || len(linear.created) != 0 {
+			t.Fatalf("rebound=%d created=%d, want 2 and 0", result.Rebound, len(linear.created))
+		}
+		bound := map[string]string{}
+		var resolved []string
+		for _, u := range linear.updates {
+			if u.Desired.Fingerprint == u.Existing.Fingerprint {
+				resolved = append(resolved, u.Existing.ID)
+				continue
+			}
+			bound[u.Desired.Fingerprint] = u.Existing.ID
+		}
+		if bound[first.Fingerprint] != "open-newer" || bound[second.Fingerprint] != "open-older" {
+			t.Fatalf("bindings = %v, want first->open-newer, second->open-older", bound)
+		}
+		// The leftover sync-cancelled ticket is left alone.
+		if len(resolved) != 0 {
+			t.Fatalf("resolved = %v, want none", resolved)
+		}
+	}
+}
+
+func TestRunIdentityBackfillHappensOnce(t *testing.T) {
+	cfg := minimalCfg()
+	finding := recreatedProjectFinding("project-a", "issue-a")
+	desired := desiredIssue(cfg, finding)
+	identityLine := "identity: " + model.FindingIdentity(finding) + "\n"
+	if !strings.Contains(desired.Description, identityLine) {
+		t.Fatalf("desired description lacks the identity line:\n%s", desired.Description)
+	}
+
+	// A ticket written before the identity line existed.
+	legacy := desired
+	legacy.Description = strings.Replace(desired.Description, identityLine, "", 1)
+	existing := storedIssue("existing-1", "SNYK-100", "Todo", legacy)
+	if existing.Identity != "" {
+		t.Fatalf("legacy ticket unexpectedly has identity %q", existing.Identity)
+	}
+	snyk := fakeSnyk{snapshot: model.SnykSnapshot{
+		Findings:   []model.Finding{finding},
+		ProjectIDs: map[string]struct{}{"project-a": {}},
+	}}
+
+	linear1 := &fakeLinear{snapshot: []model.ExistingIssue{existing}}
+	if _, err := New(cfg, discardLogger(), snyk, linear1, nil).Run(context.Background()); err != nil {
+		t.Fatalf("run 1: Run() error = %v", err)
+	}
+	if len(linear1.updates) != 1 {
+		t.Fatalf("run 1: updates = %d, want 1 (one-time identity backfill)", len(linear1.updates))
+	}
+	diff := linear1.updates[0].Diff
+	if !diff.DescriptionChanged || !diff.MetadataOnlyDescriptionChange {
+		t.Fatalf("run 1: diff = %+v, want a metadata-only description change", diff)
+	}
+
+	linear2 := &fakeLinear{snapshot: []model.ExistingIssue{storedIssue("existing-1", "SNYK-100", "Todo", linear1.updates[0].Desired)}}
+	if _, err := New(cfg, discardLogger(), snyk, linear2, nil).Run(context.Background()); err != nil {
+		t.Fatalf("run 2: Run() error = %v", err)
+	}
+	if len(linear2.updates) != 0 {
+		t.Fatalf("run 2: updates = %d, want 0 (backfill must happen exactly once)", len(linear2.updates))
+	}
+}
+
+func TestRunSkipsUpdatesToArchivedMatchedTicket(t *testing.T) {
+	cfg := minimalCfg()
+	finding := recreatedProjectFinding("project-a", "issue-a")
+	finding.Status = model.FindingFixed
+	legacy := desiredIssue(cfg, finding)
+	legacy.Description = "stale description"
+	existing := storedIssue("existing-1", "SNYK-100", "Done", legacy)
+	archivedAt := time.Date(2026, time.September, 1, 0, 0, 0, 0, time.UTC)
+	existing.ArchivedAt = &archivedAt
+	linear := &fakeLinear{snapshot: []model.ExistingIssue{existing}}
+	snyk := fakeSnyk{snapshot: model.SnykSnapshot{
+		Findings:   []model.Finding{finding},
+		ProjectIDs: map[string]struct{}{"project-a": {}},
+	}}
+
+	if _, err := New(cfg, discardLogger(), snyk, linear, nil).Run(context.Background()); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if len(linear.updates) != 0 || len(linear.created) != 0 {
+		t.Fatalf("updates=%d created=%d, want 0 (Linear rejects updates to archived issues)", len(linear.updates), len(linear.created))
+	}
+}
+
+func TestMetadataBlockClosedReasonRoundTrips(t *testing.T) {
+	description := upsertManagedMetadata("body", managedMetadata{
+		Fingerprint:   "snyk:project-a:issue-1:pkg@1.0.0",
+		Identity:      "0123456789abcdef0123456789abcdef",
+		ManagedLabels: []string{"snyk-automation"},
+		ClosedReason:  model.ClosedReasonProjectDeactivated,
+	})
+	got := storedIssue("id", "SNYK-1", "Cancelled", model.DesiredIssue{Description: description})
+	if got.Identity != "0123456789abcdef0123456789abcdef" || got.ClosedReason != model.ClosedReasonProjectDeactivated {
+		t.Fatalf("identity=%q closed_reason=%q:\n%s", got.Identity, got.ClosedReason, description)
+	}
+	// Rewriting without a closed reason clears it.
+	cleared := upsertManagedMetadata(description, managedMetadata{Fingerprint: "snyk:project-a:issue-1:pkg@1.0.0"})
+	if strings.Contains(cleared, "closed_reason") || strings.Contains(cleared, "identity:") {
+		t.Fatalf("stale metadata left behind:\n%s", cleared)
+	}
+}
+
+func TestRunResolveLoopRecordsClosedReasonOnlyWhenSyncCloses(t *testing.T) {
+	cfg := minimalCfg()
+	desired := desiredIssue(cfg, recreatedProjectFinding("project-gone", "issue-1"))
+	open := storedIssue("open", "SNYK-1", "Todo", desired)
+	done := storedIssue("done", "SNYK-2", "Done", desired)
+	done.Fingerprint = "snyk:project-gone:issue-2:glibc@2.41-12"
+	fixed := storedIssue("fixed", "SNYK-3", "Todo", desired)
+	fixed.Fingerprint = "snyk:project-live:issue-3:glibc@2.41-12"
+	linear := &fakeLinear{snapshot: []model.ExistingIssue{open, done, fixed}}
+	snyk := fakeSnyk{snapshot: model.SnykSnapshot{ProjectIDs: map[string]struct{}{"project-live": {}}}}
+
+	if _, err := New(cfg, discardLogger(), snyk, linear, nil).Run(context.Background()); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	reasons := map[string]string{}
+	for _, u := range linear.updates {
+		reasons[u.Existing.ID] = storedIssue("", "", "", u.Desired).ClosedReason
+	}
+	if reasons["open"] != model.ClosedReasonProjectMissing {
+		t.Fatalf("open ticket closed_reason = %q, want %q", reasons["open"], model.ClosedReasonProjectMissing)
+	}
+	if r, ok := reasons["done"]; ok && r != "" {
+		t.Fatalf("ticket already Done before its project vanished got closed_reason %q; that closure was not the sync's", r)
+	}
+	if reasons["fixed"] != "" {
+		t.Fatalf("ticket resolved in an active project got closed_reason %q", reasons["fixed"])
+	}
+}
+
+func TestRunReopensTicketClosedWhileSnykStillReportsOpen(t *testing.T) {
+	created := time.Date(2026, time.August, 1, 0, 0, 0, 0, time.UTC)
+	closed := time.Date(2026, time.September, 1, 0, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name           string
+		lastResolvedAt time.Time
+	}{
+		{name: "never resolved"},
+		{name: "resolved before the ticket was created", lastResolvedAt: created.Add(-24 * time.Hour)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := minimalCfg()
+			finding := recreatedProjectFinding("project-a", "issue-a")
+			finding.LastResolvedAt = tc.lastResolvedAt
+			// An automation marked the ticket Done; Snyk still reports it open.
+			existing := storedIssue("existing-1", "SNYK-100", "Done", desiredIssue(cfg, finding))
+			existing.CreatedAt = &created
+			existing.ClosedAt = &closed
+			linear := &fakeLinear{snapshot: []model.ExistingIssue{existing}}
+			snyk := fakeSnyk{snapshot: model.SnykSnapshot{
+				Findings:   []model.Finding{finding},
+				ProjectIDs: map[string]struct{}{"project-a": {}},
+			}}
+
+			result, err := New(cfg, discardLogger(), snyk, linear, nil).Run(context.Background())
+			if err != nil {
+				t.Fatalf("Run() error = %v", err)
+			}
+			if len(linear.created) != 0 || result.PlannedCreates != 0 {
+				t.Fatalf("created = %d, want 0 (must reopen, not duplicate)", len(linear.created))
+			}
+			if len(linear.updates) != 1 {
+				t.Fatalf("updates = %d, want 1", len(linear.updates))
+			}
+			u := linear.updates[0]
+			if u.Existing.ID != "existing-1" || u.Desired.State != model.StateTodo || !u.Diff.StateChanged {
+				t.Fatalf("update = %+v / diff %+v, want existing-1 moved to todo", u.Desired, u.Diff)
+			}
+			if !strings.Contains(u.Desired.StateReason, "reopened instead of creating a duplicate") {
+				t.Fatalf("StateReason = %q", u.Desired.StateReason)
+			}
+		})
+	}
+}
+
+func TestRunDoesNotReopenClosedTicketWhenUnsafe(t *testing.T) {
+	created := time.Date(2026, time.August, 1, 0, 0, 0, 0, time.UTC)
+	closed := time.Date(2026, time.September, 1, 0, 0, 0, 0, time.UTC)
+	archived := time.Date(2026, time.September, 10, 0, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name   string
+		mutate func(*model.Finding, *model.ExistingIssue)
+	}{
+		{
+			// Issue-ID reuse: Snyk resolved the old occurrence (then the sync
+			// closed the ticket on a later run), and the ID came back. The
+			// resolution predates the close, so comparing against the close
+			// time would wrongly reopen; it is after the ticket's creation.
+			name: "resolved after the ticket was created, before it was closed",
+			mutate: func(f *model.Finding, _ *model.ExistingIssue) {
+				f.LastResolvedAt = closed.Add(-time.Hour)
+			},
+		},
+		{
+			name: "resolved after the ticket was closed",
+			mutate: func(f *model.Finding, _ *model.ExistingIssue) {
+				f.LastResolvedAt = closed.Add(time.Hour)
+			},
+		},
+		{
+			name: "unparsable last_resolved_at",
+			mutate: func(f *model.Finding, _ *model.ExistingIssue) {
+				f.LastResolvedAtInvalid = true
+			},
+		},
+		{
+			name: "missing closed time",
+			mutate: func(_ *model.Finding, e *model.ExistingIssue) {
+				e.ClosedAt = nil
+			},
+		},
+		{
+			name: "missing created time",
+			mutate: func(_ *model.Finding, e *model.ExistingIssue) {
+				e.CreatedAt = nil
+			},
+		},
+		{
+			name: "archived",
+			mutate: func(_ *model.Finding, e *model.ExistingIssue) {
+				e.ArchivedAt = &archived
+			},
+		},
+		{
+			name: "coarse fingerprint",
+			mutate: func(f *model.Finding, e *model.ExistingIssue) {
+				f.Fingerprint = "snyk:project-a:issue-a"
+				e.Fingerprint = f.Fingerprint
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := minimalCfg()
+			finding := recreatedProjectFinding("project-a", "issue-a")
+			existing := storedIssue("existing-1", "SNYK-100", "Done", desiredIssue(cfg, finding))
+			existing.CreatedAt = &created
+			existing.ClosedAt = &closed
+			tc.mutate(&finding, &existing)
+			linear := &fakeLinear{snapshot: []model.ExistingIssue{existing}}
+			snyk := fakeSnyk{snapshot: model.SnykSnapshot{
+				Findings:   []model.Finding{finding},
+				ProjectIDs: map[string]struct{}{"project-a": {}},
+			}}
+
+			if _, err := New(cfg, discardLogger(), snyk, linear, nil).Run(context.Background()); err != nil {
+				t.Fatalf("Run() error = %v", err)
+			}
+			if len(linear.created) != 1 {
+				t.Fatalf("created = %d, want 1 (keep today's behavior: fresh ticket)", len(linear.created))
+			}
+			for _, u := range linear.updates {
+				if isNonTerminalModelState(u.Desired.State) {
+					t.Fatalf("closed ticket was reopened: %+v", u.Desired)
+				}
+			}
+		})
+	}
+}
+
+func TestRunReopenGuardStillAppliesToCoarseMigration(t *testing.T) {
+	// A coarse-fallback match never reaches a terminal ticket (the coarse
+	// index holds open tickets only), so a Done coarse ticket with complete
+	// timestamps is still left closed and a fresh ticket is created.
+	cfg := minimalCfg()
+	created := time.Date(2026, time.August, 1, 0, 0, 0, 0, time.UTC)
+	closed := time.Date(2026, time.September, 1, 0, 0, 0, 0, time.UTC)
+	finding := recreatedProjectFinding("project-a", "issue-a")
+	existing := storedIssue("existing-1", "SNYK-100", "Done", desiredIssue(cfg, finding))
+	existing.Fingerprint = "snyk:project-a:issue-a"
+	existing.CreatedAt = &created
+	existing.ClosedAt = &closed
+	linear := &fakeLinear{snapshot: []model.ExistingIssue{existing}}
+	snyk := fakeSnyk{snapshot: model.SnykSnapshot{
+		Findings:   []model.Finding{finding},
+		ProjectIDs: map[string]struct{}{"project-a": {}},
+	}}
+
+	if _, err := New(cfg, discardLogger(), snyk, linear, nil).Run(context.Background()); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if len(linear.created) != 1 {
+		t.Fatalf("created = %d, want 1", len(linear.created))
+	}
+	for _, u := range linear.updates {
+		if isNonTerminalModelState(u.Desired.State) {
+			t.Fatalf("closed coarse ticket was reopened: %+v", u.Desired)
+		}
+	}
+}
+
+func TestComputeDiffAllowsOnlyDeliberateReopen(t *testing.T) {
+	states := minimalCfg().Linear.States
+	existing := model.ExistingIssue{StateName: "Done"}
+	if d := ComputeDiff(existing, model.DesiredIssue{State: model.StateTodo}, states); d.StateChanged {
+		t.Fatalf("terminal->open reported without Reopen")
+	}
+	if d := ComputeDiff(existing, model.DesiredIssue{State: model.StateTodo, Reopen: true}, states); !d.StateChanged {
+		t.Fatalf("deliberate reopen not reported as a state change")
+	}
+}
+
+func TestRunReopenIsNotSuppressedByCacheFastPath(t *testing.T) {
+	cfg := minimalCfg()
+	created := time.Date(2026, time.August, 1, 0, 0, 0, 0, time.UTC)
+	closed := time.Date(2026, time.September, 1, 0, 0, 0, 0, time.UTC)
+	finding := recreatedProjectFinding("project-a", "issue-a")
+	desired := desiredIssue(cfg, finding)
+	existing := storedIssue("existing-1", "SNYK-100", "Done", desired)
+	existing.CreatedAt = &created
+	existing.ClosedAt = &closed
+	// The previous run already saw this exact Done ticket and finding (for
+	// example it created a duplicate instead), so both hashes match.
+	cacheStore := &fakeCache{snapshot: cache.Snapshot{
+		SchemaSignature: managedSchemaSignature(),
+		SnykHashes:      map[string]string{finding.Fingerprint: desiredIssueHash(desired)},
+		LinearHashes:    map[string]string{finding.Fingerprint: existingIssueHash(existing)},
+	}}
+	linear := &fakeLinear{snapshot: []model.ExistingIssue{existing}}
+	snyk := fakeSnyk{snapshot: model.SnykSnapshot{
+		Findings:   []model.Finding{finding},
+		ProjectIDs: map[string]struct{}{"project-a": {}},
+	}}
+
+	if _, err := New(cfg, discardLogger(), snyk, linear, cacheStore).Run(context.Background()); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if len(linear.updates) != 1 || linear.updates[0].Desired.State != model.StateTodo {
+		t.Fatalf("updates = %v, want the ticket reopened despite matching cache hashes", linear.updates)
 	}
 }

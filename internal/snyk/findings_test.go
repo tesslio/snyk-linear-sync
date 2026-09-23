@@ -1369,3 +1369,24 @@ func TestLocationKeyDeterministicAcrossCoordinateOrder(t *testing.T) {
 		t.Fatalf("locationKey() = %q, want lexicographically smallest %q", gotForward, "src/a.py")
 	}
 }
+
+func TestLatestResolvedAt(t *testing.T) {
+	latest, invalid := latestResolvedAt(nil)
+	if !latest.IsZero() || invalid {
+		t.Fatalf("no coordinates: got %v invalid=%v", latest, invalid)
+	}
+
+	latest, invalid = latestResolvedAt([]coordinate{
+		{LastResolvedAt: "2026-03-01T00:00:00Z"},
+		{LastResolvedAt: ""},
+		{LastResolvedAt: "2026-05-01T12:00:00Z"},
+	})
+	if invalid || !latest.Equal(time.Date(2026, time.May, 1, 12, 0, 0, 0, time.UTC)) {
+		t.Fatalf("got %v invalid=%v, want the most recent resolution", latest, invalid)
+	}
+
+	_, invalid = latestResolvedAt([]coordinate{{LastResolvedAt: "2026-03-01T00:00:00Z"}, {LastResolvedAt: "yesterday"}})
+	if !invalid {
+		t.Fatalf("an unparsable last_resolved_at must be reported, not read as never resolved")
+	}
+}

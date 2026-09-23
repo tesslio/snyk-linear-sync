@@ -426,51 +426,54 @@ func (c *Client) findingFromIssue(
 	ignoreMeta ignoreMetadata,
 ) model.Finding {
 	source := sourceLocation(issue.Attributes.Coordinates)
+	lastResolvedAt, lastResolvedAtInvalid := latestResolvedAt(issue.Attributes.Coordinates)
 	return model.Finding{
-		Fingerprint:        model.Fingerprint(projectID, issue.ID, locationKey(issue.Attributes.Coordinates)),
-		SnykIssueID:        issue.ID,
-		SnykIssueKey:       issueKey,
-		IssueType:          strings.ToLower(strings.TrimSpace(issue.Attributes.Type)),
-		CreatedAt:          createdAt,
-		UpdatedAt:          updatedAt,
-		ProjectID:          projectID,
-		ProjectName:        project.Name,
-		ProjectOrigin:      project.Origin,
-		ProjectReference:   project.TargetReference,
-		ProjectTargetFile:  project.TargetFile,
-		Repository:         project.Repository,
-		ProjectCluster:     cluster,
-		ProjectNamespace:   project.Namespace,
-		IssueTitle:         coalesce(issue.Attributes.Title, problemTitle(issue.Attributes.Problems), issue.Attributes.Key, issue.ID),
-		Severity:           coalesce(issue.Attributes.EffectiveSeverity, firstProblemSeverity(issue.Attributes.Problems), "unknown"),
-		CVSS:               selectCVSS(issue.Attributes.Severities),
-		ExploitMaturity:    exploitMaturity(issue.Attributes.ExploitDetails.MaturityLevels),
-		PackageName:        packageName(issue.Attributes.Coordinates),
-		VulnerableVersion:  vulnerableVersion(issue.Attributes.Coordinates),
-		FixedVersion:       fixedVersion(issue.Attributes.Coordinates),
-		IssueURL:           c.issueUIURL(orgSlug, projectID, urlKey),
-		IssueAPIURL:        c.issueAPIURL(issue.ID),
-		Status:             mapStatus(issue.Attributes, ignoreMeta.ExpiresAt, ignoreMeta.DisregardIfFixable),
-		IntroducedThrough:  introducedThrough(issue.Attributes.Coordinates),
-		SourceFile:         source.File,
-		SourceCommitID:     source.CommitID,
-		SourceLineStart:    source.Region.Start.Line,
-		SourceColumnStart:  source.Region.Start.Column,
-		SourceLineEnd:      source.Region.End.Line,
-		SourceColumnEnd:    source.Region.End.Column,
-		IgnoreExpiresAt:    ignoreMeta.ExpiresAt,
-		DisregardIfFixable: ignoreMeta.DisregardIfFixable,
-		Classes:            issueClasses(issue.Attributes.Classes),
-		CVEs:               cveIDs(issue.Attributes.Problems),
-		Description:        strings.TrimSpace(issue.Attributes.Description),
-		Remediation:        remediationDescription(issue.Attributes.Coordinates),
-		HasCoordinates:     len(issue.Attributes.Coordinates) > 0,
-		IsFixableManually:  anyFixable(issue.Attributes.Coordinates, func(c coordinate) bool { return c.IsFixableManually }),
-		IsFixableSnyk:      anyFixable(issue.Attributes.Coordinates, func(c coordinate) bool { return c.IsFixableSnyk }),
-		IsFixableUpstream:  anyFixable(issue.Attributes.Coordinates, func(c coordinate) bool { return c.IsFixableUpstream }),
-		IsPatchable:        anyFixable(issue.Attributes.Coordinates, func(c coordinate) bool { return c.IsPatchable }),
-		IsPinnable:         anyFixable(issue.Attributes.Coordinates, func(c coordinate) bool { return c.IsPinnable }),
-		IsUpgradeable:      anyFixable(issue.Attributes.Coordinates, func(c coordinate) bool { return c.IsUpgradeable }),
+		Fingerprint:           model.Fingerprint(projectID, issue.ID, locationKey(issue.Attributes.Coordinates)),
+		SnykIssueID:           issue.ID,
+		SnykIssueKey:          issueKey,
+		IssueType:             strings.ToLower(strings.TrimSpace(issue.Attributes.Type)),
+		CreatedAt:             createdAt,
+		UpdatedAt:             updatedAt,
+		ProjectID:             projectID,
+		ProjectName:           project.Name,
+		ProjectOrigin:         project.Origin,
+		ProjectReference:      project.TargetReference,
+		ProjectTargetFile:     project.TargetFile,
+		Repository:            project.Repository,
+		ProjectCluster:        cluster,
+		ProjectNamespace:      project.Namespace,
+		IssueTitle:            coalesce(issue.Attributes.Title, problemTitle(issue.Attributes.Problems), issue.Attributes.Key, issue.ID),
+		Severity:              coalesce(issue.Attributes.EffectiveSeverity, firstProblemSeverity(issue.Attributes.Problems), "unknown"),
+		CVSS:                  selectCVSS(issue.Attributes.Severities),
+		ExploitMaturity:       exploitMaturity(issue.Attributes.ExploitDetails.MaturityLevels),
+		PackageName:           packageName(issue.Attributes.Coordinates),
+		VulnerableVersion:     vulnerableVersion(issue.Attributes.Coordinates),
+		FixedVersion:          fixedVersion(issue.Attributes.Coordinates),
+		IssueURL:              c.issueUIURL(orgSlug, projectID, urlKey),
+		IssueAPIURL:           c.issueAPIURL(issue.ID),
+		Status:                mapStatus(issue.Attributes, ignoreMeta.ExpiresAt, ignoreMeta.DisregardIfFixable),
+		IntroducedThrough:     introducedThrough(issue.Attributes.Coordinates),
+		SourceFile:            source.File,
+		SourceCommitID:        source.CommitID,
+		SourceLineStart:       source.Region.Start.Line,
+		SourceColumnStart:     source.Region.Start.Column,
+		SourceLineEnd:         source.Region.End.Line,
+		SourceColumnEnd:       source.Region.End.Column,
+		IgnoreExpiresAt:       ignoreMeta.ExpiresAt,
+		DisregardIfFixable:    ignoreMeta.DisregardIfFixable,
+		LastResolvedAt:        lastResolvedAt,
+		LastResolvedAtInvalid: lastResolvedAtInvalid,
+		Classes:               issueClasses(issue.Attributes.Classes),
+		CVEs:                  cveIDs(issue.Attributes.Problems),
+		Description:           strings.TrimSpace(issue.Attributes.Description),
+		Remediation:           remediationDescription(issue.Attributes.Coordinates),
+		HasCoordinates:        len(issue.Attributes.Coordinates) > 0,
+		IsFixableManually:     anyFixable(issue.Attributes.Coordinates, func(c coordinate) bool { return c.IsFixableManually }),
+		IsFixableSnyk:         anyFixable(issue.Attributes.Coordinates, func(c coordinate) bool { return c.IsFixableSnyk }),
+		IsFixableUpstream:     anyFixable(issue.Attributes.Coordinates, func(c coordinate) bool { return c.IsFixableUpstream }),
+		IsPatchable:           anyFixable(issue.Attributes.Coordinates, func(c coordinate) bool { return c.IsPatchable }),
+		IsPinnable:            anyFixable(issue.Attributes.Coordinates, func(c coordinate) bool { return c.IsPinnable }),
+		IsUpgradeable:         anyFixable(issue.Attributes.Coordinates, func(c coordinate) bool { return c.IsUpgradeable }),
 	}
 }
 
@@ -1464,6 +1467,31 @@ func exploitMaturity(levels []maturityLevel) string {
 		out = append(out, value)
 	}
 	return strings.Join(out, ", ")
+}
+
+// latestResolvedAt returns the most recent last_resolved_at across the
+// issue's coordinates, the moment Snyk last saw this issue resolved. Snyk
+// keeps last_resolved_at on a coordinate after the issue reopens, which is
+// how an issue ID reused for a new occurrence shows its earlier resolution.
+// invalid reports that some coordinate carried a value that did not parse:
+// the resolution history is then unknown and callers must not read the
+// zero time as "never resolved".
+func latestResolvedAt(coords []coordinate) (latest time.Time, invalid bool) {
+	for _, coord := range coords {
+		raw := strings.TrimSpace(coord.LastResolvedAt)
+		if raw == "" {
+			continue
+		}
+		t, err := time.Parse(time.RFC3339, raw)
+		if err != nil {
+			invalid = true
+			continue
+		}
+		if t.After(latest) {
+			latest = t
+		}
+	}
+	return latest, invalid
 }
 
 func coordinateResolved(coords []coordinate) bool {
