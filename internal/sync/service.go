@@ -69,7 +69,10 @@ type RunResult struct {
 	// recreated) explains a burst of cancels, rebinds or creates.
 	ActiveProjects   int
 	InactiveProjects int
-	Conflicts        int
+	// ClusterLookupFailures counts Kubernetes projects whose cluster lookup
+	// failed this run; their findings get no identity and cannot rebind.
+	ClusterLookupFailures int
+	Conflicts             int
 	// Rebound counts tickets matched to a finding by identity after Snyk
 	// recreated the finding's project under a new project ID.
 	Rebound int64
@@ -219,6 +222,11 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 	// the resolve loop does not also try to close them: the ticket now
 	// tracks a live finding under its new fingerprint.
 	reboundFingerprints := map[string]struct{}{}
+	// deferredFingerprints records findings held back for one run because
+	// their cluster lookup failed while a rebind candidate may be theirs
+	// (see plausibleRebindCandidate). They are marked seen like any finding.
+	deferredFingerprints := map[string]struct{}{}
+	candidateClusters := rebindCandidateClusters(rebindCandidates)
 
 	desiredByFingerprint := make(map[string]model.DesiredIssue, len(findings))
 	// matchedExisting records the Linear ticket each finding resolved to,
@@ -335,6 +343,36 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 			}
 		}
 
+		if !matched && finding.ProjectClusterUnknown && plausibleRebindCandidate(rebindCandidates, candidateClusters, finding) {
+			// The cluster lookup failed, so the finding has no identity and
+			// cannot rebind, but a ticket left by a vanished project could be
+			// its own. Creating a fresh ticket now would make the next run
+			// match that copy exactly and never rebind, which is the
+			// cancel+create churn rebinding exists to prevent. Hold the
+			// finding back for this run instead; the candidate is cancelled
+			// (recording closed_reason) by the resolve loop as usual and is
+			// rebound once a lookup succeeds.
+			s.logger.Warn("deferring ticket for finding with unknown kubernetes cluster; a rebind candidate may match once the cluster lookup succeeds",
+				slog.String("fingerprint", finding.Fingerprint),
+				slog.String("project_id", finding.ProjectID),
+				slog.String("project_name", finding.ProjectName),
+			)
+			deferredFingerprints[finding.Fingerprint] = struct{}{}
+			continue
+		}
+
+		if matched && finding.ProjectClusterUnknown {
+			// The cluster lookup failed this run, so the finding has no
+			// identity and no cluster. Rendering it as-is would strip the
+			// ticket's stored identity and Cluster line, and put them back on
+			// the next successful run: two pointless updates per failure.
+			// Keep what the ticket already records instead; both are
+			// refreshed from Snyk on the next run whose lookup succeeds.
+			recovered := finding
+			recovered.ProjectCluster = storedCluster(existing.Description)
+			desired.Description = issueDescriptionWithIdentity(s.cfg.Source, desired.ManagedLabels, recovered, existing.Identity)
+		}
+
 		if matched {
 			// Respect manual Backlog override: if a user moved an open ticket from
 			// Todo to Backlog, don't move it back on subsequent syncs.
@@ -404,6 +442,7 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 	result.ExistingIssues = len(existingIssues)
 	result.ActiveProjects = len(snykSnapshot.ProjectIDs)
 	result.InactiveProjects = len(snykSnapshot.InactiveProjectIDs)
+	result.ClusterLookupFailures = snykSnapshot.ClusterLookupFailures
 	result.Conflicts = len(duplicatesToCancel)
 	result.Rebound = rebound
 	result.Reopened = reopened
@@ -427,6 +466,10 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 		seen := make(map[string]struct{}, len(desiredByFingerprint)+len(reboundFingerprints))
 		for fingerprint := range reboundFingerprints {
 			seen[fingerprint] = struct{}{}
+		}
+		for fingerprint := range deferredFingerprints {
+			seen[fingerprint] = struct{}{}
+			seen[model.CoarseFingerprint(fingerprint)] = struct{}{}
 		}
 		createBatch := make([]model.DesiredIssue, 0, createBatchSize)
 		updateBatch := make([]model.IssueUpdate, 0, createBatchSize)
@@ -864,6 +907,32 @@ func issueTitle(finding model.Finding) string {
 }
 
 func issueDescription(sourceCfg config.SourceConfig, managedLabels []string, finding model.Finding) string {
+	return issueDescriptionWithIdentity(sourceCfg, managedLabels, finding, model.FindingIdentity(finding))
+}
+
+// storedCluster returns the cluster a ticket's description already shows
+// (the "Cluster: `...`" line the sync renders above the metadata block), or
+// "" when it shows none. Used only to keep that line stable in a run whose
+// cluster lookup failed.
+func storedCluster(description string) string {
+	if start := findMetadataBlockStart(description); start >= 0 {
+		description = description[:start]
+	}
+	for line := range strings.SplitSeq(description, "\n") {
+		rest, ok := strings.CutPrefix(strings.TrimSpace(line), "Cluster: `")
+		if !ok {
+			continue
+		}
+		if value, _, ok := strings.Cut(rest, "`"); ok {
+			return markdownEscapePattern.ReplaceAllString(value, "$1")
+		}
+	}
+	return ""
+}
+
+// issueDescriptionWithIdentity renders the managed description with an
+// explicit metadata identity ("" omits the line).
+func issueDescriptionWithIdentity(sourceCfg config.SourceConfig, managedLabels []string, finding model.Finding, identity string) string {
 	issueURL := finding.IssueURL
 	if issueURL == "" {
 		issueURL = finding.IssueAPIURL
@@ -981,7 +1050,7 @@ func issueDescription(sourceCfg config.SourceConfig, managedLabels []string, fin
 
 	lines = append(lines, "", metadataBlock(managedMetadata{
 		Fingerprint:   finding.Fingerprint,
-		Identity:      model.FindingIdentity(finding),
+		Identity:      identity,
 		ManagedLabels: managedLabels,
 	}))
 	return strings.Join(lines, "\n")
@@ -1586,6 +1655,34 @@ func rebindCandidatesByIdentity(existingByFingerprint map[string]model.ExistingI
 		})
 	}
 	return out
+}
+
+// rebindCandidateClusters returns the distinct clusters shown by rebind
+// candidates' descriptions ("" for candidates showing none).
+func rebindCandidateClusters(candidates map[string][]model.ExistingIssue) map[string]struct{} {
+	out := map[string]struct{}{}
+	for _, queue := range candidates {
+		for _, issue := range queue {
+			out[storedCluster(issue.Description)] = struct{}{}
+		}
+	}
+	return out
+}
+
+// plausibleRebindCandidate reports whether a finding whose cluster lookup
+// failed would have an available rebind candidate under the cluster one of
+// the candidates records. It never binds anything: it only decides whether
+// creating a fresh ticket now could pre-empt a correct rebind next run.
+func plausibleRebindCandidate(candidates map[string][]model.ExistingIssue, clusters map[string]struct{}, finding model.Finding) bool {
+	for cluster := range clusters {
+		probe := finding
+		probe.ProjectClusterUnknown = false
+		probe.ProjectCluster = cluster
+		if identity := model.FindingIdentity(probe); identity != "" && len(candidates[identity]) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // compareCreatedDesc orders newer creation times first; unknown times last.

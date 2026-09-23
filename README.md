@@ -381,6 +381,8 @@ Snyk sometimes recreates a project (same name and target) under a new project ID
 - open tickets (their project vanished in this run), and
 - `Cancelled` tickets carrying a sync-recorded `closed_reason` (`project-missing` or `project-deactivated`), which are reopened.
 
+If the Kubernetes cluster lookup for a project fails (after retries), its findings have no identity for that run: they still match their tickets by fingerprint, the ticket's stored identity and Cluster line are kept unchanged, and no rebind happens. When such a finding has no ticket but a rebind candidate could be its own under the cluster that candidate records, creating the ticket is deferred to the next run so a successful lookup can rebind it.
+
 A ticket whose project is still active is never taken (two live projects scanning the same target keep separate tickets), nor is a ticket closed by a fix or a person, nor an archived one. Each ticket is rebound at most once per run; with several candidates the sync prefers open tickets, then the most recently created.
 
 ### Manual Backlog Override
@@ -469,7 +471,7 @@ See [.env.example](/workspace/.env.example).
 ## Logs
 
 - Console logs show startup, load progress, work progress, cache refresh, and final summary.
-- The final `sync complete` line reports `findings`, `existing_issues`, `active_projects`, `inactive_projects`, `conflicts`, `rebound`, `reopened`, `planned_creates`, `planned_updates`, `planned_resolves`, `cancelled_duplicates`, and `failed_ops`. Each rebind is also logged individually with the old and new project ID and the Linear identifier.
+- The final `sync complete` line reports `findings`, `existing_issues`, `active_projects`, `inactive_projects`, `cluster_lookup_failures`, `conflicts`, `rebound`, `reopened`, `planned_creates`, `planned_updates`, `planned_resolves`, `cancelled_duplicates`, and `failed_ops`. Each rebind is also logged individually with the old and new project ID and the Linear identifier.
 - Error logs are appended to `ERROR_LOG_FILE`.
 - Default error log path: `logs/snyk-linear-sync-errors.log`
 

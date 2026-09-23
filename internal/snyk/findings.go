@@ -267,8 +267,11 @@ func (c *Client) LoadSnapshot(ctx context.Context) (model.SnykSnapshot, error) {
 	// fetched lazily from the v1 project detail endpoint (the REST project
 	// resource does not expose it). In-memory only: one GET per kubernetes
 	// project per run, mirroring the v1IgnoresCache pattern. A failed fetch
-	// is cached as "" so we don't retry a broken project for every finding.
+	// is recorded in k8sClusterFailed so we don't retry a broken project for
+	// every finding, and so its findings are marked cluster-unknown rather
+	// than "no cluster".
 	k8sClusterCache := make(map[string]string)
+	k8sClusterFailed := make(map[string]struct{})
 
 	nextCursor := ""
 	for {
@@ -365,26 +368,33 @@ func (c *Client) LoadSnapshot(ctx context.Context) (model.SnykSnapshot, error) {
 			}
 
 			cluster := ""
+			clusterUnknown := false
 			if project.Origin == "kubernetes" {
 				var ok bool
 				cluster, ok = k8sClusterCache[projectID]
 				if !ok {
-					cluster, err = c.fetchProjectCluster(ctx, projectID)
+					cluster, err = c.fetchProjectClusterWithRetry(ctx, projectID, clusterLookupAttempts)
 					if err != nil {
 						// Cluster is ticket enrichment, not sync-critical: log
-						// and continue with an empty value rather than failing
-						// the whole run.
-						c.logger.Warn("could not fetch kubernetes cluster for project; cluster omitted from tickets",
+						// and continue rather than failing the whole run. The
+						// findings are marked cluster-unknown, which is not the
+						// same as "Snyk reports no cluster": the sync then
+						// writes no identity for them this run and keeps the
+						// cluster and identity a matched ticket already has.
+						c.logger.Warn("could not fetch kubernetes cluster for project; cluster treated as unknown this run",
 							slog.String("project_id", projectID),
 							slog.String("error", err.Error()),
 						)
 						cluster = ""
+						k8sClusterFailed[projectID] = struct{}{}
 					}
 					k8sClusterCache[projectID] = cluster
 				}
+				_, clusterUnknown = k8sClusterFailed[projectID]
 			}
 
 			finding := c.findingFromIssue(issue, projectID, project, cluster, orgSlug, issueKey, urlKey, createdAt, updatedAt, ignoreMeta)
+			finding.ProjectClusterUnknown = clusterUnknown
 
 			findings = append(findings, finding)
 		}
@@ -396,9 +406,10 @@ func (c *Client) LoadSnapshot(ctx context.Context) (model.SnykSnapshot, error) {
 	}
 
 	return model.SnykSnapshot{
-		Findings:           findings,
-		ProjectIDs:         projectIDs,
-		InactiveProjectIDs: inactiveProjectIDs,
+		Findings:              findings,
+		ProjectIDs:            projectIDs,
+		InactiveProjectIDs:    inactiveProjectIDs,
+		ClusterLookupFailures: len(k8sClusterFailed),
 	}, nil
 }
 
@@ -570,6 +581,45 @@ type v1ProjectDetail struct {
 	// ImageCluster is the Kubernetes cluster name, reported only for
 	// projects imported through the Snyk Kubernetes integration.
 	ImageCluster string `json:"imageCluster"`
+}
+
+// clusterLookupAttempts bounds fetchProjectClusterWithRetry. The adaptive
+// transport already retries 429/502/503/504 with backoff; this covers the
+// errors it does not (other 5xx, transient 4xx such as a 404 just after a
+// project import, transport errors, and bad bodies).
+const clusterLookupAttempts = 3
+
+// clusterLookupBackoff is the delay before the first retry; it grows
+// linearly per attempt. A variable so tests can shorten it.
+var clusterLookupBackoff = 500 * time.Millisecond
+
+// fetchProjectClusterWithRetry calls fetchProjectCluster up to maxAttempts
+// times with a short linear backoff, returning the last error if every
+// attempt fails. A failed lookup makes the project's findings lose their
+// identity for the run, so one transient error is worth a retry.
+func (c *Client) fetchProjectClusterWithRetry(ctx context.Context, projectID string, maxAttempts int) (string, error) {
+	var lastErr error
+	for attempt := range maxAttempts {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return "", ctx.Err()
+			case <-time.After(time.Duration(attempt) * clusterLookupBackoff):
+			}
+		}
+		cluster, err := c.fetchProjectCluster(ctx, projectID)
+		if err == nil {
+			return cluster, nil
+		}
+		lastErr = err
+		c.logger.Warn("v1 project detail request failed, retrying",
+			slog.String("project_id", projectID),
+			slog.Int("attempt", attempt+1),
+			slog.Int("max_attempts", maxAttempts),
+			slog.String("error", err.Error()),
+		)
+	}
+	return "", lastErr
 }
 
 // fetchProjectCluster returns the Kubernetes cluster name for a project

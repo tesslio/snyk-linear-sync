@@ -138,6 +138,12 @@ func TestFindingIdentity(t *testing.T) {
 		}
 	}
 
+	unknownCluster := base
+	unknownCluster.ProjectClusterUnknown = true
+	if FindingIdentity(unknownCluster) != "" {
+		t.Fatalf("identity must be empty when the cluster lookup failed")
+	}
+
 	missingKey := base
 	missingKey.SnykIssueKey = ""
 	missingName := base

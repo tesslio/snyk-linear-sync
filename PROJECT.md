@@ -58,6 +58,8 @@ Matching order for each finding:
 2. coarse fingerprint (migration of pre-location tickets; open tickets only)
 3. identity rebind: a ticket with the same identity whose project is not active, and which is either open or `Cancelled` with a sync-recorded `closed_reason` of `project-missing`/`project-deactivated`. Never a ticket of an active project, one closed by a fix or a person, or an archived one. Each candidate is used once; open tickets are preferred, then the most recently created.
 
+A failed Kubernetes cluster lookup makes the cluster unknown (not "no cluster"): those findings get no identity for the run, keep their tickets' stored identity and Cluster line, never rebind, and defer creating a new ticket only when a rebind candidate could be theirs.
+
 Linear is the only durable state: identity and `closed_reason` live in the metadata block, not in the SQLite cache. Tickets written before the identity line existed gain it on their next update, which on the first run after upgrading is a one-time, metadata-only update of every matched ticket.
 
 ## Issue Lifecycle

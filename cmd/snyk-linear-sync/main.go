@@ -64,6 +64,7 @@ func run(cfg config.Config, logger *slog.Logger) error {
 		slog.Int("existing_issues", result.ExistingIssues),
 		slog.Int("active_projects", result.ActiveProjects),
 		slog.Int("inactive_projects", result.InactiveProjects),
+		slog.Int("cluster_lookup_failures", result.ClusterLookupFailures),
 		slog.Int("conflicts", result.Conflicts),
 		slog.Int64("rebound", result.Rebound),
 		slog.Int64("reopened", result.Reopened),

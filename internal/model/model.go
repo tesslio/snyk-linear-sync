@@ -42,26 +42,31 @@ type Finding struct {
 	// workload, populated only for projects with origin "kubernetes".
 	// Parsed from the project name, which the Snyk Kubernetes integration
 	// builds as "<namespace>/<kind>.<group>/<workload>:<target>".
-	ProjectNamespace   string
-	IssueTitle         string
-	Severity           string
-	CVSS               float64
-	ExploitMaturity    string
-	PackageName        string
-	VulnerableVersion  string
-	FixedVersion       string
-	IssueURL           string
-	IssueAPIURL        string
-	Status             FindingStatus
-	IntroducedThrough  string
-	SourceFile         string
-	SourceCommitID     string
-	SourceLineStart    int
-	SourceColumnStart  int
-	SourceLineEnd      int
-	SourceColumnEnd    int
-	IgnoreExpiresAt    time.Time
-	DisregardIfFixable bool
+	ProjectNamespace string
+	// ProjectClusterUnknown is set when the project has origin "kubernetes"
+	// but the cluster lookup failed this run, so ProjectCluster is empty for
+	// lack of data rather than because Snyk reports no cluster. Such a
+	// finding has no identity for the run (see FindingIdentity).
+	ProjectClusterUnknown bool
+	IssueTitle            string
+	Severity              string
+	CVSS                  float64
+	ExploitMaturity       string
+	PackageName           string
+	VulnerableVersion     string
+	FixedVersion          string
+	IssueURL              string
+	IssueAPIURL           string
+	Status                FindingStatus
+	IntroducedThrough     string
+	SourceFile            string
+	SourceCommitID        string
+	SourceLineStart       int
+	SourceColumnStart     int
+	SourceLineEnd         int
+	SourceColumnEnd       int
+	IgnoreExpiresAt       time.Time
+	DisregardIfFixable    bool
 
 	// LastResolvedAt is the most recent last_resolved_at Snyk reports across
 	// the issue's coordinates: when Snyk last saw this issue resolved. Zero
@@ -102,6 +107,9 @@ type SnykSnapshot struct {
 	Findings           []Finding
 	ProjectIDs         map[string]struct{}
 	InactiveProjectIDs map[string]struct{}
+	// ClusterLookupFailures counts Kubernetes projects whose cluster lookup
+	// failed this run (their findings carry ProjectClusterUnknown).
+	ClusterLookupFailures int
 }
 
 type IssueLabel struct {
@@ -345,11 +353,14 @@ const identityLength = 32
 // findings.
 //
 // It returns "" when the project name or issue key is missing, since the
-// remaining fields are too generic to identify a finding across projects.
+// remaining fields are too generic to identify a finding across projects,
+// and when the cluster lookup failed (ProjectClusterUnknown): an identity
+// computed without the cluster would differ from the real one and could
+// never be matched correctly, so no identity is better than a wrong one.
 func FindingIdentity(finding Finding) string {
 	name := strings.TrimSpace(finding.ProjectName)
 	key := strings.TrimSpace(finding.SnykIssueKey)
-	if name == "" || key == "" {
+	if name == "" || key == "" || finding.ProjectClusterUnknown {
 		return ""
 	}
 	h := sha256.New()

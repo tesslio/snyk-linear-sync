@@ -5392,3 +5392,136 @@ func TestRunReopensNewestTerminalDuplicateInsteadOfCreatingAnother(t *testing.T)
 		t.Fatalf("run 2: created=%d updates=%v reopened=%d, want none", len(linear2.created), updatedIdentifiers(linear2.updates), result2.Reopened)
 	}
 }
+
+// k8sWorkloadFinding is a Kubernetes-integration finding whose cluster is
+// known, or unknown when the cluster lookup failed this run.
+func k8sWorkloadFinding(projectID, issueID, cluster string, unknown bool) model.Finding {
+	f := recreatedProjectFinding(projectID, issueID)
+	f.ProjectName = "backend/deployment.apps/api:ghcr.io/tesslio/api"
+	f.ProjectOrigin = "kubernetes"
+	f.ProjectReference = ""
+	f.ProjectTargetFile = ""
+	f.ProjectNamespace = "backend"
+	f.ProjectCluster = cluster
+	f.ProjectClusterUnknown = unknown
+	if unknown {
+		f.ProjectCluster = ""
+	}
+	return f
+}
+
+func TestRunClusterLookupFailureKeepsStoredIdentityAndCluster(t *testing.T) {
+	cfg := minimalCfg()
+	known := k8sWorkloadFinding("project-a", "issue-a", "prod", false)
+	existing := storedIssue("existing-1", "SNYK-100", "Todo", desiredIssue(cfg, known))
+	if existing.Identity == "" || !strings.Contains(existing.Description, "Cluster: `prod`") {
+		t.Fatalf("fixture must carry identity and cluster:\n%s", existing.Description)
+	}
+
+	failed := k8sWorkloadFinding("project-a", "issue-a", "", true)
+	if model.FindingIdentity(failed) != "" {
+		t.Fatalf("a failed cluster lookup must give a blank identity")
+	}
+	linear := &fakeLinear{snapshot: []model.ExistingIssue{existing}}
+	snyk := fakeSnyk{snapshot: model.SnykSnapshot{
+		Findings:              []model.Finding{failed},
+		ProjectIDs:            map[string]struct{}{"project-a": {}},
+		ClusterLookupFailures: 1,
+	}}
+
+	result, err := New(cfg, discardLogger(), snyk, linear, nil).Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if result.ClusterLookupFailures != 1 {
+		t.Fatalf("ClusterLookupFailures = %d, want 1", result.ClusterLookupFailures)
+	}
+	// Still matched by fingerprint, and the description does not churn.
+	if len(linear.created) != 0 || len(linear.updates) != 0 {
+		t.Fatalf("created=%d updates=%d, want 0/0 (no identity or cluster churn)", len(linear.created), len(linear.updates))
+	}
+
+	// A real change still updates the ticket, keeping identity and cluster.
+	failed.Severity = "critical"
+	linear2 := &fakeLinear{snapshot: []model.ExistingIssue{existing}}
+	snyk.snapshot.Findings = []model.Finding{failed}
+	if _, err := New(cfg, discardLogger(), snyk, linear2, nil).Run(context.Background()); err != nil {
+		t.Fatalf("run 2: Run() error = %v", err)
+	}
+	if len(linear2.updates) != 1 {
+		t.Fatalf("run 2: updates = %d, want 1", len(linear2.updates))
+	}
+	desc := linear2.updates[0].Desired.Description
+	if !strings.Contains(desc, "identity: "+existing.Identity) || !strings.Contains(desc, "Cluster: `prod`") {
+		t.Fatalf("run 2: stored identity or cluster stripped:\n%s", desc)
+	}
+}
+
+func TestRunClusterLookupFailureDefersRebindUntilLookupSucceeds(t *testing.T) {
+	cfg := minimalCfg()
+	oldFinding := k8sWorkloadFinding("project-old", "issue-old", "prod", false)
+	oldTicket := storedIssue("old-ticket", "SNYK-100", "Todo", desiredIssue(cfg, oldFinding))
+
+	// Run 1: the project is recreated, but the new project's cluster lookup
+	// fails. No rebind, no fresh ticket; the old ticket is cancelled with a
+	// sync-recorded closed_reason as usual.
+	snyk1 := fakeSnyk{snapshot: model.SnykSnapshot{
+		Findings:              []model.Finding{k8sWorkloadFinding("project-new", "issue-new", "", true)},
+		ProjectIDs:            map[string]struct{}{"project-new": {}},
+		ClusterLookupFailures: 1,
+	}}
+	linear1 := &fakeLinear{snapshot: []model.ExistingIssue{oldTicket}}
+	result1, err := New(cfg, discardLogger(), snyk1, linear1, nil).Run(context.Background())
+	if err != nil {
+		t.Fatalf("run 1: Run() error = %v", err)
+	}
+	if result1.Rebound != 0 || len(linear1.created) != 0 {
+		t.Fatalf("run 1: rebound=%d created=%d, want 0/0", result1.Rebound, len(linear1.created))
+	}
+	if len(linear1.updates) != 1 || linear1.updates[0].Desired.State != model.StateCancelled {
+		t.Fatalf("run 1: want the old ticket cancelled, got %v", linear1.updates)
+	}
+	cancelled := storedIssue("old-ticket", "SNYK-100", "Cancelled", linear1.updates[0].Desired)
+	if cancelled.ClosedReason != model.ClosedReasonProjectMissing || cancelled.Identity != oldTicket.Identity {
+		t.Fatalf("run 1: closed_reason=%q identity=%q", cancelled.ClosedReason, cancelled.Identity)
+	}
+
+	// Run 2: the lookup succeeds and the ticket is rebound and reopened.
+	newFinding := k8sWorkloadFinding("project-new", "issue-new", "prod", false)
+	snyk2 := fakeSnyk{snapshot: model.SnykSnapshot{
+		Findings:   []model.Finding{newFinding},
+		ProjectIDs: map[string]struct{}{"project-new": {}},
+	}}
+	linear2 := &fakeLinear{snapshot: []model.ExistingIssue{cancelled}}
+	result2, err := New(cfg, discardLogger(), snyk2, linear2, nil).Run(context.Background())
+	if err != nil {
+		t.Fatalf("run 2: Run() error = %v", err)
+	}
+	if result2.Rebound != 1 || len(linear2.created) != 0 || len(linear2.updates) != 1 {
+		t.Fatalf("run 2: rebound=%d created=%d updates=%d, want 1/0/1", result2.Rebound, len(linear2.created), len(linear2.updates))
+	}
+	if u := linear2.updates[0]; u.Desired.Fingerprint != newFinding.Fingerprint || u.Desired.State != model.StateTodo {
+		t.Fatalf("run 2: update = %+v", u.Desired)
+	}
+}
+
+func TestRunClusterLookupFailureStillCreatesWhenNoCandidateCouldMatch(t *testing.T) {
+	cfg := minimalCfg()
+	// No ticket from a vanished project could be this finding's (the only
+	// cancelled ticket is for a different workload), so a failing lookup
+	// does not hold the finding back: it gets a ticket, without identity.
+	other := k8sWorkloadFinding("project-gone", "issue-g", "prod", false)
+	other.ProjectName = "backend/deployment.apps/worker:ghcr.io/tesslio/worker"
+	cancelled := withClosedReason(storedIssue("other", "SNYK-100", "Cancelled", desiredIssue(cfg, other)), model.ClosedReasonProjectMissing)
+	linear := &fakeLinear{snapshot: []model.ExistingIssue{cancelled}}
+	snyk := fakeSnyk{snapshot: model.SnykSnapshot{
+		Findings:   []model.Finding{k8sWorkloadFinding("project-prod", "issue-p", "", true)},
+		ProjectIDs: map[string]struct{}{"project-prod": {}},
+	}}
+	if _, err := New(cfg, discardLogger(), snyk, linear, nil).Run(context.Background()); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if len(linear.created) != 1 || strings.Contains(linear.created[0].Description, "identity:") {
+		t.Fatalf("want one ticket created without an identity line, got %v", linear.created)
+	}
+}
