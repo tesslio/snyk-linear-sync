@@ -62,9 +62,28 @@ var linearAutoLinkPattern = regexp.MustCompile(`\[([^\]]+)\]\((?:<)?([^)\n>]+)(?
 var markdownEscapePattern = regexp.MustCompile(`\\([\\` + "`" + `*_{}\[\]()#+\-.!~])`)
 
 type RunResult struct {
-	Findings            int
-	ExistingIssues      int
-	Conflicts           int
+	Findings       int
+	ExistingIssues int
+	// ActiveProjects / InactiveProjects count the Snyk projects in the
+	// snapshot. A sudden change in either (projects deleted, deactivated or
+	// recreated) explains a burst of cancels, rebinds or creates.
+	ActiveProjects   int
+	InactiveProjects int
+	// ClusterLookupFailures counts Kubernetes projects whose cluster lookup
+	// failed this run; their findings get no identity and cannot rebind.
+	ClusterLookupFailures int
+	Conflicts             int
+	// Rebound counts tickets matched to a finding by identity after Snyk
+	// recreated the finding's project under a new project ID.
+	Rebound int64
+	// Reopened counts terminal tickets the sync deliberately reopened: sync-
+	// cancelled tickets rebound after project recreation, and tickets closed
+	// while Snyk kept reporting the same occurrence as open.
+	Reopened int64
+	// DeferredCreates counts findings whose ticket creation was held back
+	// for the run because their cluster lookup failed while a recent rebind
+	// candidate might be theirs (see plausibleRebindCandidate).
+	DeferredCreates     int64
 	PlannedCreates      int64
 	PlannedUpdates      int64
 	PlannedResolves     int64
@@ -161,7 +180,16 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 	// would both bind to it (ticket stealing + perpetual churn).
 	existingByCoarseFingerprint := map[string]model.ExistingIssue{}
 	var duplicatesToCancel []model.ExistingIssue
+	// terminalByFingerprint lists every non-archived terminal ticket per
+	// fingerprint, duplicates included. When all copies of a fingerprint are
+	// terminal, preferCanonicalDuplicate keeps the lowest identifier (the
+	// original ticket), but the copy an automation closed prematurely is the
+	// newest one; the reopen check must be able to consider it.
+	terminalByFingerprint := map[string][]model.ExistingIssue{}
 	for _, issue := range existingIssues {
+		if issue.Fingerprint != "" && issue.ArchivedAt == nil && isTerminalLinearState(issue, s.cfg.Linear.States) {
+			terminalByFingerprint[issue.Fingerprint] = append(terminalByFingerprint[issue.Fingerprint], issue)
+		}
 		if issue.Fingerprint != "" {
 			if prior, exists := existingByFingerprint[issue.Fingerprint]; exists {
 				canonical, duplicate := preferCanonicalDuplicate(prior, issue, s.cfg.Linear.States)
@@ -186,18 +214,39 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 		}
 	}
 
+	// rebindCandidates indexes, by project-independent identity, the tickets
+	// a finding may take over after Snyk recreates its project under a new
+	// project ID (see rebindCandidatesByIdentity for who qualifies).
+	findingFingerprints := make(map[string]struct{}, len(findings))
+	for _, finding := range findings {
+		findingFingerprints[finding.Fingerprint] = struct{}{}
+	}
+	rebindCandidates := rebindCandidatesByIdentity(existingByFingerprint, findingFingerprints, snykSnapshot.ProjectIDs, s.cfg.Linear.States)
+	// reboundFingerprints records the old fingerprints of rebound tickets so
+	// the resolve loop does not also try to close them: the ticket now
+	// tracks a live finding under its new fingerprint.
+	reboundFingerprints := map[string]struct{}{}
+	// deferredFingerprints records findings held back for one run because
+	// their cluster lookup failed while a rebind candidate may be theirs
+	// (see plausibleRebindCandidate). They are marked seen like any finding.
+	deferredFingerprints := map[string]struct{}{}
+	candidateClusters := rebindCandidateClusters(rebindCandidates)
+
 	desiredByFingerprint := make(map[string]model.DesiredIssue, len(findings))
 	// matchedExisting records the Linear ticket each finding resolved to,
-	// whether by exact fingerprint or coarse-fingerprint migration fallback.
-	// The job loop uses this instead of existingByFingerprint so that
-	// migration-matched findings update their coarse ticket rather than
-	// creating a duplicate.
+	// whether by exact fingerprint, coarse-fingerprint migration fallback, or
+	// identity rebind after project recreation. The job loop uses this
+	// instead of existingByFingerprint so that migration-matched and rebound
+	// findings update their existing ticket (rewriting its fingerprint)
+	// rather than creating a duplicate.
 	matchedExisting := make(map[string]model.ExistingIssue, len(findings))
 	snykHashes := make(map[string]string, len(findings))
+	var rebound, reopened int64
 	for _, finding := range findings {
 		desired := desiredIssue(s.cfg, finding)
 
 		existing, matched := existingByFingerprint[finding.Fingerprint]
+		kind := matchExact
 		if !matched {
 			// Migration fallback: the finding carries a fine-grained
 			// fingerprint no Linear ticket has yet (new code occurrence),
@@ -210,6 +259,7 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 				if candidate, ok := existingByCoarseFingerprint[coarse]; ok {
 					existing = candidate
 					matched = true
+					kind = matchCoarse
 					// Deplete the coarse index so only the first fine-grained finding
 					// reuses this ticket. Subsequent findings with the same coarse
 					// prefix (e.g. the same issue type in a different file) create
@@ -220,16 +270,73 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 			}
 		}
 
-		if matched {
-			// Reopen guard: never reuse a terminal (Done/Cancelled) ticket
-			// when Snyk reports the finding as open/awaiting-fix. Snyk
-			// reusing a problem-type issueID across different code is not a
-			// directive to reopen a closed Linear ticket; a fresh ticket
-			// should be created instead. Treating this as "no match" falls
-			// through to the create path. The terminal ticket is also removed
-			// from existingByFingerprint so the job-dispatch loop does not
-			// send an update that would reopen it.
-			if isTerminalLinearState(existing, s.cfg.Linear.States) && isNonTerminalModelState(desired.State) {
+		if !matched {
+			// Rebind after project recreation: Snyk sometimes recreates a
+			// project (same name and target) under a new project ID, which
+			// also mints new issue IDs, so no fingerprint matches. The
+			// finding's project-independent identity still does. Take over
+			// the old project's ticket instead of letting the resolve loop
+			// cancel it and creating a copy. Candidates are depleted on use
+			// so two findings can never bind to the same ticket.
+			if candidate, ok := takeRebindCandidate(rebindCandidates, model.FindingIdentity(finding)); ok {
+				existing = candidate
+				matched = true
+				kind = matchRebind
+				reboundFingerprints[candidate.Fingerprint] = struct{}{}
+				rebound++
+				oldProjectID, _ := FingerprintProjectID(candidate.Fingerprint)
+				s.logger.Info("rebinding ticket to finding in recreated Snyk project",
+					slog.String("existing", candidate.Identifier),
+					slog.String("existing_state", candidate.StateName),
+					slog.String("old_project_id", oldProjectID),
+					slog.String("new_project_id", finding.ProjectID),
+					slog.String("old_fingerprint", candidate.Fingerprint),
+					slog.String("new_fingerprint", finding.Fingerprint),
+					slog.String("project_name", finding.ProjectName),
+				)
+			}
+		}
+
+		if matched && isTerminalLinearState(existing, s.cfg.Linear.States) && isNonTerminalModelState(desired.State) {
+			switch {
+			case kind == matchRebind:
+				// A terminal rebind candidate is always a ticket the sync
+				// itself cancelled because its project disappeared (the
+				// candidate index admits no other terminal ticket), so the
+				// closure was never a fix or a human decision. The finding is
+				// the same one in the recreated project; reopen the ticket.
+				desired.Reopen = true
+				desired.StateReason = "Snyk recreated this finding's project under a new project ID and still reports the finding as open; reopened the ticket cancelled when the old project disappeared"
+			case kind == matchExact && reopenCandidate(terminalByFingerprint[finding.Fingerprint], finding, &existing):
+				// The ticket was closed (typically by an automation outside
+				// the sync) while Snyk kept reporting this exact occurrence as
+				// open. Creating a fresh ticket would mint a duplicate with
+				// the identical fingerprint every time this happens, so reuse
+				// the ticket; the normal update moves it back to the open
+				// state. See continuouslyOpenSinceTicketCreated for why this
+				// cannot resurrect a #28 zombie ticket.
+				desired.Reopen = true
+				desired.StateReason = "Snyk still reports this finding as open; reopened instead of creating a duplicate"
+				// The reopened copy becomes canonical; older terminal copies
+				// stay untouched (the duplicate-cancel loop skips terminal
+				// tickets), and next run preferCanonicalDuplicate keeps this
+				// now-open ticket.
+				existingByFingerprint[finding.Fingerprint] = existing
+				s.logger.Info("reopening ticket closed while Snyk still reports the finding as open",
+					slog.String("fingerprint", finding.Fingerprint),
+					slog.String("existing", existing.Identifier),
+					slog.String("existing_state", existing.StateName),
+				)
+			default:
+				// Reopen guard: never reuse a terminal (Done/Cancelled)
+				// ticket when Snyk reports the finding as open/awaiting-fix.
+				// Snyk reusing a problem-type issueID across different code
+				// is not a directive to reopen a closed Linear ticket; a
+				// fresh ticket should be created instead. Treating this as
+				// "no match" falls through to the create path. The terminal
+				// ticket is also removed from existingByFingerprint so the
+				// job-dispatch loop does not send an update that would
+				// reopen it.
 				s.logger.Info("not reusing closed ticket for reopened finding; creating new ticket",
 					slog.String("fingerprint", finding.Fingerprint),
 					slog.String("existing", existing.Identifier),
@@ -238,6 +345,36 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 				delete(existingByFingerprint, finding.Fingerprint)
 				matched = false
 			}
+		}
+
+		if !matched && finding.ProjectClusterUnknown && plausibleRebindCandidate(rebindCandidates, candidateClusters, finding, s.cfg.Linear.States, time.Now()) {
+			// The cluster lookup failed, so the finding has no identity and
+			// cannot rebind, but a ticket left by a vanished project could be
+			// its own. Creating a fresh ticket now would make the next run
+			// match that copy exactly and never rebind, which is the
+			// cancel+create churn rebinding exists to prevent. Hold the
+			// finding back for this run instead; the candidate is cancelled
+			// (recording closed_reason) by the resolve loop as usual and is
+			// rebound once a lookup succeeds.
+			s.logger.Warn("deferring ticket for finding with unknown kubernetes cluster; a rebind candidate may match once the cluster lookup succeeds",
+				slog.String("fingerprint", finding.Fingerprint),
+				slog.String("project_id", finding.ProjectID),
+				slog.String("project_name", finding.ProjectName),
+			)
+			deferredFingerprints[finding.Fingerprint] = struct{}{}
+			continue
+		}
+
+		if matched && finding.ProjectClusterUnknown {
+			// The cluster lookup failed this run, so the finding has no
+			// identity and no cluster. Rendering it as-is would strip the
+			// ticket's stored identity and Cluster line, and put them back on
+			// the next successful run: two pointless updates per failure.
+			// Keep what the ticket already records instead; both are
+			// refreshed from Snyk on the next run whose lookup succeeds.
+			recovered := finding
+			recovered.ProjectCluster = storedCluster(existing.Description)
+			desired.Description = issueDescriptionWithIdentity(s.cfg.Source, desired.ManagedLabels, recovered, existing.Identity)
 		}
 
 		if matched {
@@ -288,6 +425,9 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 
 		}
 
+		if desired.Reopen {
+			reopened++
+		}
 		desiredByFingerprint[finding.Fingerprint] = desired
 		snykHashes[finding.Fingerprint] = desiredIssueHash(desired)
 		if matched {
@@ -304,7 +444,13 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 	var result RunResult
 	result.Findings = len(findings)
 	result.ExistingIssues = len(existingIssues)
+	result.ActiveProjects = len(snykSnapshot.ProjectIDs)
+	result.InactiveProjects = len(snykSnapshot.InactiveProjectIDs)
+	result.ClusterLookupFailures = snykSnapshot.ClusterLookupFailures
 	result.Conflicts = len(duplicatesToCancel)
+	result.Rebound = rebound
+	result.Reopened = reopened
+	result.DeferredCreates = int64(len(deferredFingerprints))
 	var queuedJobs int64
 
 	g, workerCtx := errgroup.WithContext(runCtx)
@@ -322,7 +468,14 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 	g.Go(func() error {
 		defer close(jobs)
 
-		seen := make(map[string]struct{}, len(desiredByFingerprint))
+		seen := make(map[string]struct{}, len(desiredByFingerprint)+len(reboundFingerprints))
+		for fingerprint := range reboundFingerprints {
+			seen[fingerprint] = struct{}{}
+		}
+		for fingerprint := range deferredFingerprints {
+			seen[fingerprint] = struct{}{}
+			seen[model.CoarseFingerprint(fingerprint)] = struct{}{}
+		}
 		createBatch := make([]model.DesiredIssue, 0, createBatchSize)
 		updateBatch := make([]model.IssueUpdate, 0, createBatchSize)
 		for fingerprint, desired := range desiredByFingerprint {
@@ -343,12 +496,23 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 				}
 				continue
 			}
+			// Linear does not allow updating archived issues; an update would
+			// only fail, and fail again every run. Archived tickets are always
+			// terminal and are only matched here when the desired state is
+			// terminal too, so there is nothing to move.
+			if existing.ArchivedAt != nil {
+				continue
+			}
 			// The cache fast-path may not suppress a pending move into a terminal
 			// state: a finding that became fixed/ignored (desired Done/Cancelled)
 			// while its ticket sat in an open column must still be closed, even
 			// if its Snyk/Linear hashes are unchanged since the last run. Benign
-			// open-state divergences stay cache-suppressed as before.
-			if cacheEnabled && cacheSnapshot.SnykHashes[fingerprint] == snykHashes[fingerprint] && cacheSnapshot.LinearHashes[fingerprint] == currentLinearHashes[fingerprint] && !pendingTerminalTransition(existing, desired) {
+			// open-state divergences stay cache-suppressed as before. Nor may it
+			// suppress a deliberate reopen, or a ticket matched under a
+			// different stored fingerprint (coarse migration or rebind), whose
+			// fingerprint must be rewritten: the cache is keyed by fingerprint
+			// and says nothing about a ticket that carried another one.
+			if cacheEnabled && cacheSnapshot.SnykHashes[fingerprint] == snykHashes[fingerprint] && cacheSnapshot.LinearHashes[fingerprint] == currentLinearHashes[fingerprint] && !pendingTerminalTransition(existing, desired) && !desired.Reopen && existing.Fingerprint == fingerprint {
 				continue
 			}
 			if needsUpdate(existing, desired, s.cfg.Linear.States) {
@@ -383,10 +547,24 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 				continue
 			}
 			desiredState, stateReason := missingFindingState(existing.Fingerprint, snykSnapshot.ProjectIDs, snykSnapshot.InactiveProjectIDs)
+			// Record a machine-made closure only when this loop is the one
+			// closing the ticket. A ticket that is already terminal was closed
+			// by a fix or a person before its project vanished; keep whatever
+			// it already records rather than claiming the closure, so it never
+			// becomes eligible for a rebind.
+			closedReason := existing.ClosedReason
+			if isNonTerminalLinearState(existing, s.cfg.Linear.States) {
+				closedReason = projectClosedReason(existing.Fingerprint, snykSnapshot.ProjectIDs, snykSnapshot.InactiveProjectIDs)
+			}
 			resolved := model.DesiredIssue{
-				Fingerprint:   existing.Fingerprint,
-				Title:         existing.Title,
-				Description:   upsertManagedMetadata(existing.Description, existing.Fingerprint, existing.ManagedLabels),
+				Fingerprint: existing.Fingerprint,
+				Title:       existing.Title,
+				Description: upsertManagedMetadata(existing.Description, managedMetadata{
+					Fingerprint:   existing.Fingerprint,
+					Identity:      existing.Identity,
+					ManagedLabels: existing.ManagedLabels,
+					ClosedReason:  closedReason,
+				}),
 				DueDate:       existing.DueDate,
 				State:         desiredState,
 				StateReason:   stateReason,
@@ -488,6 +666,18 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 
 	return result, nil
 }
+
+// matchKind records how a finding was matched to an existing ticket. The
+// reopen guard treats each differently: only an exact fingerprint match may
+// reopen a prematurely closed ticket, and only a rebind may reopen a ticket
+// the sync cancelled because its project disappeared.
+type matchKind int
+
+const (
+	matchExact matchKind = iota
+	matchCoarse
+	matchRebind
+)
 
 type jobKind string
 
@@ -722,6 +912,32 @@ func issueTitle(finding model.Finding) string {
 }
 
 func issueDescription(sourceCfg config.SourceConfig, managedLabels []string, finding model.Finding) string {
+	return issueDescriptionWithIdentity(sourceCfg, managedLabels, finding, model.FindingIdentity(finding))
+}
+
+// storedCluster returns the cluster a ticket's description already shows
+// (the "Cluster: `...`" line the sync renders above the metadata block), or
+// "" when it shows none. Used only to keep that line stable in a run whose
+// cluster lookup failed.
+func storedCluster(description string) string {
+	if start := findMetadataBlockStart(description); start >= 0 {
+		description = description[:start]
+	}
+	for line := range strings.SplitSeq(description, "\n") {
+		rest, ok := strings.CutPrefix(strings.TrimSpace(line), "Cluster: `")
+		if !ok {
+			continue
+		}
+		if value, _, ok := strings.Cut(rest, "`"); ok {
+			return markdownEscapePattern.ReplaceAllString(value, "$1")
+		}
+	}
+	return ""
+}
+
+// issueDescriptionWithIdentity renders the managed description with an
+// explicit metadata identity ("" omits the line).
+func issueDescriptionWithIdentity(sourceCfg config.SourceConfig, managedLabels []string, finding model.Finding, identity string) string {
 	issueURL := finding.IssueURL
 	if issueURL == "" {
 		issueURL = finding.IssueAPIURL
@@ -837,7 +1053,11 @@ func issueDescription(sourceCfg config.SourceConfig, managedLabels []string, fin
 		lines = append(lines, "", "### Remediation", embedSnykProse(finding.Remediation))
 	}
 
-	lines = append(lines, "", metadataBlock(finding.Fingerprint, managedLabels))
+	lines = append(lines, "", metadataBlock(managedMetadata{
+		Fingerprint:   finding.Fingerprint,
+		Identity:      identity,
+		ManagedLabels: managedLabels,
+	}))
 	return strings.Join(lines, "\n")
 }
 
@@ -932,13 +1152,39 @@ func issueTitleContext(finding model.Finding) string {
 	}
 }
 
-func metadataBlock(fingerprint string, managedLabels []string) string {
+// managedMetadata is the content of the hidden metadata block the sync keeps
+// at the end of every managed ticket description. Linear is the only durable
+// state the sync has, so anything a later run must know about a ticket lives
+// here (the SQLite cache is only a performance hint).
+type managedMetadata struct {
+	// Fingerprint is the exact join key to the Snyk finding.
+	Fingerprint string
+	// Identity is the project-independent finding identity (see
+	// model.FindingIdentity), used to rebind the ticket if Snyk recreates
+	// its project under a new ID. Empty when unknown; the line is omitted.
+	Identity string
+	// ManagedLabels is the label set the sync owns on this ticket.
+	ManagedLabels []string
+	// ClosedReason records that the sync cancelled the ticket only because
+	// its Snyk project went missing or was deactivated. Written by the
+	// resolve loop; a normal update from a live finding never carries it, so
+	// it is cleared as soon as the ticket tracks an active finding again.
+	ClosedReason string
+}
+
+func metadataBlock(meta managedMetadata) string {
 	lines := []string{
 		"<!-- snyk-linear-sync",
-		fmt.Sprintf("fingerprint: %s", fingerprint),
+		fmt.Sprintf("fingerprint: %s", meta.Fingerprint),
 	}
-	if labels := model.NormalizeManagedLabelNames(managedLabels); len(labels) > 0 {
+	if meta.Identity != "" {
+		lines = append(lines, fmt.Sprintf("identity: %s", meta.Identity))
+	}
+	if labels := model.NormalizeManagedLabelNames(meta.ManagedLabels); len(labels) > 0 {
 		lines = append(lines, fmt.Sprintf("managed_labels: %s", strings.Join(labels, ",")))
+	}
+	if meta.ClosedReason != "" {
+		lines = append(lines, fmt.Sprintf("closed_reason: %s", meta.ClosedReason))
 	}
 	lines = append(lines, "-->")
 	return strings.Join(lines, "\n")
@@ -1221,8 +1467,11 @@ func ComputeDiff(existing model.ExistingIssue, desired model.DesiredIssue, state
 		d.TitleTo = desired.Title
 	}
 
-	if normalizeDescriptionForCompare(existing.Description) != normalizeDescriptionForCompare(desired.Description) {
+	existingDescription := normalizeDescriptionForCompare(existing.Description)
+	desiredDescription := normalizeDescriptionForCompare(desired.Description)
+	if existingDescription != desiredDescription {
 		d.DescriptionChanged = true
+		d.MetadataOnlyDescriptionChange = withoutMetadataBlock(existingDescription) == withoutMetadataBlock(desiredDescription)
 	}
 
 	if existing.DueDate != desired.DueDate {
@@ -1244,7 +1493,9 @@ func ComputeDiff(existing model.ExistingIssue, desired model.DesiredIssue, state
 			// bypasses that guard (or a future refactor introduces one),
 			// suppress the state change rather than reopening a closed
 			// ticket. The description/labels/title can still update.
-			if isTerminalLinearState(existing, states) && isNonTerminalModelState(desired.State) {
+			// The only exception is a reopen the match loop decided on
+			// deliberately (desired.Reopen), after its own checks.
+			if isTerminalLinearState(existing, states) && isNonTerminalModelState(desired.State) && !desired.Reopen {
 				// Deliberately do not set d.StateChanged.
 			} else {
 				d.StateChanged = true
@@ -1329,6 +1580,239 @@ func missingFindingState(fingerprint string, activeProjects map[string]struct{},
 	// Both deleted and inactive projects result in Cancelled: the issue is no
 	// longer actionable regardless of why the project stopped producing findings.
 	return model.StateCancelled, "the Snyk project no longer exists"
+}
+
+// projectClosedReason returns the metadata closed_reason for a ticket the
+// resolve loop cancels because its Snyk project is gone or deactivated, or ""
+// when the project is still active (the ticket is Done because the finding
+// is no longer present, which is a fix, not a machine-made closure).
+func projectClosedReason(fingerprint string, activeProjects map[string]struct{}, inactiveProjects map[string]struct{}) string {
+	projectID, ok := FingerprintProjectID(fingerprint)
+	if !ok {
+		return ""
+	}
+	if _, exists := activeProjects[projectID]; exists {
+		return ""
+	}
+	if _, exists := inactiveProjects[projectID]; exists {
+		return model.ClosedReasonProjectDeactivated
+	}
+	return model.ClosedReasonProjectMissing
+}
+
+// rebindCandidatesByIdentity indexes, by identity, the existing tickets that
+// a finding may take over after Snyk recreates a project under a new project
+// ID. A ticket qualifies only when all of these hold:
+//
+//   - it carries an identity (tickets gain one on their first update);
+//   - no current finding claims its fingerprint exactly;
+//   - its fingerprint's project is NOT in the active project set. Two live
+//     projects scanning the same target must keep separate tickets, so a
+//     ticket whose project still reports findings is never taken;
+//   - it is not archived (Linear does not allow updating archived issues);
+//   - it is either still open (its project vanished this run and the resolve
+//     loop would cancel it), or it sits in the Cancelled state with a
+//     sync-recorded project-missing/project-deactivated closed_reason. A
+//     ticket closed by a fix or by a person is never reused: that closure is
+//     a decision, and the reopen guard keeps protecting it.
+//
+// Each identity's candidates are sorted deterministically: open tickets
+// first, then the most recently created. takeRebindCandidate hands them out
+// one at a time, so a candidate is used at most once and any surplus is left
+// to the normal flow (the resolve loop cancels open ones as before).
+func rebindCandidatesByIdentity(existingByFingerprint map[string]model.ExistingIssue, findingFingerprints map[string]struct{}, activeProjects map[string]struct{}, states config.StateConfig) map[string][]model.ExistingIssue {
+	out := map[string][]model.ExistingIssue{}
+	for fingerprint, issue := range existingByFingerprint {
+		if issue.Identity == "" || issue.ArchivedAt != nil {
+			continue
+		}
+		if _, claimed := findingFingerprints[fingerprint]; claimed {
+			continue
+		}
+		projectID, ok := FingerprintProjectID(fingerprint)
+		if !ok {
+			continue
+		}
+		if _, active := activeProjects[projectID]; active {
+			continue
+		}
+		if isTerminalLinearState(issue, states) && !isSyncCancelledForMissingProject(issue, states) {
+			continue
+		}
+		out[issue.Identity] = append(out[issue.Identity], issue)
+	}
+	for identity := range out {
+		slices.SortFunc(out[identity], func(a, b model.ExistingIssue) int {
+			aOpen, bOpen := isNonTerminalLinearState(a, states), isNonTerminalLinearState(b, states)
+			if aOpen != bOpen {
+				if aOpen {
+					return -1
+				}
+				return 1
+			}
+			if c := compareCreatedDesc(a.CreatedAt, b.CreatedAt); c != 0 {
+				return c
+			}
+			if c := identifierNum(b.Identifier) - identifierNum(a.Identifier); c != 0 {
+				return c
+			}
+			return strings.Compare(a.ID, b.ID)
+		})
+	}
+	return out
+}
+
+// rebindCandidateClusters returns the distinct clusters shown by rebind
+// candidates' descriptions ("" for candidates showing none).
+func rebindCandidateClusters(candidates map[string][]model.ExistingIssue) map[string]struct{} {
+	out := map[string]struct{}{}
+	for _, queue := range candidates {
+		for _, issue := range queue {
+			out[storedCluster(issue.Description)] = struct{}{}
+		}
+	}
+	return out
+}
+
+// deferCreateWindow caps how long a finding whose cluster lookup keeps
+// failing can be held back for a possible rebind: only candidates that are
+// still open, or were closed less than this long ago, justify a deferral.
+// A persistent lookup failure therefore never hides a finding for more than
+// about a day; after that it gets a ticket without an identity as usual.
+const deferCreateWindow = 24 * time.Hour
+
+// plausibleRebindCandidate reports whether a finding whose cluster lookup
+// failed would have a recent rebind candidate under the cluster one of the
+// candidates records. It never binds anything: it only decides whether
+// creating a fresh ticket now could pre-empt a correct rebind next run.
+// Only candidates that are non-terminal, or were closed within
+// deferCreateWindow of now, count; a terminal candidate with no recorded
+// closed time does not, so visibility wins when the timeline is unknown.
+func plausibleRebindCandidate(candidates map[string][]model.ExistingIssue, clusters map[string]struct{}, finding model.Finding, states config.StateConfig, now time.Time) bool {
+	for cluster := range clusters {
+		probe := finding
+		probe.ProjectClusterUnknown = false
+		probe.ProjectCluster = cluster
+		identity := model.FindingIdentity(probe)
+		if identity == "" {
+			continue
+		}
+		for _, candidate := range candidates[identity] {
+			if isNonTerminalLinearState(candidate, states) {
+				return true
+			}
+			if candidate.ClosedAt != nil && now.Sub(*candidate.ClosedAt) < deferCreateWindow {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// compareCreatedDesc orders newer creation times first; unknown times last.
+func compareCreatedDesc(a, b *time.Time) int {
+	switch {
+	case a == nil && b == nil:
+		return 0
+	case a == nil:
+		return 1
+	case b == nil:
+		return -1
+	default:
+		return b.Compare(*a)
+	}
+}
+
+// takeRebindCandidate removes and returns the best remaining rebind
+// candidate for identity, if any.
+func takeRebindCandidate(candidates map[string][]model.ExistingIssue, identity string) (model.ExistingIssue, bool) {
+	if identity == "" {
+		return model.ExistingIssue{}, false
+	}
+	queue := candidates[identity]
+	if len(queue) == 0 {
+		return model.ExistingIssue{}, false
+	}
+	candidates[identity] = queue[1:]
+	return queue[0], true
+}
+
+// isSyncCancelledForMissingProject reports whether a ticket is Cancelled with
+// a closed_reason the sync records only when it cancels a ticket because its
+// Snyk project went missing or was deactivated. A person moving such a ticket
+// to Done (or anywhere else) is a decision the sync respects, so the state
+// must still be the configured Cancelled state.
+func isSyncCancelledForMissingProject(issue model.ExistingIssue, states config.StateConfig) bool {
+	if model.NormalizeWorkflowStateName(issue.StateName) != model.NormalizeWorkflowStateName(states.Cancelled) {
+		return false
+	}
+	switch issue.ClosedReason {
+	case model.ClosedReasonProjectMissing, model.ClosedReasonProjectDeactivated:
+		return true
+	default:
+		return false
+	}
+}
+
+// continuouslyOpenSinceTicketCreated reports whether an exactly-matched
+// terminal ticket may be reopened for an open finding, because Snyk shows
+// the finding has stayed open for the ticket's whole life: its closure (in
+// practice by an automation outside the sync) was premature, not a fix.
+//
+// This does not reintroduce the #28 zombie-ticket bug. #28 was Snyk reusing
+// an issue ID for a different occurrence, and a reuse always starts with
+// Snyk resolving the earlier occurrence, which Snyk keeps as the
+// coordinate's last_resolved_at. Requiring that no resolution happened since
+// the ticket was created therefore excludes every reuse the ticket could
+// have tracked. The comparison is against the ticket's creation, not its
+// closure: when Snyk resolves a finding the sync closes the ticket on a
+// later run, so that resolution always predates the closure, and comparing
+// against the closure would reopen exactly the tickets #28 protects.
+//
+// Every uncertainty keeps today's behavior (a fresh ticket):
+//   - coarse fingerprints (no location segment) can span several code
+//     occurrences, so their history says nothing about this one;
+//   - archived tickets cannot be updated;
+//   - a missing creation or closed time leaves the timeline unknown;
+//   - an unparsable last_resolved_at leaves the resolution history unknown.
+func continuouslyOpenSinceTicketCreated(existing model.ExistingIssue, finding model.Finding) bool {
+	if model.FingerprintLocation(finding.Fingerprint) == "" {
+		return false
+	}
+	if existing.ArchivedAt != nil || existing.ClosedAt == nil || existing.CreatedAt == nil {
+		return false
+	}
+	if finding.LastResolvedAtInvalid {
+		return false
+	}
+	if finding.LastResolvedAt.IsZero() {
+		return true
+	}
+	return finding.LastResolvedAt.Before(*existing.CreatedAt)
+}
+
+// reopenCandidate picks the ticket the premature-closure reopen check is run
+// against: the most recently created non-archived terminal ticket with the
+// finding's exact fingerprint. That is the copy most likely to have tracked
+// the current open period, and the only one that can pass the created-time
+// check when earlier copies predate a Snyk resolution. On success it stores
+// the ticket in *existing and returns true.
+func reopenCandidate(terminal []model.ExistingIssue, finding model.Finding, existing *model.ExistingIssue) bool {
+	if len(terminal) == 0 {
+		return false
+	}
+	newest := terminal[0]
+	for _, issue := range terminal[1:] {
+		c := compareCreatedDesc(issue.CreatedAt, newest.CreatedAt)
+		if c < 0 || (c == 0 && identifierNum(issue.Identifier) > identifierNum(newest.Identifier)) {
+			newest = issue
+		}
+	}
+	if !continuouslyOpenSinceTicketCreated(newest, finding) {
+		return false
+	}
+	*existing = newest
+	return true
 }
 
 // FingerprintProjectID extracts the project ID portion of a Snyk fingerprint.
@@ -1502,9 +1986,9 @@ func isTerminalLinearState(existing model.ExistingIssue, states config.StateConf
 	return false
 }
 
-func upsertManagedMetadata(description, fingerprint string, managedLabels []string) string {
+func upsertManagedMetadata(description string, meta managedMetadata) string {
 	description = strings.TrimSpace(strings.ReplaceAll(description, "\r\n", "\n"))
-	block := metadataBlock(fingerprint, managedLabels)
+	block := metadataBlock(meta)
 
 	start := findMetadataBlockStart(description)
 	if start >= 0 {
@@ -1556,6 +2040,21 @@ func findMetadataBlockStart(description string) int {
 		i = absIdx + 1
 	}
 	return last
+}
+
+// withoutMetadataBlock returns the description with its trailing metadata
+// block removed, so ComputeDiff can tell a metadata-only change (nothing a
+// human needs a comment about) from a change to the visible body.
+func withoutMetadataBlock(description string) string {
+	start := findMetadataBlockStart(description)
+	if start < 0 {
+		return description
+	}
+	end := len(description)
+	if relEnd := strings.Index(description[start:], "-->"); relEnd >= 0 {
+		end = start + relEnd + len("-->")
+	}
+	return strings.TrimSpace(description[:start] + description[end:])
 }
 
 func metadataHeaderStart() string {

@@ -43,12 +43,24 @@ It is not responsible for:
 Each Snyk finding is identified by:
 
 ```text
-snyk:<project-id>:<issue-id>
+snyk:<project-id>:<issue-id>[:<location>]
 ```
 
-That fingerprint is embedded in the Linear description metadata block and is the durable join key between systems.
+That fingerprint is embedded in the Linear description metadata block and is the durable join key between systems. `<location>` (source file for code issues, `package@version` for dependencies) separates occurrences that share a Snyk issue ID.
 
 Without that fingerprint, the sync cannot safely deduplicate or update issues.
+
+The metadata block also carries a project-independent `identity`: a hash of the project's origin, name, target file, target reference, repository and Kubernetes cluster, the issue key, and the location. The cluster is included because Snyk's Kubernetes project names carry no cluster, so the same workload in staging and prod would otherwise share an identity. It exists because Snyk sometimes recreates a project under a new project ID, which changes every fingerprint for findings that are otherwise the same. Identity is used only to decide which existing ticket a finding is matched to; ticket content and state still derive only from current Snyk data.
+
+Matching order for each finding:
+
+1. exact fingerprint
+2. coarse fingerprint (migration of pre-location tickets; open tickets only)
+3. identity rebind: a ticket with the same identity whose project is not active, and which is either open or `Cancelled` with a sync-recorded `closed_reason` of `project-missing`/`project-deactivated`. Never a ticket of an active project, one closed by a fix or a person, or an archived one. Each candidate is used once; open tickets are preferred, then the most recently created.
+
+A failed Kubernetes cluster lookup makes the cluster unknown (not "no cluster"): those findings get no identity for the run, keep their tickets' stored identity and Cluster line, never rebind, and defer creating a new ticket only when a rebind candidate could be theirs and is still open or was closed less than 24 hours ago (so a persistent failure hides a finding for at most about a day).
+
+Linear is the only durable state: identity and `closed_reason` live in the metadata block, not in the SQLite cache. Tickets written before the identity line existed gain it on their next update, which on the first run after upgrading is a one-time, metadata-only update of every matched ticket.
 
 ## Issue Lifecycle
 
@@ -74,7 +86,14 @@ Update the Linear issue when managed fields differ:
 
 When a previously tracked finding no longer exists in Snyk but its Snyk project still exists, move the Linear issue to the resolved state.
 
-When a previously tracked finding no longer exists because its Snyk project no longer exists, cancel the Linear issue instead.
+When a previously tracked finding no longer exists because its Snyk project no longer exists, cancel the Linear issue instead. When the sync itself closes an open ticket this way it records `closed_reason: project-missing` (or `project-deactivated`) in the metadata block, so a later run can tell the closure was machine-made and rebind the ticket if the project is recreated.
+
+### Reopen Guard
+
+A terminal ticket is not reopened when Snyk reports its finding as open again; a fresh ticket is created instead, because Snyk reuses issue IDs across different code (#28). Two exceptions:
+
+- a rebind of a sync-cancelled ticket after project recreation (see Identity Model);
+- an exact, location-bearing fingerprint match whose ticket has known creation and closed times in Linear, where Snyk's `last_resolved_at` (the latest across the issue's coordinates) is empty or earlier than the ticket's creation. The finding was then open for the ticket's whole life, so the closure was premature (for example an automation) and the ticket is reopened (among several closed copies with that fingerprint, the most recently created one is checked and becomes canonical) with the reason "Snyk still reports this finding as open; reopened instead of creating a duplicate". This cannot reintroduce #28: an issue-ID reuse starts with Snyk resolving the old occurrence, which shows as a `last_resolved_at` after the ticket's creation. The comparison is deliberately against creation rather than closure, because the sync closes a ticket on a run after Snyk's resolution, so the resolution always predates the closure. An unparsable `last_resolved_at` or a missing timestamp keeps the default behavior.
 
 ### Conflict
 

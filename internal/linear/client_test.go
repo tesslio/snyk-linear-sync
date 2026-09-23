@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	gqlclient "git.sr.ht/~emersion/gqlclient"
 
@@ -1797,5 +1798,80 @@ func TestUpdateIssuesPreservesUnmanagedLabelAddedSinceSnapshot(t *testing.T) {
 	}
 	if !containsString(ids, "label-automation") {
 		t.Fatalf("labelIds = %#v, want the managed snyk-automation label present", ids)
+	}
+}
+
+func TestExtractIdentityAndClosedReason(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		description string
+	}{
+		{
+			name:        "as written",
+			description: "body\n\n<!-- snyk-linear-sync\nfingerprint: snyk:p:i:pkg@1\nidentity: 0123456789abcdef0123456789abcdef\nmanaged_labels: snyk-automation\nclosed_reason: project-missing\n-->",
+		},
+		{
+			name:        "escaped by Linear markdown normalization",
+			description: "body\n\n<!-- snyk-linear-sync\nfingerprint: snyk:p:i:pkg@1\nidentity: 0123456789abcdef0123456789abcdef\nmanaged\\_labels: snyk-automation\nclosed\\_reason: project\\-missing\n-->",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := extractIdentity(tc.description); got != "0123456789abcdef0123456789abcdef" {
+				t.Fatalf("extractIdentity() = %q", got)
+			}
+			if got := extractClosedReason(tc.description); got != model.ClosedReasonProjectMissing {
+				t.Fatalf("extractClosedReason() = %q", got)
+			}
+		})
+	}
+	legacy := "<!-- snyk-linear-sync\nfingerprint: snyk:p:i\n-->"
+	if extractIdentity(legacy) != "" || extractClosedReason(legacy) != "" {
+		t.Fatalf("legacy block must yield no identity or closed_reason")
+	}
+	// Lines outside the metadata block are never read.
+	outside := "identity: spoofed\nclosed_reason: project-missing\n<!-- snyk-linear-sync\nfingerprint: snyk:p:i\n-->"
+	if extractIdentity(outside) != "" || extractClosedReason(outside) != "" {
+		t.Fatalf("metadata lines outside the block must be ignored")
+	}
+}
+
+func TestLinearIssueToModelLoadsTimestamps(t *testing.T) {
+	created := "2026-08-01T10:00:00Z"
+	completed := "2026-09-01T10:00:00Z"
+	canceled := "2026-09-05T10:00:00Z"
+	node := linearIssueNode{ID: "id", CreatedAt: &created, CompletedAt: &completed}
+	issue := linearIssueToModel(node)
+	if issue.CreatedAt == nil || issue.CreatedAt.Format(time.RFC3339) != created {
+		t.Fatalf("CreatedAt = %v, want %s", issue.CreatedAt, created)
+	}
+	if issue.ClosedAt == nil || issue.ClosedAt.Format(time.RFC3339) != completed {
+		t.Fatalf("ClosedAt = %v, want completedAt %s", issue.ClosedAt, completed)
+	}
+
+	// Done then Cancelled: the later timestamp is the current closure.
+	node.CanceledAt = &canceled
+	if issue := linearIssueToModel(node); issue.ClosedAt == nil || issue.ClosedAt.Format(time.RFC3339) != canceled {
+		t.Fatalf("ClosedAt = %v, want canceledAt %s", issue.ClosedAt, canceled)
+	}
+
+	bad := "not-a-time"
+	if issue := linearIssueToModel(linearIssueNode{CompletedAt: &bad}); issue.ClosedAt != nil || issue.CreatedAt != nil {
+		t.Fatalf("unparsable/missing timestamps must be nil, got closed=%v created=%v", issue.ClosedAt, issue.CreatedAt)
+	}
+}
+
+func TestBuildChangeCommentSkipsMetadataOnlyDescriptionChange(t *testing.T) {
+	update := model.IssueUpdate{
+		Diff: &model.IssueDiff{DescriptionChanged: true, MetadataOnlyDescriptionChange: true},
+	}
+	if comment := buildChangeComment(update); comment != "" {
+		t.Fatalf("expected no comment for a metadata-only change, got: %s", comment)
+	}
+	update.Diff.StateChanged = true
+	update.Diff.StateTo = "todo"
+	update.Desired.StateReason = "Snyk still reports this finding as open; reopened instead of creating a duplicate"
+	comment := buildChangeComment(update)
+	if strings.Contains(comment, "Description updated") || !strings.Contains(comment, "reopened instead of creating a duplicate") {
+		t.Fatalf("unexpected comment: %s", comment)
 	}
 }
