@@ -12,6 +12,7 @@ github.com/tesslio/snyk-linear-sync
 
 - Authenticates to Snyk with OAuth client credentials.
 - Reads all projects in one configured Snyk org.
+- Optionally skips every project whose origin is listed in `SNYK_EXCLUDE_ORIGINS` (for example `cli`), and cancels the open tickets already filed for them (see [Excluding Project Origins](#excluding-project-origins)).
 - Normalizes Snyk findings into one Linear issue per `project + issue`.
 - Stores a stable fingerprint in a hidden metadata block in the Linear issue description.
 - Embeds Snyk issue details (fix availability, CVSS, CWE class(es), CVE identifier(s), vulnerability description, and remediation guidance) in the Linear ticket body so consumers do not each need Snyk API credentials.
@@ -166,7 +167,7 @@ closed_reason: project-missing
 
 - `fingerprint` is the exact join key to the Snyk finding.
 - `identity` is a project-independent hash of the finding (project origin, name, target file, target reference, repository and Kubernetes cluster, issue key, and location). It is written on every create and update and lets the sync find the ticket again if Snyk recreates the project under a new project ID. Tickets created before this line existed gain it on their next update; the first run after upgrading therefore updates every matched ticket once (a metadata-only change, so no change comment is posted).
-- `closed_reason` is present only on tickets the sync cancelled because their Snyk project went missing (`project-missing`) or was deactivated (`project-deactivated`). It marks the closure as machine-made, not a fix or a human decision. It is dropped as soon as the ticket tracks a live finding again.
+- `closed_reason` is present only on tickets the sync cancelled because their Snyk project went missing (`project-missing`), was deactivated (`project-deactivated`), or has an origin listed in `SNYK_EXCLUDE_ORIGINS` (`origin-excluded`). It marks the closure as machine-made, not a fix or a human decision. It is dropped as soon as the ticket tracks a live finding again.
 
 Changing or removing that block can cause duplicate issues or prevent updates from matching the correct Linear issue.
 
@@ -320,6 +321,22 @@ not need to write it itself.
 
 This setting only controls the issue subscriber list. Linear will still record the API user as the issue creator, and the create mutation response may briefly include that creator in `subscribers` even when the persisted issue subscriber list is empty after a refresh.
 
+## Excluding Project Origins
+
+`SNYK_EXCLUDE_ORIGINS` lists Snyk project `origin` values whose projects the sync ignores:
+
+- format: comma-separated origins, matched case-insensitively against the project's `origin` attribute
+- example: `cli` to ignore projects created by `snyk monitor` / `snyk container monitor`
+- default: none (every origin is synced)
+
+For a project with an excluded origin, the sync:
+
+- never creates or updates a ticket for its findings, and skips its v1 ignore lookups
+- cancels its open (non-terminal) tickets, recording `closed_reason: origin-excluded`
+- leaves its already closed (`Done`/`Cancelled`) tickets untouched, so excluding an origin does not rewrite how earlier tickets were resolved
+
+The exclusion wins over the project's status: an excluded project counts as neither active nor inactive. Its cancelled tickets are not rebind candidates (see [Project Recreation](#project-recreation)). If the origin is later removed from the list, its findings come back through the normal matching rules: an exact fingerprint match on a cancelled ticket goes through the [Reopen Guard](#reopen-guard), and anything else gets a fresh ticket.
+
 ## Snapshot Scope
 
 Each run loads a snapshot of the sync's own Linear tickets. The query is scoped
@@ -357,6 +374,7 @@ be trusted to select which issues to load.
 - missing finding in an existing active Snyk project -> `Done`
 - missing finding because the Snyk project no longer exists -> `Cancelled`
 - Snyk project is inactive (de-activated) -> `Cancelled`
+- Snyk project origin listed in `SNYK_EXCLUDE_ORIGINS` -> `Cancelled` (open tickets only; closed tickets keep their state)
 
 The configured Linear state names are resolved by name first, then by workflow type where possible.
 
@@ -441,6 +459,7 @@ Optional:
 - `--env-file`
 - `SNYK_REGION`
 - `SNYK_OAUTH_SCOPES`
+- `SNYK_EXCLUDE_ORIGINS`
 - `SOURCE_PROVIDER`
 - `LINEAR_STATE_TODO`
 - `LINEAR_STATE_BACKLOG`
@@ -471,7 +490,7 @@ See [.env.example](/workspace/.env.example).
 ## Logs
 
 - Console logs show startup, load progress, work progress, cache refresh, and final summary.
-- The final `sync complete` line reports `findings`, `existing_issues`, `active_projects`, `inactive_projects`, `cluster_lookup_failures`, `conflicts`, `rebound`, `reopened`, `deferred_creates`, `planned_creates`, `planned_updates`, `planned_resolves`, `cancelled_duplicates`, and `failed_ops`. Each rebind is also logged individually with the old and new project ID and the Linear identifier.
+- The final `sync complete` line reports `findings`, `existing_issues`, `active_projects`, `inactive_projects`, `excluded_projects`, `cluster_lookup_failures`, `conflicts`, `rebound`, `reopened`, `deferred_creates`, `planned_creates`, `planned_updates`, `planned_resolves`, `cancelled_duplicates`, and `failed_ops`. Each rebind is also logged individually with the old and new project ID and the Linear identifier.
 - Error logs are appended to `ERROR_LOG_FILE`.
 - Default error log path: `logs/snyk-linear-sync-errors.log`
 

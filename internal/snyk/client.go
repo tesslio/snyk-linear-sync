@@ -29,6 +29,8 @@ type Client struct {
 	sdk        *snyksdk.Client
 	logger     *slog.Logger
 	cache      *cache.Store
+	// excludedOrigins holds the lower-cased SNYK_EXCLUDE_ORIGINS values.
+	excludedOrigins map[string]struct{}
 }
 
 func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Client, error) {
@@ -76,13 +78,19 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Client, 
 		return nil, fmt.Errorf("parse region V1 URL: %w", err)
 	}
 
+	excludedOrigins := make(map[string]struct{}, len(cfg.Snyk.ExcludeOrigins))
+	for _, origin := range cfg.Snyk.ExcludeOrigins {
+		excludedOrigins[origin] = struct{}{}
+	}
+
 	return &Client{
-		orgID:      cfg.Snyk.OrgID,
-		httpClient: httpClient,
-		restBase:   restBase,
-		v1Base:     v1Base,
-		sdk:        sdkClient,
-		logger:     logger,
+		orgID:           cfg.Snyk.OrgID,
+		httpClient:      httpClient,
+		restBase:        restBase,
+		v1Base:          v1Base,
+		sdk:             sdkClient,
+		logger:          logger,
+		excludedOrigins: excludedOrigins,
 	}, nil
 }
 

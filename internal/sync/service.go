@@ -69,6 +69,9 @@ type RunResult struct {
 	// recreated) explains a burst of cancels, rebinds or creates.
 	ActiveProjects   int
 	InactiveProjects int
+	// ExcludedProjects counts projects skipped because their origin is in
+	// SNYK_EXCLUDE_ORIGINS.
+	ExcludedProjects int
 	// ClusterLookupFailures counts Kubernetes projects whose cluster lookup
 	// failed this run; their findings get no identity and cannot rebind.
 	ClusterLookupFailures int
@@ -446,6 +449,7 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 	result.ExistingIssues = len(existingIssues)
 	result.ActiveProjects = len(snykSnapshot.ProjectIDs)
 	result.InactiveProjects = len(snykSnapshot.InactiveProjectIDs)
+	result.ExcludedProjects = len(snykSnapshot.ExcludedProjectIDs)
 	result.ClusterLookupFailures = snykSnapshot.ClusterLookupFailures
 	result.Conflicts = len(duplicatesToCancel)
 	result.Rebound = rebound
@@ -546,7 +550,13 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 			if existing.ArchivedAt != nil {
 				continue
 			}
-			desiredState, stateReason := missingFindingState(existing.Fingerprint, snykSnapshot.ProjectIDs, snykSnapshot.InactiveProjectIDs)
+			// A ticket of an excluded project that is already closed keeps
+			// its state: excluding an origin stops tracking it from now on
+			// and does not rewrite how its past tickets were resolved.
+			if excludedProject(existing.Fingerprint, snykSnapshot.ExcludedProjectIDs) && isTerminalLinearState(existing, s.cfg.Linear.States) {
+				continue
+			}
+			desiredState, stateReason := missingFindingState(existing.Fingerprint, snykSnapshot)
 			// Record a machine-made closure only when this loop is the one
 			// closing the ticket. A ticket that is already terminal was closed
 			// by a fix or a person before its project vanished; keep whatever
@@ -554,7 +564,7 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 			// becomes eligible for a rebind.
 			closedReason := existing.ClosedReason
 			if isNonTerminalLinearState(existing, s.cfg.Linear.States) {
-				closedReason = projectClosedReason(existing.Fingerprint, snykSnapshot.ProjectIDs, snykSnapshot.InactiveProjectIDs)
+				closedReason = projectClosedReason(existing.Fingerprint, snykSnapshot)
 			}
 			resolved := model.DesiredIssue{
 				Fingerprint: existing.Fingerprint,
@@ -1566,15 +1576,18 @@ func ComputeDiff(existing model.ExistingIssue, desired model.DesiredIssue, state
 	return d
 }
 
-func missingFindingState(fingerprint string, activeProjects map[string]struct{}, inactiveProjects map[string]struct{}) (model.IssueState, string) {
+func missingFindingState(fingerprint string, snapshot model.SnykSnapshot) (model.IssueState, string) {
 	projectID, ok := FingerprintProjectID(fingerprint)
 	if !ok {
 		return model.StateDone, "this Snyk finding is no longer present"
 	}
-	if _, exists := activeProjects[projectID]; exists {
+	if _, exists := snapshot.ProjectIDs[projectID]; exists {
 		return model.StateDone, "this Snyk finding is no longer present"
 	}
-	if _, exists := inactiveProjects[projectID]; exists {
+	if _, exists := snapshot.ExcludedProjectIDs[projectID]; exists {
+		return model.StateCancelled, "the Snyk project's origin is excluded from the sync (SNYK_EXCLUDE_ORIGINS)"
+	}
+	if _, exists := snapshot.InactiveProjectIDs[projectID]; exists {
 		return model.StateCancelled, "the Snyk project has been deactivated"
 	}
 	// Both deleted and inactive projects result in Cancelled: the issue is no
@@ -1583,21 +1596,36 @@ func missingFindingState(fingerprint string, activeProjects map[string]struct{},
 }
 
 // projectClosedReason returns the metadata closed_reason for a ticket the
-// resolve loop cancels because its Snyk project is gone or deactivated, or ""
-// when the project is still active (the ticket is Done because the finding
-// is no longer present, which is a fix, not a machine-made closure).
-func projectClosedReason(fingerprint string, activeProjects map[string]struct{}, inactiveProjects map[string]struct{}) string {
+// resolve loop cancels because its Snyk project is gone, deactivated, or of an
+// excluded origin, or "" when the project is still active (the ticket is Done
+// because the finding is no longer present, which is a fix, not a
+// machine-made closure).
+func projectClosedReason(fingerprint string, snapshot model.SnykSnapshot) string {
 	projectID, ok := FingerprintProjectID(fingerprint)
 	if !ok {
 		return ""
 	}
-	if _, exists := activeProjects[projectID]; exists {
+	if _, exists := snapshot.ProjectIDs[projectID]; exists {
 		return ""
 	}
-	if _, exists := inactiveProjects[projectID]; exists {
+	if _, exists := snapshot.ExcludedProjectIDs[projectID]; exists {
+		return model.ClosedReasonOriginExcluded
+	}
+	if _, exists := snapshot.InactiveProjectIDs[projectID]; exists {
 		return model.ClosedReasonProjectDeactivated
 	}
 	return model.ClosedReasonProjectMissing
+}
+
+// excludedProject reports whether the fingerprint's project is one whose
+// origin is in SNYK_EXCLUDE_ORIGINS.
+func excludedProject(fingerprint string, excludedProjects map[string]struct{}) bool {
+	projectID, ok := FingerprintProjectID(fingerprint)
+	if !ok {
+		return false
+	}
+	_, exists := excludedProjects[projectID]
+	return exists
 }
 
 // rebindCandidatesByIdentity indexes, by identity, the existing tickets that

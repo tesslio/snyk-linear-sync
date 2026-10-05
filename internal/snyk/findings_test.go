@@ -1440,3 +1440,57 @@ func TestFetchProjectClusterWithRetry(t *testing.T) {
 		})
 	}
 }
+
+// TestPartitionProjectsExcludesOrigins verifies that a project whose origin is
+// excluded lands only in the excluded set, whatever its status, and that the
+// origin match ignores case and surrounding whitespace.
+func TestPartitionProjectsExcludesOrigins(t *testing.T) {
+	projects := []projectRef{
+		{ID: "gh-active", Origin: "github", Active: true},
+		{ID: "gh-inactive", Origin: "github", Active: false},
+		{ID: "cli-active", Origin: "cli", Active: true},
+		{ID: "cli-inactive", Origin: " CLI ", Active: false},
+	}
+
+	details, active, inactive, excluded := partitionProjects(projects, map[string]struct{}{"cli": {}})
+
+	if len(details) != len(projects) {
+		t.Fatalf("details = %d entries, want %d", len(details), len(projects))
+	}
+	for name, tc := range map[string]struct {
+		got  map[string]struct{}
+		want []string
+	}{
+		"active":   {active, []string{"gh-active"}},
+		"inactive": {inactive, []string{"gh-inactive"}},
+		"excluded": {excluded, []string{"cli-active", "cli-inactive"}},
+	} {
+		if len(tc.got) != len(tc.want) {
+			t.Fatalf("%s = %v, want %v", name, tc.got, tc.want)
+		}
+		for _, id := range tc.want {
+			if _, ok := tc.got[id]; !ok {
+				t.Fatalf("%s = %v, want it to contain %q", name, tc.got, id)
+			}
+		}
+	}
+}
+
+func TestPartitionProjectsWithoutExclusions(t *testing.T) {
+	projects := []projectRef{
+		{ID: "cli-active", Origin: "cli", Active: true},
+		{ID: "gh-inactive", Origin: "github", Active: false},
+	}
+
+	_, active, inactive, excluded := partitionProjects(projects, nil)
+
+	if _, ok := active["cli-active"]; !ok || len(active) != 1 {
+		t.Fatalf("active = %v, want only cli-active", active)
+	}
+	if _, ok := inactive["gh-inactive"]; !ok || len(inactive) != 1 {
+		t.Fatalf("inactive = %v, want only gh-inactive", inactive)
+	}
+	if len(excluded) != 0 {
+		t.Fatalf("excluded = %v, want none", excluded)
+	}
+}

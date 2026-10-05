@@ -88,6 +88,10 @@ When a previously tracked finding no longer exists in Snyk but its Snyk project 
 
 When a previously tracked finding no longer exists because its Snyk project no longer exists, cancel the Linear issue instead. When the sync itself closes an open ticket this way it records `closed_reason: project-missing` (or `project-deactivated`) in the metadata block, so a later run can tell the closure was machine-made and rebind the ticket if the project is recreated.
 
+### Excluded Origins
+
+`SNYK_EXCLUDE_ORIGINS` lists Snyk project origins (for example `cli`) the sync ignores. An excluded project's findings are dropped when the Snyk snapshot is loaded, before any matching, so they are never created or updated. Its open tickets are cancelled with `closed_reason: origin-excluded`; its closed tickets are left alone, because excluding an origin is a decision about what to track from now on, not a statement about how earlier tickets were resolved. The exclusion takes precedence over project status, and an `origin-excluded` closure never makes a ticket a rebind candidate: the project still exists, so only a fingerprint match can bring the ticket back if the origin is un-excluded.
+
 ### Reopen Guard
 
 A terminal ticket is not reopened when Snyk reports its finding as open again; a fresh ticket is created instead, because Snyk reuses issue IDs across different code (#28). Two exceptions:
@@ -254,6 +258,7 @@ The current workflow mapping is:
 - missing finding in an existing active Snyk project -> `Done`
 - missing finding because the Snyk project no longer exists -> `Cancelled`
 - Snyk project is inactive (de-activated) -> `Cancelled`
+- Snyk project origin listed in `SNYK_EXCLUDE_ORIGINS` -> `Cancelled` (open tickets only; closed tickets keep their state)
 
 The sync also normalizes workflow naming differences such as `Canceled` vs `Cancelled`.
 

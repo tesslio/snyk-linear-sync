@@ -71,6 +71,10 @@ type SnykConfig struct {
 	ClientSecret string
 	OrgID        string
 	Scopes       []string
+	// ExcludeOrigins lists Snyk project origins (lower-cased, e.g. "cli")
+	// whose projects the sync ignores: their findings never become tickets,
+	// and open tickets already filed for them are cancelled.
+	ExcludeOrigins []string
 }
 
 type SourceConfig struct {
@@ -168,11 +172,12 @@ func Load(args []string) (Config, error) {
 			BypassCache: *bypassCache,
 		},
 		Snyk: SnykConfig{
-			Region:       getEnv("SNYK_REGION", defaultSnykRegion),
-			ClientID:     os.Getenv("SNYK_CLIENT_ID"),
-			ClientSecret: os.Getenv("SNYK_CLIENT_SECRET"),
-			OrgID:        os.Getenv("SNYK_ORG_ID"),
-			Scopes:       splitCSV(os.Getenv("SNYK_OAUTH_SCOPES")),
+			Region:         getEnv("SNYK_REGION", defaultSnykRegion),
+			ClientID:       os.Getenv("SNYK_CLIENT_ID"),
+			ClientSecret:   os.Getenv("SNYK_CLIENT_SECRET"),
+			OrgID:          os.Getenv("SNYK_ORG_ID"),
+			Scopes:         splitCSV(os.Getenv("SNYK_OAUTH_SCOPES")),
+			ExcludeOrigins: parseOriginList(os.Getenv("SNYK_EXCLUDE_ORIGINS")),
 		},
 		Source: SourceConfig{
 			Provider: normalizeSourceProvider(getEnv("SOURCE_PROVIDER", defaultSourceProvider)),
@@ -362,6 +367,18 @@ func parseLabelList(raw string) []string {
 		if label := normalizeManagedLabel(part); label != "" {
 			out = append(out, label)
 		}
+	}
+	return out
+}
+
+// parseOriginList parses a comma-separated list of Snyk project origins.
+// Entries are lower-cased to match the origin keys LINEAR_ORIGIN_LABELS uses,
+// and the "off"/"none" disable words are dropped, so SNYK_EXCLUDE_ORIGINS=off
+// excludes nothing.
+func parseOriginList(raw string) []string {
+	var out []string
+	for _, origin := range parseLabelList(raw) {
+		out = append(out, strings.ToLower(origin))
 	}
 	return out
 }

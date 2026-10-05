@@ -2368,6 +2368,71 @@ func TestRunInactiveProjectAlreadyCancelledIsIdempotent(t *testing.T) {
 	}
 }
 
+// TestRunCancelsOpenIssuesOfExcludedOriginProjects verifies that open tickets
+// of a project whose origin is in SNYK_EXCLUDE_ORIGINS are cancelled with a
+// recorded origin-excluded closed_reason, and that tickets already closed
+// keep their state.
+func TestRunCancelsOpenIssuesOfExcludedOriginProjects(t *testing.T) {
+	cfg := minimalCfg()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	snyk := fakeSnyk{
+		snapshot: model.SnykSnapshot{
+			Findings:           []model.Finding{},
+			ProjectIDs:         map[string]struct{}{"project-active": {}},
+			ExcludedProjectIDs: map[string]struct{}{"project-excluded": {}},
+		},
+	}
+	linear := &fakeLinear{
+		snapshot: []model.ExistingIssue{
+			{ID: "id-1", Identifier: "SEC-1", Title: "open", Description: "body", StateName: "Todo", Fingerprint: "snyk:project-excluded:issue-1"},
+			{ID: "id-2", Identifier: "SEC-2", Title: "in progress", Description: "body", StateName: "In Progress", Fingerprint: "snyk:project-excluded:issue-2"},
+			{ID: "id-3", Identifier: "SEC-3", Title: "fixed", Description: "body", StateName: "Done", Fingerprint: "snyk:project-excluded:issue-3"},
+			{ID: "id-4", Identifier: "SEC-4", Title: "ignored", Description: "body", StateName: "Cancelled", Fingerprint: "snyk:project-excluded:issue-4"},
+		},
+	}
+
+	service := New(cfg, logger, snyk, linear, nil)
+	result, err := service.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if result.ExcludedProjects != 1 {
+		t.Fatalf("ExcludedProjects = %d, want 1", result.ExcludedProjects)
+	}
+	if result.PlannedResolves != 2 {
+		t.Fatalf("PlannedResolves = %d, want 2 (the two open tickets)", result.PlannedResolves)
+	}
+	got := cancelledIdentifiers(linear.updates)
+	slices.Sort(got)
+	if !slices.Equal(got, []string{"SEC-1", "SEC-2"}) {
+		t.Fatalf("cancelled = %v, want [SEC-1 SEC-2]; closed tickets must keep their state", got)
+	}
+	for _, update := range linear.updates {
+		if !strings.Contains(update.Desired.Description, "closed_reason: "+model.ClosedReasonOriginExcluded) {
+			t.Fatalf("%s description missing origin-excluded closed_reason:\n%s", update.Existing.Identifier, update.Desired.Description)
+		}
+		if !strings.Contains(update.Desired.StateReason, "SNYK_EXCLUDE_ORIGINS") {
+			t.Fatalf("%s state reason = %q, want it to name SNYK_EXCLUDE_ORIGINS", update.Existing.Identifier, update.Desired.StateReason)
+		}
+	}
+}
+
+// TestExcludedOriginClosureIsNotARebindCandidate pins that origin-excluded
+// cancellations stay out of the rebind index: the project still exists, so
+// only a fingerprint match may ever bring such a ticket back.
+func TestExcludedOriginClosureIsNotARebindCandidate(t *testing.T) {
+	cfg := minimalCfg()
+	issue := model.ExistingIssue{
+		StateName:    "Cancelled",
+		ClosedReason: model.ClosedReasonOriginExcluded,
+	}
+	if isSyncCancelledForMissingProject(issue, cfg.Linear.States) {
+		t.Fatal("origin-excluded ticket treated as cancelled for a missing project")
+	}
+}
+
 func TestRunKeepsTemporaryIgnoreOpenWithExtendedDueDate(t *testing.T) {
 	cfg := minimalCfg()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))

@@ -272,6 +272,41 @@ func TestLoadProtectedLabelsCanBeDisabled(t *testing.T) {
 	}
 }
 
+func TestLoadExcludeOrigins(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("SNYK_EXCLUDE_ORIGINS", " CLI , ,off,api ")
+
+	cfg, err := Load(nil)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	// Blank entries and the "off" disable word are dropped; the rest are
+	// trimmed and lower-cased to match Snyk's origin values.
+	want := []string{"cli", "api"}
+	if len(cfg.Snyk.ExcludeOrigins) != len(want) {
+		t.Fatalf("ExcludeOrigins = %#v, want %#v", cfg.Snyk.ExcludeOrigins, want)
+	}
+	for i, origin := range want {
+		if cfg.Snyk.ExcludeOrigins[i] != origin {
+			t.Fatalf("ExcludeOrigins[%d] = %q, want %q", i, cfg.Snyk.ExcludeOrigins[i], origin)
+		}
+	}
+}
+
+func TestLoadExcludeOriginsDefaultsToNone(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("SNYK_EXCLUDE_ORIGINS", "")
+
+	cfg, err := Load(nil)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if len(cfg.Snyk.ExcludeOrigins) != 0 {
+		t.Fatalf("ExcludeOrigins = %#v, want none by default", cfg.Snyk.ExcludeOrigins)
+	}
+}
+
 func setRequiredEnv(t *testing.T) {
 	t.Helper()
 	t.Setenv("SNYK_CLIENT_ID", "client-id")

@@ -107,6 +107,10 @@ type SnykSnapshot struct {
 	Findings           []Finding
 	ProjectIDs         map[string]struct{}
 	InactiveProjectIDs map[string]struct{}
+	// ExcludedProjectIDs holds projects whose origin is in
+	// SNYK_EXCLUDE_ORIGINS. They are in neither ProjectIDs nor
+	// InactiveProjectIDs, and none of their findings are in Findings.
+	ExcludedProjectIDs map[string]struct{}
 	// ClusterLookupFailures counts Kubernetes projects whose cluster lookup
 	// failed this run (their findings carry ProjectClusterUnknown).
 	ClusterLookupFailures int
@@ -163,9 +167,10 @@ type ExistingIssue struct {
 	// Snyk recreates its project under a new project ID.
 	Identity string
 	// ClosedReason is the machine-readable reason the sync recorded in the
-	// metadata block when it cancelled the ticket because its Snyk project
-	// disappeared (ClosedReasonProjectMissing / ClosedReasonProjectDeactivated),
-	// or "" when the sync did not close it for that reason.
+	// metadata block when it cancelled the ticket because of its Snyk project
+	// rather than its finding (ClosedReasonProjectMissing,
+	// ClosedReasonProjectDeactivated or ClosedReasonOriginExcluded), or ""
+	// when the sync did not close it for that reason.
 	ClosedReason string
 }
 
@@ -177,6 +182,12 @@ const (
 	ClosedReasonProjectMissing     = "project-missing"
 	ClosedReasonProjectDeactivated = "project-deactivated"
 )
+
+// ClosedReasonOriginExcluded marks a ticket the sync cancelled because its
+// project's origin is in SNYK_EXCLUDE_ORIGINS. It is machine-made too, but it
+// does not make the ticket a rebind candidate: the project still exists, and
+// if the origin is un-excluded its findings match the ticket by fingerprint.
+const ClosedReasonOriginExcluded = "origin-excluded"
 
 type DesiredIssue struct {
 	Fingerprint   string

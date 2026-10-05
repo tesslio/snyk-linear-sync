@@ -235,17 +235,7 @@ func (c *Client) LoadSnapshot(ctx context.Context) (model.SnykSnapshot, error) {
 		return model.SnykSnapshot{}, err
 	}
 
-	projectDetails := make(map[string]projectRef, len(projects))
-	projectIDs := make(map[string]struct{}, len(projects))
-	inactiveProjectIDs := make(map[string]struct{})
-	for _, project := range projects {
-		projectDetails[project.ID] = project
-		if project.Active {
-			projectIDs[project.ID] = struct{}{}
-		} else {
-			inactiveProjectIDs[project.ID] = struct{}{}
-		}
-	}
+	projectDetails, projectIDs, inactiveProjectIDs, excludedProjectIDs := partitionProjects(projects, c.excludedOrigins)
 
 	findings := make([]model.Finding, 0, len(projects))
 	// Cache v1 ignores per project ID to avoid redundant API calls when the
@@ -282,10 +272,12 @@ func (c *Client) LoadSnapshot(ctx context.Context) (model.SnykSnapshot, error) {
 
 		// Collect all project IDs that appear in this page so we can fetch
 		// v1 ignore metadata (expiration dates and disregardIfFixable).
+		// Excluded projects are skipped here too: none of their findings are
+		// kept, so their ignore metadata would only cost API calls.
 		projectIDsInPage := make(map[string]struct{})
 		for _, issue := range page {
 			projectID := issue.Relationships.ScanItem.Data.ID
-			if projectID != "" {
+			if _, excluded := excludedProjectIDs[projectID]; projectID != "" && !excluded {
 				projectIDsInPage[projectID] = struct{}{}
 			}
 		}
@@ -311,6 +303,9 @@ func (c *Client) LoadSnapshot(ctx context.Context) (model.SnykSnapshot, error) {
 				continue
 			}
 			if _, inactive := inactiveProjectIDs[projectID]; inactive {
+				continue
+			}
+			if _, excluded := excludedProjectIDs[projectID]; excluded {
 				continue
 			}
 
@@ -409,8 +404,38 @@ func (c *Client) LoadSnapshot(ctx context.Context) (model.SnykSnapshot, error) {
 		Findings:              findings,
 		ProjectIDs:            projectIDs,
 		InactiveProjectIDs:    inactiveProjectIDs,
+		ExcludedProjectIDs:    excludedProjectIDs,
 		ClusterLookupFailures: len(k8sClusterFailed),
 	}, nil
+}
+
+// partitionProjects indexes projects by ID and splits them into active,
+// inactive, and excluded sets. A project whose origin is in excludedOrigins
+// is excluded whatever its status, so the three sets never overlap: the sync
+// cancels an excluded project's open tickets for the exclusion, not as a
+// deactivation.
+func partitionProjects(projects []projectRef, excludedOrigins map[string]struct{}) (details map[string]projectRef, active, inactive, excluded map[string]struct{}) {
+	details = make(map[string]projectRef, len(projects))
+	active = make(map[string]struct{}, len(projects))
+	inactive = make(map[string]struct{})
+	excluded = make(map[string]struct{})
+	for _, project := range projects {
+		details[project.ID] = project
+		switch {
+		case isExcludedOrigin(project.Origin, excludedOrigins):
+			excluded[project.ID] = struct{}{}
+		case project.Active:
+			active[project.ID] = struct{}{}
+		default:
+			inactive[project.ID] = struct{}{}
+		}
+	}
+	return details, active, inactive, excluded
+}
+
+func isExcludedOrigin(origin string, excludedOrigins map[string]struct{}) bool {
+	_, ok := excludedOrigins[strings.ToLower(strings.TrimSpace(origin))]
+	return ok
 }
 
 func (c *Client) ListFindings(ctx context.Context) ([]model.Finding, error) {
