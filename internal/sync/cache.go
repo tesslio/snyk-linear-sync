@@ -12,7 +12,7 @@ import (
 // Bump when the managed issue rendering (title/description/labels/state
 // mapping) changes so cached hashes from the old format are discarded and
 // every ticket is reconciled once against the new format.
-const metadataSchemaVersion = "2026-08-26-k8s-cluster-namespace"
+const metadataSchemaVersion = "2026-09-23-identity-closed-reason"
 
 func managedSchemaSignature() string {
 	return metadataSchemaVersion

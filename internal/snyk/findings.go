@@ -267,8 +267,11 @@ func (c *Client) LoadSnapshot(ctx context.Context) (model.SnykSnapshot, error) {
 	// fetched lazily from the v1 project detail endpoint (the REST project
 	// resource does not expose it). In-memory only: one GET per kubernetes
 	// project per run, mirroring the v1IgnoresCache pattern. A failed fetch
-	// is cached as "" so we don't retry a broken project for every finding.
+	// is recorded in k8sClusterFailed so we don't retry a broken project for
+	// every finding, and so its findings are marked cluster-unknown rather
+	// than "no cluster".
 	k8sClusterCache := make(map[string]string)
+	k8sClusterFailed := make(map[string]struct{})
 
 	nextCursor := ""
 	for {
@@ -365,26 +368,33 @@ func (c *Client) LoadSnapshot(ctx context.Context) (model.SnykSnapshot, error) {
 			}
 
 			cluster := ""
+			clusterUnknown := false
 			if project.Origin == "kubernetes" {
 				var ok bool
 				cluster, ok = k8sClusterCache[projectID]
 				if !ok {
-					cluster, err = c.fetchProjectCluster(ctx, projectID)
+					cluster, err = c.fetchProjectClusterWithRetry(ctx, projectID, clusterLookupAttempts)
 					if err != nil {
 						// Cluster is ticket enrichment, not sync-critical: log
-						// and continue with an empty value rather than failing
-						// the whole run.
-						c.logger.Warn("could not fetch kubernetes cluster for project; cluster omitted from tickets",
+						// and continue rather than failing the whole run. The
+						// findings are marked cluster-unknown, which is not the
+						// same as "Snyk reports no cluster": the sync then
+						// writes no identity for them this run and keeps the
+						// cluster and identity a matched ticket already has.
+						c.logger.Warn("could not fetch kubernetes cluster for project; cluster treated as unknown this run",
 							slog.String("project_id", projectID),
 							slog.String("error", err.Error()),
 						)
 						cluster = ""
+						k8sClusterFailed[projectID] = struct{}{}
 					}
 					k8sClusterCache[projectID] = cluster
 				}
+				_, clusterUnknown = k8sClusterFailed[projectID]
 			}
 
 			finding := c.findingFromIssue(issue, projectID, project, cluster, orgSlug, issueKey, urlKey, createdAt, updatedAt, ignoreMeta)
+			finding.ProjectClusterUnknown = clusterUnknown
 
 			findings = append(findings, finding)
 		}
@@ -396,9 +406,10 @@ func (c *Client) LoadSnapshot(ctx context.Context) (model.SnykSnapshot, error) {
 	}
 
 	return model.SnykSnapshot{
-		Findings:           findings,
-		ProjectIDs:         projectIDs,
-		InactiveProjectIDs: inactiveProjectIDs,
+		Findings:              findings,
+		ProjectIDs:            projectIDs,
+		InactiveProjectIDs:    inactiveProjectIDs,
+		ClusterLookupFailures: len(k8sClusterFailed),
 	}, nil
 }
 
@@ -426,51 +437,54 @@ func (c *Client) findingFromIssue(
 	ignoreMeta ignoreMetadata,
 ) model.Finding {
 	source := sourceLocation(issue.Attributes.Coordinates)
+	lastResolvedAt, lastResolvedAtInvalid := latestResolvedAt(issue.Attributes.Coordinates)
 	return model.Finding{
-		Fingerprint:        model.Fingerprint(projectID, issue.ID, locationKey(issue.Attributes.Coordinates)),
-		SnykIssueID:        issue.ID,
-		SnykIssueKey:       issueKey,
-		IssueType:          strings.ToLower(strings.TrimSpace(issue.Attributes.Type)),
-		CreatedAt:          createdAt,
-		UpdatedAt:          updatedAt,
-		ProjectID:          projectID,
-		ProjectName:        project.Name,
-		ProjectOrigin:      project.Origin,
-		ProjectReference:   project.TargetReference,
-		ProjectTargetFile:  project.TargetFile,
-		Repository:         project.Repository,
-		ProjectCluster:     cluster,
-		ProjectNamespace:   project.Namespace,
-		IssueTitle:         coalesce(issue.Attributes.Title, problemTitle(issue.Attributes.Problems), issue.Attributes.Key, issue.ID),
-		Severity:           coalesce(issue.Attributes.EffectiveSeverity, firstProblemSeverity(issue.Attributes.Problems), "unknown"),
-		CVSS:               selectCVSS(issue.Attributes.Severities),
-		ExploitMaturity:    exploitMaturity(issue.Attributes.ExploitDetails.MaturityLevels),
-		PackageName:        packageName(issue.Attributes.Coordinates),
-		VulnerableVersion:  vulnerableVersion(issue.Attributes.Coordinates),
-		FixedVersion:       fixedVersion(issue.Attributes.Coordinates),
-		IssueURL:           c.issueUIURL(orgSlug, projectID, urlKey),
-		IssueAPIURL:        c.issueAPIURL(issue.ID),
-		Status:             mapStatus(issue.Attributes, ignoreMeta.ExpiresAt, ignoreMeta.DisregardIfFixable),
-		IntroducedThrough:  introducedThrough(issue.Attributes.Coordinates),
-		SourceFile:         source.File,
-		SourceCommitID:     source.CommitID,
-		SourceLineStart:    source.Region.Start.Line,
-		SourceColumnStart:  source.Region.Start.Column,
-		SourceLineEnd:      source.Region.End.Line,
-		SourceColumnEnd:    source.Region.End.Column,
-		IgnoreExpiresAt:    ignoreMeta.ExpiresAt,
-		DisregardIfFixable: ignoreMeta.DisregardIfFixable,
-		Classes:            issueClasses(issue.Attributes.Classes),
-		CVEs:               cveIDs(issue.Attributes.Problems),
-		Description:        strings.TrimSpace(issue.Attributes.Description),
-		Remediation:        remediationDescription(issue.Attributes.Coordinates),
-		HasCoordinates:     len(issue.Attributes.Coordinates) > 0,
-		IsFixableManually:  anyFixable(issue.Attributes.Coordinates, func(c coordinate) bool { return c.IsFixableManually }),
-		IsFixableSnyk:      anyFixable(issue.Attributes.Coordinates, func(c coordinate) bool { return c.IsFixableSnyk }),
-		IsFixableUpstream:  anyFixable(issue.Attributes.Coordinates, func(c coordinate) bool { return c.IsFixableUpstream }),
-		IsPatchable:        anyFixable(issue.Attributes.Coordinates, func(c coordinate) bool { return c.IsPatchable }),
-		IsPinnable:         anyFixable(issue.Attributes.Coordinates, func(c coordinate) bool { return c.IsPinnable }),
-		IsUpgradeable:      anyFixable(issue.Attributes.Coordinates, func(c coordinate) bool { return c.IsUpgradeable }),
+		Fingerprint:           model.Fingerprint(projectID, issue.ID, locationKey(issue.Attributes.Coordinates)),
+		SnykIssueID:           issue.ID,
+		SnykIssueKey:          issueKey,
+		IssueType:             strings.ToLower(strings.TrimSpace(issue.Attributes.Type)),
+		CreatedAt:             createdAt,
+		UpdatedAt:             updatedAt,
+		ProjectID:             projectID,
+		ProjectName:           project.Name,
+		ProjectOrigin:         project.Origin,
+		ProjectReference:      project.TargetReference,
+		ProjectTargetFile:     project.TargetFile,
+		Repository:            project.Repository,
+		ProjectCluster:        cluster,
+		ProjectNamespace:      project.Namespace,
+		IssueTitle:            coalesce(issue.Attributes.Title, problemTitle(issue.Attributes.Problems), issue.Attributes.Key, issue.ID),
+		Severity:              coalesce(issue.Attributes.EffectiveSeverity, firstProblemSeverity(issue.Attributes.Problems), "unknown"),
+		CVSS:                  selectCVSS(issue.Attributes.Severities),
+		ExploitMaturity:       exploitMaturity(issue.Attributes.ExploitDetails.MaturityLevels),
+		PackageName:           packageName(issue.Attributes.Coordinates),
+		VulnerableVersion:     vulnerableVersion(issue.Attributes.Coordinates),
+		FixedVersion:          fixedVersion(issue.Attributes.Coordinates),
+		IssueURL:              c.issueUIURL(orgSlug, projectID, urlKey),
+		IssueAPIURL:           c.issueAPIURL(issue.ID),
+		Status:                mapStatus(issue.Attributes, ignoreMeta.ExpiresAt, ignoreMeta.DisregardIfFixable),
+		IntroducedThrough:     introducedThrough(issue.Attributes.Coordinates),
+		SourceFile:            source.File,
+		SourceCommitID:        source.CommitID,
+		SourceLineStart:       source.Region.Start.Line,
+		SourceColumnStart:     source.Region.Start.Column,
+		SourceLineEnd:         source.Region.End.Line,
+		SourceColumnEnd:       source.Region.End.Column,
+		IgnoreExpiresAt:       ignoreMeta.ExpiresAt,
+		DisregardIfFixable:    ignoreMeta.DisregardIfFixable,
+		LastResolvedAt:        lastResolvedAt,
+		LastResolvedAtInvalid: lastResolvedAtInvalid,
+		Classes:               issueClasses(issue.Attributes.Classes),
+		CVEs:                  cveIDs(issue.Attributes.Problems),
+		Description:           strings.TrimSpace(issue.Attributes.Description),
+		Remediation:           remediationDescription(issue.Attributes.Coordinates),
+		HasCoordinates:        len(issue.Attributes.Coordinates) > 0,
+		IsFixableManually:     anyFixable(issue.Attributes.Coordinates, func(c coordinate) bool { return c.IsFixableManually }),
+		IsFixableSnyk:         anyFixable(issue.Attributes.Coordinates, func(c coordinate) bool { return c.IsFixableSnyk }),
+		IsFixableUpstream:     anyFixable(issue.Attributes.Coordinates, func(c coordinate) bool { return c.IsFixableUpstream }),
+		IsPatchable:           anyFixable(issue.Attributes.Coordinates, func(c coordinate) bool { return c.IsPatchable }),
+		IsPinnable:            anyFixable(issue.Attributes.Coordinates, func(c coordinate) bool { return c.IsPinnable }),
+		IsUpgradeable:         anyFixable(issue.Attributes.Coordinates, func(c coordinate) bool { return c.IsUpgradeable }),
 	}
 }
 
@@ -567,6 +581,45 @@ type v1ProjectDetail struct {
 	// ImageCluster is the Kubernetes cluster name, reported only for
 	// projects imported through the Snyk Kubernetes integration.
 	ImageCluster string `json:"imageCluster"`
+}
+
+// clusterLookupAttempts bounds fetchProjectClusterWithRetry. The adaptive
+// transport already retries 429/502/503/504 with backoff; this covers the
+// errors it does not (other 5xx, transient 4xx such as a 404 just after a
+// project import, transport errors, and bad bodies).
+const clusterLookupAttempts = 3
+
+// clusterLookupBackoff is the delay before the first retry; it grows
+// linearly per attempt. A variable so tests can shorten it.
+var clusterLookupBackoff = 500 * time.Millisecond
+
+// fetchProjectClusterWithRetry calls fetchProjectCluster up to maxAttempts
+// times with a short linear backoff, returning the last error if every
+// attempt fails. A failed lookup makes the project's findings lose their
+// identity for the run, so one transient error is worth a retry.
+func (c *Client) fetchProjectClusterWithRetry(ctx context.Context, projectID string, maxAttempts int) (string, error) {
+	var lastErr error
+	for attempt := range maxAttempts {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return "", ctx.Err()
+			case <-time.After(time.Duration(attempt) * clusterLookupBackoff):
+			}
+		}
+		cluster, err := c.fetchProjectCluster(ctx, projectID)
+		if err == nil {
+			return cluster, nil
+		}
+		lastErr = err
+		c.logger.Warn("v1 project detail request failed, retrying",
+			slog.String("project_id", projectID),
+			slog.Int("attempt", attempt+1),
+			slog.Int("max_attempts", maxAttempts),
+			slog.String("error", err.Error()),
+		)
+	}
+	return "", lastErr
 }
 
 // fetchProjectCluster returns the Kubernetes cluster name for a project
@@ -1464,6 +1517,31 @@ func exploitMaturity(levels []maturityLevel) string {
 		out = append(out, value)
 	}
 	return strings.Join(out, ", ")
+}
+
+// latestResolvedAt returns the most recent last_resolved_at across the
+// issue's coordinates, the moment Snyk last saw this issue resolved. Snyk
+// keeps last_resolved_at on a coordinate after the issue reopens, which is
+// how an issue ID reused for a new occurrence shows its earlier resolution.
+// invalid reports that some coordinate carried a value that did not parse:
+// the resolution history is then unknown and callers must not read the
+// zero time as "never resolved".
+func latestResolvedAt(coords []coordinate) (latest time.Time, invalid bool) {
+	for _, coord := range coords {
+		raw := strings.TrimSpace(coord.LastResolvedAt)
+		if raw == "" {
+			continue
+		}
+		t, err := time.Parse(time.RFC3339, raw)
+		if err != nil {
+			invalid = true
+			continue
+		}
+		if t.After(latest) {
+			latest = t
+		}
+	}
+	return latest, invalid
 }
 
 func coordinateResolved(coords []coordinate) bool {

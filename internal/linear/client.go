@@ -53,6 +53,9 @@ type linearIssueNode struct {
 	Priority    int     `json:"priority"`
 	DueDate     *string `json:"dueDate"`
 	ArchivedAt  *string `json:"archivedAt"`
+	CreatedAt   *string `json:"createdAt"`
+	CompletedAt *string `json:"completedAt"`
+	CanceledAt  *string `json:"canceledAt"`
 	State       struct {
 		ID   string `json:"id"`
 		Name string `json:"name"`
@@ -129,6 +132,9 @@ query issueByIdentifier($filter: IssueFilter!) {
       priority
       dueDate
       archivedAt
+      createdAt
+      completedAt
+      canceledAt
       state {
         id
         name
@@ -202,11 +208,12 @@ func linearIssueToModel(issue linearIssueNode) model.ExistingIssue {
 			GroupID: groupID,
 		})
 	}
-	var archivedAt *time.Time
-	if issue.ArchivedAt != nil && *issue.ArchivedAt != "" {
-		if t, err := time.Parse(time.RFC3339, *issue.ArchivedAt); err == nil {
-			archivedAt = &t
-		}
+	// A ticket moved Done -> Cancelled (or back and forth) can carry both
+	// timestamps; the later one is when it entered its current terminal
+	// state. Linear clears them when a ticket is reopened.
+	closedAt := parseLinearTime(issue.CompletedAt)
+	if canceledAt := parseLinearTime(issue.CanceledAt); canceledAt != nil && (closedAt == nil || canceledAt.After(*closedAt)) {
+		closedAt = canceledAt
 	}
 	return model.ExistingIssue{
 		ID:            issue.ID,
@@ -221,8 +228,25 @@ func linearIssueToModel(issue linearIssueNode) model.ExistingIssue {
 		Fingerprint:   extractFingerprint(description),
 		ManagedLabels: extractManagedLabels(description),
 		Labels:        labels,
-		ArchivedAt:    archivedAt,
+		ArchivedAt:    parseLinearTime(issue.ArchivedAt),
+		CreatedAt:     parseLinearTime(issue.CreatedAt),
+		ClosedAt:      closedAt,
+		Identity:      extractIdentity(description),
+		ClosedReason:  extractClosedReason(description),
 	}
+}
+
+// parseLinearTime parses an optional Linear DateTime. A missing or
+// unparsable value yields nil, which every caller treats as "unknown".
+func parseLinearTime(value *string) *time.Time {
+	if value == nil || *value == "" {
+		return nil
+	}
+	t, err := time.Parse(time.RFC3339, *value)
+	if err != nil {
+		return nil
+	}
+	return &t
 }
 
 func (c *Client) StateID(state model.IssueState) (string, error) {
@@ -657,6 +681,9 @@ query existingIssues($filter: IssueFilter!, $after: String) {
       priority
       dueDate
       archivedAt
+      createdAt
+      completedAt
+      canceledAt
       state {
         id
         name
@@ -868,6 +895,37 @@ func extractFingerprint(description string) string {
 		}
 		if after, ok := strings.CutPrefix(trimmed, "Fingerprint:"); ok {
 			return model.CanonicalFingerprint(strings.TrimSpace(after))
+		}
+	}
+	return ""
+}
+
+// extractIdentity returns the project-independent finding identity from the
+// metadata block, or "" when the ticket predates the identity line. The
+// value is lowercase hex, which Linear's markdown normalization leaves
+// alone, but it is canonicalized the same way as the fingerprint (escapes
+// stripped) so a future rewrite cannot silently break rebinding.
+func extractIdentity(description string) string {
+	return metadataValue(description, "identity:")
+}
+
+// extractClosedReason returns the closed_reason the sync recorded in the
+// metadata block when it cancelled the ticket because its Snyk project
+// disappeared, or "".
+func extractClosedReason(description string) string {
+	return metadataValue(description, "closed_reason:")
+}
+
+// metadataValue returns the canonicalized, lowercased value of the first
+// metadata block line starting with prefix, or "". Linear may escape
+// punctuation such as '-' and '_' (closed_reason: project\-missing), so the
+// value goes through the same canonicalization as the fingerprint.
+func metadataValue(description, prefix string) string {
+	for line := range metadataBlockLines(description) {
+		// Linear can also escape the underscore in the key itself.
+		trimmed := model.CanonicalFingerprint(strings.TrimSpace(line))
+		if after, ok := strings.CutPrefix(trimmed, prefix); ok {
+			return strings.ToLower(strings.TrimSpace(after))
 		}
 	}
 	return ""
@@ -1421,7 +1479,10 @@ func buildChangeComment(update model.IssueUpdate) string {
 		return ""
 	}
 	d := update.Diff
-	if !d.TitleChanged && !d.DescriptionChanged && !d.DueDateChanged &&
+	// A change confined to the hidden metadata block (e.g. the one-time
+	// identity backfill) is still written, but nobody needs a comment on it.
+	descriptionChanged := d.DescriptionChanged && !d.MetadataOnlyDescriptionChange
+	if !d.TitleChanged && !descriptionChanged && !d.DueDateChanged &&
 		!d.StateChanged && !d.PriorityChanged && len(d.LabelsAdded) == 0 && len(d.LabelsRemoved) == 0 {
 		return ""
 	}
@@ -1455,7 +1516,7 @@ func buildChangeComment(update model.IssueUpdate) string {
 		}
 	}
 
-	if d.DescriptionChanged {
+	if descriptionChanged {
 		lines = append(lines, "- Description updated — Snyk finding data changed")
 	}
 

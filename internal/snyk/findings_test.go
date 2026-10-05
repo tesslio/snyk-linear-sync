@@ -1369,3 +1369,74 @@ func TestLocationKeyDeterministicAcrossCoordinateOrder(t *testing.T) {
 		t.Fatalf("locationKey() = %q, want lexicographically smallest %q", gotForward, "src/a.py")
 	}
 }
+
+func TestLatestResolvedAt(t *testing.T) {
+	latest, invalid := latestResolvedAt(nil)
+	if !latest.IsZero() || invalid {
+		t.Fatalf("no coordinates: got %v invalid=%v", latest, invalid)
+	}
+
+	latest, invalid = latestResolvedAt([]coordinate{
+		{LastResolvedAt: "2026-03-01T00:00:00Z"},
+		{LastResolvedAt: ""},
+		{LastResolvedAt: "2026-05-01T12:00:00Z"},
+	})
+	if invalid || !latest.Equal(time.Date(2026, time.May, 1, 12, 0, 0, 0, time.UTC)) {
+		t.Fatalf("got %v invalid=%v, want the most recent resolution", latest, invalid)
+	}
+
+	_, invalid = latestResolvedAt([]coordinate{{LastResolvedAt: "2026-03-01T00:00:00Z"}, {LastResolvedAt: "yesterday"}})
+	if !invalid {
+		t.Fatalf("an unparsable last_resolved_at must be reported, not read as never resolved")
+	}
+}
+
+func TestFetchProjectClusterWithRetry(t *testing.T) {
+	previous := clusterLookupBackoff
+	clusterLookupBackoff = time.Millisecond
+	defer func() { clusterLookupBackoff = previous }()
+
+	for _, tc := range []struct {
+		name         string
+		failures     int
+		wantErr      bool
+		wantRequests int
+	}{
+		{name: "recovers after a transient 500", failures: 1, wantRequests: 2},
+		{name: "fails after every attempt", failures: 10, wantErr: true, wantRequests: clusterLookupAttempts},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			requests := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests++
+				if requests <= tc.failures {
+					w.WriteHeader(http.StatusInternalServerError)
+					return
+				}
+				_, _ = w.Write([]byte(`{"imageCluster":"prod"}`))
+			}))
+			defer server.Close()
+			base, err := url.Parse(server.URL + "/")
+			if err != nil {
+				t.Fatalf("parse server URL: %v", err)
+			}
+			c := &Client{
+				httpClient: server.Client(),
+				v1Base:     base,
+				orgID:      "test-org",
+				logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+			}
+
+			cluster, err := c.fetchProjectClusterWithRetry(context.Background(), "test-project", clusterLookupAttempts)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("err = %v, wantErr %v", err, tc.wantErr)
+			}
+			if !tc.wantErr && cluster != "prod" {
+				t.Fatalf("cluster = %q, want prod", cluster)
+			}
+			if requests != tc.wantRequests {
+				t.Fatalf("requests = %d, want %d", requests, tc.wantRequests)
+			}
+		})
+	}
+}

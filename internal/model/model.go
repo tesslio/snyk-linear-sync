@@ -1,6 +1,8 @@
 package model
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"regexp"
 	"slices"
@@ -40,26 +42,43 @@ type Finding struct {
 	// workload, populated only for projects with origin "kubernetes".
 	// Parsed from the project name, which the Snyk Kubernetes integration
 	// builds as "<namespace>/<kind>.<group>/<workload>:<target>".
-	ProjectNamespace   string
-	IssueTitle         string
-	Severity           string
-	CVSS               float64
-	ExploitMaturity    string
-	PackageName        string
-	VulnerableVersion  string
-	FixedVersion       string
-	IssueURL           string
-	IssueAPIURL        string
-	Status             FindingStatus
-	IntroducedThrough  string
-	SourceFile         string
-	SourceCommitID     string
-	SourceLineStart    int
-	SourceColumnStart  int
-	SourceLineEnd      int
-	SourceColumnEnd    int
-	IgnoreExpiresAt    time.Time
-	DisregardIfFixable bool
+	ProjectNamespace string
+	// ProjectClusterUnknown is set when the project has origin "kubernetes"
+	// but the cluster lookup failed this run, so ProjectCluster is empty for
+	// lack of data rather than because Snyk reports no cluster. Such a
+	// finding has no identity for the run (see FindingIdentity).
+	ProjectClusterUnknown bool
+	IssueTitle            string
+	Severity              string
+	CVSS                  float64
+	ExploitMaturity       string
+	PackageName           string
+	VulnerableVersion     string
+	FixedVersion          string
+	IssueURL              string
+	IssueAPIURL           string
+	Status                FindingStatus
+	IntroducedThrough     string
+	SourceFile            string
+	SourceCommitID        string
+	SourceLineStart       int
+	SourceColumnStart     int
+	SourceLineEnd         int
+	SourceColumnEnd       int
+	IgnoreExpiresAt       time.Time
+	DisregardIfFixable    bool
+
+	// LastResolvedAt is the most recent last_resolved_at Snyk reports across
+	// the issue's coordinates: when Snyk last saw this issue resolved. Zero
+	// means Snyk reports no resolution at all. LastResolvedAtInvalid is set
+	// when a coordinate carried a non-empty value that could not be parsed;
+	// callers must then treat the resolution history as unknown rather than
+	// as "never resolved". The reopen guard in the sync uses both to tell a
+	// ticket closed while the finding stayed continuously open (safe to
+	// reopen) from one whose occurrence Snyk resolved before the issue ID
+	// was reused (must get a fresh ticket).
+	LastResolvedAt        time.Time
+	LastResolvedAtInvalid bool
 
 	// Issue detail fields surfaced from the Snyk REST issue resource so
 	// consumers of the Linear ticket do not each need Snyk API credentials.
@@ -88,6 +107,9 @@ type SnykSnapshot struct {
 	Findings           []Finding
 	ProjectIDs         map[string]struct{}
 	InactiveProjectIDs map[string]struct{}
+	// ClusterLookupFailures counts Kubernetes projects whose cluster lookup
+	// failed this run (their findings carry ProjectClusterUnknown).
+	ClusterLookupFailures int
 }
 
 type IssueLabel struct {
@@ -128,7 +150,33 @@ type ExistingIssue struct {
 	// archived within a recent window so the reopen guard can still see
 	// recently-closed tickets. An archived ticket is always terminal.
 	ArchivedAt *time.Time
+	// CreatedAt is when the Linear issue was created, or nil if Linear did
+	// not report it.
+	CreatedAt *time.Time
+	// ClosedAt is when the Linear issue entered its current terminal state
+	// (Linear's completedAt or canceledAt), or nil when it is open or Linear
+	// did not report it. Only meaningful for terminal tickets.
+	ClosedAt *time.Time
+	// Identity is the project-independent finding identity recorded in the
+	// metadata block (see FindingIdentity), or "" for tickets written before
+	// the identity line existed. It lets the sync re-find a ticket after
+	// Snyk recreates its project under a new project ID.
+	Identity string
+	// ClosedReason is the machine-readable reason the sync recorded in the
+	// metadata block when it cancelled the ticket because its Snyk project
+	// disappeared (ClosedReasonProjectMissing / ClosedReasonProjectDeactivated),
+	// or "" when the sync did not close it for that reason.
+	ClosedReason string
 }
+
+// Closed reasons the sync records in the metadata block when it cancels a
+// ticket only because its Snyk project stopped reporting. They mark the
+// closure as machine-made (not a fix and not a human decision), which is
+// what makes the ticket safe to rebind when Snyk recreates the project.
+const (
+	ClosedReasonProjectMissing     = "project-missing"
+	ClosedReasonProjectDeactivated = "project-deactivated"
+)
 
 type DesiredIssue struct {
 	Fingerprint   string
@@ -156,6 +204,13 @@ type DesiredIssue struct {
 	// genuine re-detections — which would otherwise churn the due date
 	// every run once the fallback triggers.
 	DueDateUsedUpdatedAtFallback bool
+	// Reopen marks a deliberate reuse of a terminal (Done/Cancelled) ticket
+	// for a finding Snyk reports as open: a ticket the sync itself cancelled
+	// because its project vanished (rebind after project recreation), or one
+	// closed while Snyk kept reporting the same occurrence as continuously
+	// open. Only the sync's match loop sets it, after its own safety checks;
+	// ComputeDiff otherwise refuses any terminal-to-open state change.
+	Reopen bool
 }
 
 // IssueDiff captures which managed fields changed between the existing and
@@ -166,18 +221,23 @@ type IssueDiff struct {
 	TitleFrom          string
 	TitleTo            string
 	DescriptionChanged bool
-	DueDateChanged     bool
-	DueDateFrom        string
-	DueDateTo          string
-	StateChanged       bool
-	StateFrom          string
-	StateTo            string
-	PriorityChanged    bool
-	PriorityFrom       int
-	PriorityTo         int
-	LabelsAdded        []string
-	LabelsRemoved      []string
-	LabelsNeedUpdate   bool
+	// MetadataOnlyDescriptionChange is set with DescriptionChanged when the
+	// descriptions differ only inside the hidden metadata block (e.g. a newly
+	// added identity line). The update still happens, but there is nothing
+	// a human would want a change comment about.
+	MetadataOnlyDescriptionChange bool
+	DueDateChanged                bool
+	DueDateFrom                   string
+	DueDateTo                     string
+	StateChanged                  bool
+	StateFrom                     string
+	StateTo                       string
+	PriorityChanged               bool
+	PriorityFrom                  int
+	PriorityTo                    int
+	LabelsAdded                   []string
+	LabelsRemoved                 []string
+	LabelsNeedUpdate              bool
 }
 
 func (d *IssueDiff) HasChanges() bool {
@@ -249,6 +309,76 @@ func Fingerprint(projectID, issueID, locationKey string) string {
 		return fmt.Sprintf("snyk:%s:%s", projectID, issueID)
 	}
 	return CanonicalFingerprint(fmt.Sprintf("snyk:%s:%s:%s", projectID, issueID, locationKey))
+}
+
+// FingerprintLocation returns the location segment of a fingerprint (the
+// part after snyk:<projectID>:<issueID>:), or "" for a coarse fingerprint.
+func FingerprintLocation(fingerprint string) string {
+	rest, ok := strings.CutPrefix(fingerprint, "snyk:")
+	if !ok {
+		return ""
+	}
+	_, rest, ok = strings.Cut(rest, ":")
+	if !ok {
+		return ""
+	}
+	_, location, _ := strings.Cut(rest, ":")
+	return location
+}
+
+// identityLength is how many hex characters of the SHA-256 digest are kept
+// for a finding identity: 128 bits, far beyond any collision risk at the
+// scale of one Snyk org, while keeping the metadata line short.
+const identityLength = 32
+
+// FindingIdentity returns a project-independent identity for a finding,
+// derived only from Snyk data: the project's origin, name, target file,
+// target reference, repository and Kubernetes cluster, the issue key, and
+// the fingerprint's location segment.
+//
+// Snyk sometimes recreates a project (same name, same target) under a new
+// project ID, which also mints new issue IDs, so every fingerprint changes
+// even though the findings are the same. The identity deliberately leaves
+// both IDs out so it survives that recreation; the sync uses it to rebind
+// the old project's tickets instead of cancelling them and creating copies.
+// The issue key is Snyk's coalesced key (attributes.key, else the first
+// problem ID, else the issue ID); only in the last case does the identity
+// change on recreation, which merely falls back to today's behavior.
+//
+// The cluster matters because Snyk names Kubernetes projects
+// "<namespace>/<kind>.<group>/<workload>:<target>" with no cluster in the
+// name: the same workload in staging and prod would otherwise share an
+// identity, so a recreation could swap tickets between clusters and a
+// deleted staging project's cancelled tickets could be rebound to prod
+// findings.
+//
+// It returns "" when the project name or issue key is missing, since the
+// remaining fields are too generic to identify a finding across projects,
+// and when the cluster lookup failed (ProjectClusterUnknown): an identity
+// computed without the cluster would differ from the real one and could
+// never be matched correctly, so no identity is better than a wrong one.
+func FindingIdentity(finding Finding) string {
+	name := strings.TrimSpace(finding.ProjectName)
+	key := strings.TrimSpace(finding.SnykIssueKey)
+	if name == "" || key == "" || finding.ProjectClusterUnknown {
+		return ""
+	}
+	h := sha256.New()
+	for _, part := range []string{
+		"v1",
+		strings.ToLower(strings.TrimSpace(finding.ProjectOrigin)),
+		name,
+		strings.TrimSpace(finding.ProjectTargetFile),
+		strings.TrimSpace(finding.ProjectReference),
+		strings.TrimSpace(finding.Repository),
+		strings.TrimSpace(finding.ProjectCluster),
+		key,
+		FingerprintLocation(finding.Fingerprint),
+	} {
+		_, _ = h.Write([]byte(part))
+		_, _ = h.Write([]byte{0})
+	}
+	return hex.EncodeToString(h.Sum(nil))[:identityLength]
 }
 
 // fingerprintEscapePattern matches the backslash escapes Linear's markdown
