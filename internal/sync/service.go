@@ -38,6 +38,12 @@ type LinearClient interface {
 	// A non-nil error means no per-alias data is available and every update
 	// must be retried individually.
 	PostComments(ctx context.Context, updates []model.IssueUpdate) ([]int, error)
+	// LastOpenStates reads the Linear history of the given closed issues and
+	// returns, per issue ID, the open workflow state each was in before it
+	// was closed. Issues whose history yields none are absent. The error
+	// reports issues whose history could not be read; the map still holds
+	// every issue that was read.
+	LastOpenStates(ctx context.Context, issueIDs []string) (map[string]model.WorkflowState, error)
 }
 
 type CacheStore interface {
@@ -435,6 +441,10 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 		}
 	}
 
+	if reopened > 0 {
+		s.restoreReopenedStates(ctx, desiredByFingerprint, matchedExisting)
+	}
+
 	currentLinearHashes := make(map[string]string, len(matchedExisting))
 	for fingerprint, issue := range matchedExisting {
 		currentLinearHashes[fingerprint] = existingIssueHash(issue)
@@ -553,9 +563,16 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 			// it already records rather than claiming the closure, so it never
 			// becomes eligible for a rebind.
 			closedReason := existing.ClosedReason
-			if isNonTerminalLinearState(existing, s.cfg.Linear.States) {
+			alreadyClosed := isTerminalLinearState(existing, s.cfg.Linear.States)
+			if !alreadyClosed {
 				closedReason = projectClosedReason(existing.Fingerprint, snykSnapshot.ProjectIDs, snykSnapshot.InactiveProjectIDs)
 			}
+			// For the same reason it keeps its closed state. A project going
+			// away says nothing about how the ticket was closed, and moving a
+			// Done ticket to Cancelled would erase the record that the
+			// finding was fixed. A ticket closed in a live project still moves
+			// to Done once its finding is gone, as before.
+			preserveClosedState := alreadyClosed && desiredState == model.StateCancelled
 			resolved := model.DesiredIssue{
 				Fingerprint: existing.Fingerprint,
 				Title:       existing.Title,
@@ -567,6 +584,7 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 				}),
 				DueDate:       existing.DueDate,
 				State:         desiredState,
+				PreserveState: preserveClosedState,
 				StateReason:   stateReason,
 				ManagedLabels: existing.ManagedLabels,
 				Priority:      existing.Priority,
@@ -1485,6 +1503,9 @@ func ComputeDiff(existing model.ExistingIssue, desired model.DesiredIssue, state
 	if !desired.PreserveState {
 		existingNorm := model.NormalizeWorkflowStateName(existing.StateName)
 		desiredNorm := model.NormalizeWorkflowStateName(model.StateName(desired.State))
+		if desired.RestoreState.ID != "" {
+			desiredNorm = model.NormalizeWorkflowStateName(desired.RestoreState.Name)
+		}
 		if existingNorm != desiredNorm {
 			// Defense in depth: never report a terminal→non-terminal state
 			// change as an update. The match-layer reopen guard should
@@ -1501,6 +1522,9 @@ func ComputeDiff(existing model.ExistingIssue, desired model.DesiredIssue, state
 				d.StateChanged = true
 				d.StateFrom = existing.StateName
 				d.StateTo = desiredNorm
+				if desired.RestoreState.ID != "" {
+					d.StateTo = desired.RestoreState.Name
+				}
 			}
 		}
 	}
@@ -1813,6 +1837,49 @@ func reopenCandidate(terminal []model.ExistingIssue, finding model.Finding, exis
 	}
 	*existing = newest
 	return true
+}
+
+// restoreReopenedStates points every deliberate reopen at the open workflow
+// state its ticket was in before it was closed, instead of the configured
+// open state. A sync-cancelled ticket had usually been triaged already (moved
+// to Todo, or into progress) before Snyk deactivated or recreated its
+// project, and sending it back to Triage throws that triage away. The state
+// comes from the ticket's Linear history; when it cannot be read the reopen
+// still happens, into the configured open state as before.
+func (s *Service) restoreReopenedStates(ctx context.Context, desiredByFingerprint map[string]model.DesiredIssue, matchedExisting map[string]model.ExistingIssue) {
+	var issueIDs []string
+	for fingerprint, desired := range desiredByFingerprint {
+		if desired.Reopen {
+			issueIDs = append(issueIDs, matchedExisting[fingerprint].ID)
+		}
+	}
+	slices.Sort(issueIDs)
+
+	states, err := s.linear.LastOpenStates(ctx, issueIDs)
+	if err != nil {
+		s.logger.Warn("could not read Linear history for some reopened tickets; reopening them in the configured open state",
+			slog.Int("reopened", len(issueIDs)),
+			slog.Int("states_found", len(states)),
+			slog.Any("error", err),
+		)
+	}
+	for fingerprint, desired := range desiredByFingerprint {
+		if !desired.Reopen {
+			continue
+		}
+		existing := matchedExisting[fingerprint]
+		state, ok := states[existing.ID]
+		if !ok {
+			continue
+		}
+		desired.RestoreState = state
+		desired.StateReason += "; back in the state it was in before it was closed"
+		desiredByFingerprint[fingerprint] = desired
+		s.logger.Info("restoring reopened ticket to its state before it was closed",
+			slog.String("existing", existing.Identifier),
+			slog.String("state", state.Name),
+		)
+	}
 }
 
 // FingerprintProjectID extracts the project ID portion of a Snyk fingerprint.

@@ -2,10 +2,12 @@ package linear
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"iter"
 	"log/slog"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -29,10 +31,14 @@ type Client struct {
 	gql *gqlclient.Client
 	log *slog.Logger
 
-	mu              sync.RWMutex
-	resolvedTeam    string
-	statesByName    map[string]string
-	statesByType    map[string]string
+	mu           sync.RWMutex
+	resolvedTeam string
+	statesByName map[string]string
+	statesByType map[string]string
+	// statesByID maps each of the team's workflow state IDs to its name and
+	// type ("triage", "backlog", "unstarted", "started", "completed",
+	// "canceled"), for reading state IDs out of issue history.
+	statesByID      map[string]workflowState
 	managedLabelIDs map[string]string
 	// managedLabelGroupIDs maps a normalized managed-label name to the ID of its
 	// Linear exclusive group (or "" when ungrouped), so desiredLabelIDs can drop
@@ -409,6 +415,9 @@ func (c *Client) UpdateIssues(ctx context.Context, updates []model.IssueUpdate) 
 		if err != nil {
 			return err
 		}
+		if update.Desired.RestoreState.ID != "" {
+			stateID = update.Desired.RestoreState.ID
+		}
 
 		title := update.Desired.Title
 		description := update.Desired.Description
@@ -519,6 +528,7 @@ func (c *Client) loadStates(ctx context.Context) error {
 	var after *string
 	states := map[string]string{}
 	stateTypes := map[string]string{}
+	statesByID := map[string]workflowState{}
 
 	for {
 		op := gqlclient.NewOperation(`
@@ -561,6 +571,7 @@ query teamStates($id: String!, $after: String) {
 
 		for _, state := range resp.Team.States.Nodes {
 			states[strings.ToLower(state.Name)] = state.ID
+			statesByID[state.ID] = workflowState{name: state.Name, stateType: state.Type}
 			if _, exists := stateTypes[state.Type]; !exists {
 				stateTypes[state.Type] = state.ID
 			}
@@ -575,8 +586,168 @@ query teamStates($id: String!, $after: String) {
 	c.mu.Lock()
 	c.statesByName = states
 	c.statesByType = stateTypes
+	c.statesByID = statesByID
 	c.mu.Unlock()
 	return nil
+}
+
+// workflowState is one of the team's workflow states, as the client caches
+// it for reading state IDs out of issue history.
+type workflowState struct {
+	name      string
+	stateType string
+}
+
+// open reports whether the state is one a ticket is worked in, as opposed to
+// a closed (completed or canceled) one.
+func (s workflowState) open() bool {
+	return s.stateType != "completed" && s.stateType != "canceled"
+}
+
+// maxHistoryPages bounds how many pages of one issue's history LastOpenStates
+// reads. A synced ticket gains history on every update, but nowhere near
+// this many entries.
+const maxHistoryPages = 20
+
+// stateTransition is one workflow state change in an issue's history.
+type stateTransition struct {
+	at          time.Time
+	fromStateID string
+	toStateID   string
+}
+
+// LastOpenStates reads the history of each issue and returns, per issue ID,
+// the open workflow state the issue was last in before it was closed (see
+// lastOpenState). Issues whose history yields none are absent. Issues whose
+// history cannot be read are reported in the returned error and left out;
+// the rest are still returned.
+func (c *Client) LastOpenStates(ctx context.Context, issueIDs []string) (map[string]model.WorkflowState, error) {
+	if len(issueIDs) == 0 {
+		return nil, nil
+	}
+	if err := c.resolveTeam(ctx); err != nil {
+		return nil, err
+	}
+	if err := c.ensureStatesLoaded(ctx); err != nil {
+		return nil, err
+	}
+
+	out := make(map[string]model.WorkflowState, len(issueIDs))
+	var errs []error
+	for _, issueID := range issueIDs {
+		transitions, err := c.fetchStateTransitions(ctx, issueID)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("read history of Linear issue %s: %w", issueID, err))
+			if ctx.Err() != nil {
+				break
+			}
+			continue
+		}
+		if state, ok := c.lastOpenState(transitions); ok {
+			out[issueID] = state
+		}
+	}
+	return out, errors.Join(errs...)
+}
+
+// fetchStateTransitions returns every workflow state change in the issue's
+// history, in the order Linear returns them.
+func (c *Client) fetchStateTransitions(ctx context.Context, issueID string) ([]stateTransition, error) {
+	var (
+		after       *string
+		transitions []stateTransition
+	)
+	for range maxHistoryPages {
+		op := gqlclient.NewOperation(`
+query issueStateHistory($id: String!, $after: String) {
+  issue(id: $id) {
+    history(first: 100, after: $after) {
+      nodes {
+        createdAt
+        fromStateId
+        toStateId
+      }
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
+    }
+  }
+}`)
+		op.Var("id", issueID)
+		op.Var("after", after)
+
+		var resp struct {
+			Issue struct {
+				History struct {
+					Nodes []struct {
+						CreatedAt   string  `json:"createdAt"`
+						FromStateID *string `json:"fromStateId"`
+						ToStateID   *string `json:"toStateId"`
+					} `json:"nodes"`
+					PageInfo struct {
+						HasNextPage bool    `json:"hasNextPage"`
+						EndCursor   *string `json:"endCursor"`
+					} `json:"pageInfo"`
+				} `json:"history"`
+			} `json:"issue"`
+		}
+		if err := c.execute(ctx, op, &resp); err != nil {
+			return nil, fmt.Errorf("fetch Linear issue history: %w", err)
+		}
+
+		for _, node := range resp.Issue.History.Nodes {
+			toStateID := deref(node.ToStateID)
+			if toStateID == "" {
+				// Not a state change.
+				continue
+			}
+			at, err := time.Parse(time.RFC3339, node.CreatedAt)
+			if err != nil {
+				return nil, fmt.Errorf("parse Linear issue history time %q: %w", node.CreatedAt, err)
+			}
+			transitions = append(transitions, stateTransition{
+				at:          at,
+				fromStateID: deref(node.FromStateID),
+				toStateID:   toStateID,
+			})
+		}
+
+		page := resp.Issue.History.PageInfo
+		if !page.HasNextPage || page.EndCursor == nil {
+			return transitions, nil
+		}
+		after = page.EndCursor
+	}
+	return nil, fmt.Errorf("issue history is longer than %d pages", maxHistoryPages)
+}
+
+// lastOpenState returns the latest open workflow state the transitions show
+// the issue in: the target of a transition into an open state, or the origin
+// of a transition into a closed one. Linear does not record the state an
+// issue was created in, but the first transition out of it does. States that
+// are not the team's current states (the issue came from another team, or
+// the state was archived since) are skipped, because an update cannot move
+// the issue there.
+func (c *Client) lastOpenState(transitions []stateTransition) (model.WorkflowState, bool) {
+	slices.SortStableFunc(transitions, func(a, b stateTransition) int {
+		return a.at.Compare(b.at)
+	})
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	last := ""
+	for _, t := range transitions {
+		if state, ok := c.statesByID[t.toStateID]; ok && state.open() {
+			last = t.toStateID
+		} else if state, ok := c.statesByID[t.fromStateID]; ok && state.open() {
+			last = t.fromStateID
+		}
+	}
+	if last == "" {
+		return model.WorkflowState{}, false
+	}
+	return model.WorkflowState{ID: last, Name: c.statesByID[last].name}, true
 }
 
 func (c *Client) loadIssues(ctx context.Context) ([]model.ExistingIssue, error) {

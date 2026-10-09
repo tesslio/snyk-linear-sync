@@ -365,7 +365,7 @@ These distinctions are intentional:
 - Issues ignored "until fix is available" are placed in `Backlog` with no due date because the team cannot act on them until an upstream fix ships. The `triage-dependency` label (configurable via `LINEAR_AWAITING_FIX_LABEL`) makes them filterable. When a fix becomes available, Snyk flips `ignored=false` and the next run moves the issue to `Todo` with a due date.
 - Temporarily ignored issues (those with a scheduled expiry) are kept open in `Todo` rather than cancelled, because they require attention once the ignore expires. This applies only while the finding still exists in Snyk: a finding Snyk reports as resolved is treated as `Done` regardless of any ignore (active, expired, or "until fix available") still attached to it, so a vulnerability that no longer exists never lingers as an open or overdue ticket.
 - If a Snyk issue disappears but the project still exists and is active, the tool treats that as the issue being resolved and moves the Linear ticket to `Done`.
-- If the Snyk project itself is gone or has been de-activated (inactive), the tool treats the managed Linear ticket as no longer actionable and moves it to `Cancelled`.
+- If the Snyk project itself is gone or has been de-activated (inactive), the tool treats the managed Linear ticket as no longer actionable and moves it to `Cancelled`. A ticket that was already closed keeps its state: a `Done` ticket stays `Done`, because the project going away says nothing about how the finding was closed.
 
 ### Reopen Guard
 
@@ -373,6 +373,8 @@ A closed (`Done`/`Cancelled`) ticket is normally never reopened when Snyk report
 
 - **Closed while still open in Snyk.** When the fingerprint matches exactly and includes a location, the ticket has recorded creation and closed times in Linear, and Snyk's `last_resolved_at` shows no resolution since the ticket was created (empty, or earlier than the ticket's creation), the finding has been open for the ticket's whole life. The closure was premature (for example an automation marked it `Done`), so the sync reopens the ticket (when earlier runs already left several closed copies with that fingerprint, the check runs against the most recently created one, which then becomes the canonical ticket; older copies are left untouched) instead of minting a duplicate with the same fingerprint. An issue ID reused for a new occurrence always shows a later `last_resolved_at`, because Snyk resolved the old occurrence first, so this cannot reopen the tickets the guard exists to protect. An unparsable `last_resolved_at`, a coarse fingerprint, an archived ticket, or a missing Linear timestamp keeps the default behavior.
 - **Project recreation.** See below.
+
+A reopened ticket goes back to the open state it was in before it was closed (for example `Todo` or `In Progress` after triage), read from its Linear history, rather than the configured open state; the change comment names the state. When the history has no usable open state (it was in another team's state, or that state has been archived) or cannot be read, the ticket reopens in the configured open state.
 
 ### Project Recreation
 
