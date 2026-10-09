@@ -2,6 +2,7 @@ package sync
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"slices"
@@ -44,6 +45,12 @@ type fakeLinear struct {
 	// above but for PostComments.
 	commentCallBatches      [][]model.IssueUpdate
 	commentFailFingerprints map[string]int
+
+	// lastOpenStates / lastOpenStatesErr are what LastOpenStates returns;
+	// lastOpenStatesCalls records the issue IDs of each call.
+	lastOpenStates      map[string]model.WorkflowState
+	lastOpenStatesErr   error
+	lastOpenStatesCalls [][]string
 }
 
 type fakeCache struct {
@@ -89,6 +96,17 @@ func (f *fakeLinear) PostComments(_ context.Context, updates []model.IssueUpdate
 		f.comments = append(f.comments, u)
 	}
 	return failed, nil
+}
+
+func (f *fakeLinear) LastOpenStates(_ context.Context, issueIDs []string) (map[string]model.WorkflowState, error) {
+	f.lastOpenStatesCalls = append(f.lastOpenStatesCalls, append([]string(nil), issueIDs...))
+	out := map[string]model.WorkflowState{}
+	for _, id := range issueIDs {
+		if state, ok := f.lastOpenStates[id]; ok {
+			out[id] = state
+		}
+	}
+	return out, f.lastOpenStatesErr
 }
 
 func (f *fakeCache) Load(context.Context) (cache.Snapshot, error) {
@@ -5572,5 +5590,189 @@ func TestRunClusterLookupFailureDeferralIsCappedAt24Hours(t *testing.T) {
 				t.Fatalf("rebound=%d updates=%d, want 0/0 (candidate left alone)", result.Rebound, len(linear.updates))
 			}
 		})
+	}
+}
+
+func TestRunResolveLoopKeepsClosedTicketStateWhenProjectGoes(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		inactive bool
+	}{
+		{name: "project deactivated", inactive: true},
+		{name: "project deleted"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := minimalCfg()
+			open := storedIssue("open", "SNYK-1", "Todo", desiredIssue(cfg, recreatedProjectFinding("project-gone", "issue-1")))
+			// Fixed before Snyk deactivated or deleted its project.
+			fixed := storedIssue("fixed", "SNYK-2", "Done", desiredIssue(cfg, recreatedProjectFinding("project-gone", "issue-2")))
+			snapshot := model.SnykSnapshot{ProjectIDs: map[string]struct{}{"project-live": {}}}
+			if tc.inactive {
+				snapshot.InactiveProjectIDs = map[string]struct{}{"project-gone": {}}
+			}
+			linear := &fakeLinear{snapshot: []model.ExistingIssue{open, fixed}}
+
+			result, err := New(cfg, discardLogger(), fakeSnyk{snapshot: snapshot}, linear, nil).Run(context.Background())
+			if err != nil {
+				t.Fatalf("Run() error = %v", err)
+			}
+			if result.PlannedResolves != 1 || len(linear.updates) != 1 {
+				t.Fatalf("resolves=%d updates=%v, want only the open ticket cancelled", result.PlannedResolves, updatedIdentifiers(linear.updates))
+			}
+			if u := linear.updates[0]; u.Existing.ID != "open" || u.Desired.State != model.StateCancelled {
+				t.Fatalf("update = %s -> %q, want open -> cancelled", u.Existing.Identifier, u.Desired.State)
+			}
+		})
+	}
+}
+
+func TestRunResolveLoopStillMovesClosedTicketToDoneInLiveProject(t *testing.T) {
+	cfg := minimalCfg()
+	// Cancelled while the finding was ignored; the finding is now gone from
+	// a project that still exists, so it was fixed.
+	cancelled := storedIssue("cancelled", "SNYK-1", "Cancelled", desiredIssue(cfg, recreatedProjectFinding("project-live", "issue-1")))
+	linear := &fakeLinear{snapshot: []model.ExistingIssue{cancelled}}
+	snyk := fakeSnyk{snapshot: model.SnykSnapshot{ProjectIDs: map[string]struct{}{"project-live": {}}}}
+
+	if _, err := New(cfg, discardLogger(), snyk, linear, nil).Run(context.Background()); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if len(linear.updates) != 1 || linear.updates[0].Desired.State != model.StateDone || !linear.updates[0].Diff.StateChanged {
+		t.Fatalf("updates = %+v, want the ticket moved to done", linear.updates)
+	}
+}
+
+func TestRunReopenRestoresStateFromBeforeClosure(t *testing.T) {
+	created := time.Date(2026, time.August, 1, 0, 0, 0, 0, time.UTC)
+	closed := time.Date(2026, time.September, 1, 0, 0, 0, 0, time.UTC)
+	inProgress := model.WorkflowState{ID: "state-in-progress", Name: "In Progress"}
+
+	for _, tc := range []struct {
+		name  string
+		setup func(cfg config.Config) (model.ExistingIssue, model.SnykSnapshot)
+	}{
+		{
+			name: "closed while still open in Snyk",
+			setup: func(cfg config.Config) (model.ExistingIssue, model.SnykSnapshot) {
+				finding := recreatedProjectFinding("project-a", "issue-a")
+				existing := storedIssue("existing-1", "SNYK-100", "Cancelled", desiredIssue(cfg, finding))
+				existing.CreatedAt = &created
+				existing.ClosedAt = &closed
+				return existing, model.SnykSnapshot{
+					Findings:   []model.Finding{finding},
+					ProjectIDs: map[string]struct{}{"project-a": {}},
+				}
+			},
+		},
+		{
+			name: "rebind after project recreation",
+			setup: func(cfg config.Config) (model.ExistingIssue, model.SnykSnapshot) {
+				existing := storedIssue("existing-1", "SNYK-100", "Cancelled", desiredIssue(cfg, recreatedProjectFinding("project-old", "issue-old")))
+				existing = withClosedReason(existing, model.ClosedReasonProjectDeactivated)
+				return existing, model.SnykSnapshot{
+					Findings:           []model.Finding{recreatedProjectFinding("project-new", "issue-new")},
+					ProjectIDs:         map[string]struct{}{"project-new": {}},
+					InactiveProjectIDs: map[string]struct{}{"project-old": {}},
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := minimalCfg()
+			existing, snapshot := tc.setup(cfg)
+			linear := &fakeLinear{
+				snapshot:       []model.ExistingIssue{existing},
+				lastOpenStates: map[string]model.WorkflowState{"existing-1": inProgress},
+			}
+
+			result, err := New(cfg, discardLogger(), fakeSnyk{snapshot: snapshot}, linear, nil).Run(context.Background())
+			if err != nil {
+				t.Fatalf("Run() error = %v", err)
+			}
+			if result.Reopened+result.Rebound == 0 || len(linear.created) != 0 || len(linear.updates) != 1 {
+				t.Fatalf("reopened=%d rebound=%d created=%d updates=%d, want one reopen", result.Reopened, result.Rebound, len(linear.created), len(linear.updates))
+			}
+			if !slices.Equal(slices.Concat(linear.lastOpenStatesCalls...), []string{"existing-1"}) {
+				t.Fatalf("LastOpenStates calls = %v, want one for existing-1", linear.lastOpenStatesCalls)
+			}
+			u := linear.updates[0]
+			if !u.Desired.Reopen || u.Desired.RestoreState != inProgress {
+				t.Fatalf("reopen=%v restore=%+v, want reopen into %+v", u.Desired.Reopen, u.Desired.RestoreState, inProgress)
+			}
+			if !u.Diff.StateChanged || u.Diff.StateTo != "In Progress" {
+				t.Fatalf("diff = %+v, want a state change to In Progress", u.Diff)
+			}
+			if !strings.Contains(u.Desired.StateReason, "back in the state it was in before it was closed") {
+				t.Fatalf("StateReason = %q", u.Desired.StateReason)
+			}
+		})
+	}
+}
+
+func TestRunReopenFallsBackToConfiguredOpenStateWithoutHistory(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{name: "no open state in history"},
+		{name: "history unreadable", err: errors.New("boom")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := minimalCfg()
+			created := time.Date(2026, time.August, 1, 0, 0, 0, 0, time.UTC)
+			closed := time.Date(2026, time.September, 1, 0, 0, 0, 0, time.UTC)
+			finding := recreatedProjectFinding("project-a", "issue-a")
+			existing := storedIssue("existing-1", "SNYK-100", "Done", desiredIssue(cfg, finding))
+			existing.CreatedAt = &created
+			existing.ClosedAt = &closed
+			linear := &fakeLinear{snapshot: []model.ExistingIssue{existing}, lastOpenStatesErr: tc.err}
+			snyk := fakeSnyk{snapshot: model.SnykSnapshot{
+				Findings:   []model.Finding{finding},
+				ProjectIDs: map[string]struct{}{"project-a": {}},
+			}}
+
+			result, err := New(cfg, discardLogger(), snyk, linear, nil).Run(context.Background())
+			if err != nil {
+				t.Fatalf("Run() error = %v", err)
+			}
+			if result.Reopened != 1 || len(linear.updates) != 1 || result.FailedOps != 0 {
+				t.Fatalf("reopened=%d updates=%d failed=%d, want the reopen to go ahead", result.Reopened, len(linear.updates), result.FailedOps)
+			}
+			u := linear.updates[0]
+			if u.Desired.RestoreState != (model.WorkflowState{}) || u.Desired.State != model.StateTodo || u.Diff.StateTo != "todo" {
+				t.Fatalf("restore=%+v state=%q stateTo=%q, want the configured open state", u.Desired.RestoreState, u.Desired.State, u.Diff.StateTo)
+			}
+			if strings.Contains(u.Desired.StateReason, "before it was closed") {
+				t.Fatalf("StateReason = %q, must not claim a restore", u.Desired.StateReason)
+			}
+		})
+	}
+}
+
+func TestRunReadsHistoryOnlyForReopens(t *testing.T) {
+	cfg := minimalCfg()
+	finding := recreatedProjectFinding("project-a", "issue-a")
+	stale := desiredIssue(cfg, finding)
+	stale.Title = "stale title"
+	linear := &fakeLinear{snapshot: []model.ExistingIssue{storedIssue("existing-1", "SNYK-100", "Todo", stale)}}
+	snyk := fakeSnyk{snapshot: model.SnykSnapshot{
+		Findings:   []model.Finding{finding},
+		ProjectIDs: map[string]struct{}{"project-a": {}},
+	}}
+
+	if _, err := New(cfg, discardLogger(), snyk, linear, nil).Run(context.Background()); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if len(linear.updates) != 1 || len(linear.lastOpenStatesCalls) != 0 {
+		t.Fatalf("updates=%d history reads=%v, want an update and no history read", len(linear.updates), linear.lastOpenStatesCalls)
+	}
+}
+
+func TestComputeDiffReportsRestoredState(t *testing.T) {
+	states := config.StateConfig{Todo: "Triage", Done: "Done", Cancelled: "Cancelled"}
+	existing := model.ExistingIssue{StateName: "Canceled"}
+	desired := model.DesiredIssue{State: model.StateTodo, Reopen: true, RestoreState: model.WorkflowState{ID: "state-todo", Name: "Todo"}}
+	if d := ComputeDiff(existing, desired, states); !d.StateChanged || d.StateFrom != "Canceled" || d.StateTo != "Todo" {
+		t.Fatalf("diff = %+v, want Canceled -> Todo", d)
 	}
 }

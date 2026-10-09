@@ -86,7 +86,7 @@ Update the Linear issue when managed fields differ:
 
 When a previously tracked finding no longer exists in Snyk but its Snyk project still exists, move the Linear issue to the resolved state.
 
-When a previously tracked finding no longer exists because its Snyk project no longer exists, cancel the Linear issue instead. When the sync itself closes an open ticket this way it records `closed_reason: project-missing` (or `project-deactivated`) in the metadata block, so a later run can tell the closure was machine-made and rebind the ticket if the project is recreated.
+When a previously tracked finding no longer exists because its Snyk project no longer exists, cancel the Linear issue instead. When the sync itself closes an open ticket this way it records `closed_reason: project-missing` (or `project-deactivated`) in the metadata block, so a later run can tell the closure was machine-made and rebind the ticket if the project is recreated. A ticket that is already closed keeps its state and records no `closed_reason`: a `Done` ticket stays `Done`, because the project going away says nothing about how the ticket was closed.
 
 ### Reopen Guard
 
@@ -94,6 +94,8 @@ A terminal ticket is not reopened when Snyk reports its finding as open again; a
 
 - a rebind of a sync-cancelled ticket after project recreation (see Identity Model);
 - an exact, location-bearing fingerprint match whose ticket has known creation and closed times in Linear, where Snyk's `last_resolved_at` (the latest across the issue's coordinates) is empty or earlier than the ticket's creation. The finding was then open for the ticket's whole life, so the closure was premature (for example an automation) and the ticket is reopened (among several closed copies with that fingerprint, the most recently created one is checked and becomes canonical) with the reason "Snyk still reports this finding as open; reopened instead of creating a duplicate". This cannot reintroduce #28: an issue-ID reuse starts with Snyk resolving the old occurrence, which shows as a `last_resolved_at` after the ticket's creation. The comparison is deliberately against creation rather than closure, because the sync closes a ticket on a run after Snyk's resolution, so the resolution always predates the closure. An unparsable `last_resolved_at` or a missing timestamp keeps the default behavior.
+
+A reopened ticket (by either exception) moves to the last open workflow state its Linear history shows it in before it was closed, so triage done before the closure (moving it from Triage to Todo, or into progress) survives. Only states of the team qualify. When the history yields none or cannot be read, the reopen still happens, into the configured open state.
 
 ### Conflict
 

@@ -3,10 +3,12 @@ package linear
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -1873,5 +1875,193 @@ func TestBuildChangeCommentSkipsMetadataOnlyDescriptionChange(t *testing.T) {
 	comment := buildChangeComment(update)
 	if strings.Contains(comment, "Description updated") || !strings.Contains(comment, "reopened instead of creating a duplicate") {
 		t.Fatalf("unexpected comment: %s", comment)
+	}
+}
+
+// historyClient returns a client whose transport answers issueStateHistory
+// queries from pages, keyed by issue ID and then by the request's "after"
+// cursor ("" for the first page). An issue missing from pages gets a GraphQL
+// error.
+func historyClient(t *testing.T, pages map[string]map[string]string, requests *[]map[string]any) *Client {
+	t.Helper()
+	return &Client{
+		cfg: config.LinearConfig{TeamID: "team-1"},
+		gql: gqlclient.New("http://linear.test/graphql", &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				var payload struct {
+					Query     string         `json:"query"`
+					Variables map[string]any `json:"variables"`
+				}
+				body, err := io.ReadAll(req.Body)
+				if err != nil {
+					t.Fatalf("ReadAll() error = %v", err)
+				}
+				if err := json.Unmarshal(body, &payload); err != nil {
+					t.Fatalf("json.Unmarshal() error = %v", err)
+				}
+				if !strings.Contains(payload.Query, "query issueStateHistory") {
+					t.Fatalf("unexpected GraphQL query: %s", payload.Query)
+				}
+				*requests = append(*requests, payload.Variables)
+				id, _ := payload.Variables["id"].(string)
+				after, _ := payload.Variables["after"].(string)
+				page, ok := pages[id][after]
+				if !ok {
+					return jsonResponse(t, `{"errors":[{"message":"Entity not found"}]}`), nil
+				}
+				return jsonResponse(t, page), nil
+			}),
+		}),
+		log:          slog.New(slog.NewTextHandler(io.Discard, nil)),
+		resolvedTeam: "team-1",
+		statesByName: map[string]string{"triage": "s-triage", "todo": "s-todo", "in progress": "s-progress", "done": "s-done", "canceled": "s-canceled"},
+		statesByType: map[string]string{"triage": "s-triage", "unstarted": "s-todo", "started": "s-progress", "completed": "s-done", "canceled": "s-canceled"},
+		statesByID: map[string]workflowState{
+			"s-triage":   {name: "Triage", stateType: "triage"},
+			"s-todo":     {name: "Todo", stateType: "unstarted"},
+			"s-progress": {name: "In Progress", stateType: "started"},
+			"s-done":     {name: "Done", stateType: "completed"},
+			"s-canceled": {name: "Canceled", stateType: "canceled"},
+		},
+	}
+}
+
+func historyPage(hasNext bool, cursor string, nodes ...string) string {
+	return fmt.Sprintf(`{"data":{"issue":{"history":{"nodes":[%s],"pageInfo":{"hasNextPage":%t,"endCursor":%q}}}}}`, strings.Join(nodes, ","), hasNext, cursor)
+}
+
+func historyNode(at, from, to string) string {
+	field := func(v string) string {
+		if v == "" {
+			return "null"
+		}
+		return strconv.Quote(v)
+	}
+	return fmt.Sprintf(`{"createdAt":%q,"fromStateId":%s,"toStateId":%s}`, at, field(from), field(to))
+}
+
+func TestLastOpenStatesReturnsStateBeforeClosure(t *testing.T) {
+	pages := map[string]map[string]string{
+		// Triaged to Todo, then cancelled by the sync when its project was
+		// deactivated. Linear lists history newest first; a description
+		// update carries no state change.
+		"triaged": {"": historyPage(false, "",
+			historyNode("2026-10-08T13:01:52.014Z", "s-todo", "s-canceled"),
+			historyNode("2026-10-07T09:00:00Z", "", ""),
+			historyNode("2026-10-05T05:22:51.308Z", "s-triage", "s-todo"),
+		)},
+		// Created in Triage and cancelled straight away: Linear records no
+		// entry for the initial state, only the transition out of it.
+		"untriaged": {"": historyPage(false, "",
+			historyNode("2026-10-08T13:01:52Z", "s-triage", "s-canceled"),
+		)},
+		// In progress, fixed (Done), then moved to Canceled; the last open
+		// state is still In Progress. Spread over two pages, oldest first.
+		"paged": {
+			"": historyPage(true, "cursor-1",
+				historyNode("2026-09-01T00:00:00Z", "s-triage", "s-todo"),
+				historyNode("2026-09-02T00:00:00Z", "s-todo", "s-progress"),
+			),
+			"cursor-1": historyPage(false, "",
+				historyNode("2026-09-03T00:00:00Z", "s-progress", "s-done"),
+				historyNode("2026-10-08T00:00:00Z", "s-done", "s-canceled"),
+			),
+		},
+		// Moved in from another team whose states this team cannot use, and
+		// closed straight away.
+		"foreign": {"": historyPage(false, "",
+			historyNode("2026-09-01T00:00:00Z", "other-team-todo", "s-canceled"),
+		)},
+		"no-changes": {"": historyPage(false, "", historyNode("2026-09-01T00:00:00Z", "", ""))},
+	}
+	var requests []map[string]any
+	client := historyClient(t, pages, &requests)
+
+	got, err := client.LastOpenStates(t.Context(), []string{"triaged", "untriaged", "paged", "foreign", "no-changes"})
+	if err != nil {
+		t.Fatalf("LastOpenStates() error = %v", err)
+	}
+	want := map[string]model.WorkflowState{
+		"triaged":   {ID: "s-todo", Name: "Todo"},
+		"untriaged": {ID: "s-triage", Name: "Triage"},
+		"paged":     {ID: "s-progress", Name: "In Progress"},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("LastOpenStates() = %+v, want %+v", got, want)
+	}
+	for id, state := range want {
+		if got[id] != state {
+			t.Fatalf("LastOpenStates()[%s] = %+v, want %+v", id, got[id], state)
+		}
+	}
+	if len(requests) != 6 || requests[3]["id"] != "paged" || requests[3]["after"] != "cursor-1" {
+		t.Fatalf("requests = %v, want one per issue plus a second page for paged", requests)
+	}
+}
+
+func TestLastOpenStatesKeepsReadableIssuesWhenOneFails(t *testing.T) {
+	pages := map[string]map[string]string{
+		"ok": {"": historyPage(false, "", historyNode("2026-10-08T00:00:00Z", "s-todo", "s-canceled"))},
+	}
+	var requests []map[string]any
+	client := historyClient(t, pages, &requests)
+
+	got, err := client.LastOpenStates(t.Context(), []string{"missing", "ok"})
+	if err == nil || !strings.Contains(err.Error(), "missing") {
+		t.Fatalf("error = %v, want one naming the unreadable issue", err)
+	}
+	if len(got) != 1 || got["ok"] != (model.WorkflowState{ID: "s-todo", Name: "Todo"}) {
+		t.Fatalf("LastOpenStates() = %+v, want the readable issue", got)
+	}
+}
+
+func TestUpdateIssuesMovesReopenToRestoredState(t *testing.T) {
+	var input0 map[string]any
+	client := &Client{
+		cfg: config.LinearConfig{TeamID: "team-1", States: config.StateConfig{Todo: "Triage"}},
+		gql: gqlclient.New("http://linear.test/graphql", &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				var payload struct {
+					Query     string         `json:"query"`
+					Variables map[string]any `json:"variables"`
+				}
+				body, err := io.ReadAll(req.Body)
+				if err != nil {
+					t.Fatalf("ReadAll() error = %v", err)
+				}
+				if err := json.Unmarshal(body, &payload); err != nil {
+					t.Fatalf("json.Unmarshal() error = %v", err)
+				}
+				switch {
+				case strings.Contains(payload.Query, "query issueLabelsByID"):
+					return jsonResponse(t, `{"data":{"issues":{"nodes":[{"id":"issue-1","labels":{"nodes":[]}}]}}}`), nil
+				case strings.Contains(payload.Query, "mutation issueUpdateBatch"):
+					input0, _ = payload.Variables["input0"].(map[string]any)
+					return jsonResponse(t, `{"data":{"issueUpdate0":{"success":true}}}`), nil
+				}
+				t.Fatalf("unexpected GraphQL query: %s", payload.Query)
+				return nil, nil
+			}),
+		}),
+		log:          slog.New(slog.NewTextHandler(io.Discard, nil)),
+		resolvedTeam: "team-1",
+		statesByName: map[string]string{"triage": "s-triage", "todo": "s-todo"},
+		statesByType: map[string]string{"triage": "s-triage", "unstarted": "s-todo"},
+	}
+
+	err := client.UpdateIssues(t.Context(), []model.IssueUpdate{{
+		Existing: model.ExistingIssue{ID: "issue-1", Identifier: "SEC-1", StateName: "Canceled"},
+		Desired: model.DesiredIssue{
+			Fingerprint:  "snyk:proj-1:issue-1",
+			State:        model.StateTodo,
+			Reopen:       true,
+			RestoreState: model.WorkflowState{ID: "s-todo", Name: "Todo"},
+		},
+	}})
+	if err != nil {
+		t.Fatalf("UpdateIssues() error = %v", err)
+	}
+	if input0["stateId"] != "s-todo" {
+		t.Fatalf("stateId = %v, want the restored state s-todo rather than the configured Triage", input0["stateId"])
 	}
 }

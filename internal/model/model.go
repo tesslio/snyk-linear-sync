@@ -131,6 +131,13 @@ const (
 	StateCancelled IssueState = "cancelled"
 )
 
+// WorkflowState is a concrete workflow state of the Linear team, as opposed
+// to the model IssueState the sync maps onto a configured state name.
+type WorkflowState struct {
+	ID   string
+	Name string
+}
+
 type ExistingIssue struct {
 	ID            string
 	Identifier    string
@@ -211,6 +218,12 @@ type DesiredIssue struct {
 	// open. Only the sync's match loop sets it, after its own safety checks;
 	// ComputeDiff otherwise refuses any terminal-to-open state change.
 	Reopen bool
+	// RestoreState, set only with Reopen, is the open workflow state the
+	// ticket was in before it was closed, read from its Linear history. A
+	// reopen moves the ticket there instead of the configured open state, so
+	// the triage done on it before the closure is not lost. Empty when the
+	// history did not yield one; the configured open state applies then.
+	RestoreState WorkflowState
 }
 
 // IssueDiff captures which managed fields changed between the existing and
