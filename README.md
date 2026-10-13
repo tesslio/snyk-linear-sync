@@ -125,7 +125,7 @@ CI enforces all of these: `gofmt -l`, `go fix` + `git diff --exit-code`,
 - Includes repository, project reference, target file, and source location details when Snyk provides them.
 - Batches Linear create and update mutations to reduce request pressure.
 - Retries and backs off on Linear rate limiting.
-- Normalizes common Linear markdown rewrites when comparing descriptions so steady-state runs do not churn.
+- Normalizes common Linear markdown rewrites when comparing descriptions so steady-state runs do not churn, and ignores the scanned commit and line numbers of Snyk Code findings, so a rescan that changes nothing else does not rewrite every ticket of the repository. The commit and line links on a ticket are refreshed when anything else about its finding changes.
 
 ## Linear Permissions
 
