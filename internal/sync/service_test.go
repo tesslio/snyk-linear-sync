@@ -3,8 +3,10 @@ package sync
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -5774,5 +5776,201 @@ func TestComputeDiffReportsRestoredState(t *testing.T) {
 	desired := model.DesiredIssue{State: model.StateTodo, Reopen: true, RestoreState: model.WorkflowState{ID: "state-todo", Name: "Todo"}}
 	if d := ComputeDiff(existing, desired, states); !d.StateChanged || d.StateFrom != "Canceled" || d.StateTo != "Todo" {
 		t.Fatalf("diff = %+v, want Canceled -> Todo", d)
+	}
+}
+
+// scanFinding is a Snyk Code finding as one scan of commit reports it, with
+// the flagged region starting at line.
+func scanFinding(issueID, commit string, line int) model.Finding {
+	return model.Finding{
+		Fingerprint:       model.Fingerprint("project-a", issueID, "src/app.py"),
+		SnykIssueID:       issueID,
+		SnykIssueKey:      "key-" + issueID,
+		IssueType:         "code",
+		ProjectID:         "project-a",
+		ProjectName:       "owner/repo(main)",
+		ProjectOrigin:     "github",
+		ProjectReference:  "main",
+		IssueTitle:        "Path Traversal",
+		Severity:          "low",
+		Status:            model.FindingIgnored,
+		IssueURL:          "https://app.example.test/" + issueID,
+		IssueAPIURL:       "https://api.example.test/" + issueID,
+		Repository:        "owner/repo",
+		SourceFile:        "src/app.py",
+		SourceCommitID:    commit,
+		SourceLineStart:   line,
+		SourceColumnStart: 10,
+		SourceLineEnd:     line,
+		SourceColumnEnd:   14,
+		Description:       "Unsanitized input flows into open.",
+		CreatedAt:         time.Date(2026, time.August, 1, 0, 0, 0, 0, time.UTC),
+	}
+}
+
+const (
+	commitA = "1111111111111111111111111111111111111111"
+	commitB = "2222222222222222222222222222222222222222"
+)
+
+var linearStoredLinkPattern = regexp.MustCompile(`\]\((https://[^)]+)\)`)
+
+// linearStored returns description the way Linear stores it after a write:
+// the heading's brackets escaped and followed by a blank line, and every link
+// target wrapped in angle brackets.
+func linearStored(description string) string {
+	heading, rest, _ := strings.Cut(description, "\n")
+	heading = strings.NewReplacer("[", `\[`, "]", `\]`).Replace(heading)
+	return heading + "\n\n" + linearStoredLinkPattern.ReplaceAllString(rest, "](<$1>)")
+}
+
+func githubCfg() config.Config {
+	cfg := minimalCfg()
+	cfg.Source = config.SourceConfig{Provider: "github"}
+	return cfg
+}
+
+func TestNormalizeDescriptionForCompareMatchesLinearStoredForm(t *testing.T) {
+	desired := desiredIssue(githubCfg(), scanFinding("issue-1", commitA, 10)).Description
+	stored := linearStored(desired)
+	if !strings.Contains(stored, "\\]\n\nRepository: [owner/repo](<https://github.com/owner/repo>)") {
+		t.Fatalf("fixture is not in Linear's stored form:\n%s", stored)
+	}
+	if normalizeDescriptionForCompare(stored) != normalizeDescriptionForCompare(desired) {
+		t.Fatalf("stored and written descriptions compare different:\n%s\n---\n%s", normalizeDescriptionForCompare(stored), normalizeDescriptionForCompare(desired))
+	}
+}
+
+func TestNormalizeDescriptionForCompareIgnoresScanPins(t *testing.T) {
+	cfg := githubCfg()
+	before := desiredIssue(cfg, scanFinding("issue-1", commitA, 10)).Description
+	rescanned := scanFinding("issue-1", commitB, 40)
+	rescanned.SourceLineEnd = 44
+	after := desiredIssue(cfg, rescanned).Description
+	if !strings.Contains(after, commitB) || !strings.Contains(after, "#L40-L44") || !strings.Contains(after, "(line 40:10 to 44:14)") {
+		t.Fatalf("fixture does not move the scan pins:\n%s", after)
+	}
+	if normalizeDescriptionForCompare(linearStored(before)) != normalizeDescriptionForCompare(after) {
+		t.Fatalf("a rescan that only moved the commit and lines compares different:\n%s\n---\n%s", normalizeDescriptionForCompare(before), normalizeDescriptionForCompare(after))
+	}
+
+	for _, tc := range []struct {
+		name   string
+		change func(*model.Finding)
+	}{
+		{name: "status", change: func(f *model.Finding) { f.Status = model.FindingOpen }},
+		{name: "branch", change: func(f *model.Finding) { f.ProjectReference = "release" }},
+		{name: "source file", change: func(f *model.Finding) { f.SourceFile = "src/other.py" }},
+		{name: "commit link in Snyk prose", change: func(f *model.Finding) {
+			f.Description = "Fixed upstream in https://github.com/upstream/lib/commit/" + commitB
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			changed := scanFinding("issue-1", commitA, 10)
+			tc.change(&changed)
+			if normalizeDescriptionForCompare(before) == normalizeDescriptionForCompare(desiredIssue(cfg, changed).Description) {
+				t.Fatalf("a %s change was hidden by the scan-pin normalization", tc.name)
+			}
+		})
+	}
+}
+
+// linearSim stands in for Linear across runs: it keeps each written
+// description in Linear's stored form.
+type linearSim struct {
+	fakeLinear
+	issues map[string]*model.ExistingIssue
+	order  []string
+}
+
+func (l *linearSim) LoadSnapshot(context.Context) ([]model.ExistingIssue, error) {
+	out := make([]model.ExistingIssue, 0, len(l.order))
+	for _, id := range l.order {
+		out = append(out, *l.issues[id])
+	}
+	return out, nil
+}
+
+func (l *linearSim) UpdateIssues(ctx context.Context, updates []model.IssueUpdate) error {
+	for _, u := range updates {
+		issue := l.issues[u.Existing.ID]
+		issue.Title, issue.Description, issue.DueDate, issue.Priority = u.Desired.Title, linearStored(u.Desired.Description), u.Desired.DueDate, u.Desired.Priority
+		issue.ManagedLabels = u.Desired.ManagedLabels
+	}
+	return l.fakeLinear.UpdateIssues(ctx, updates)
+}
+
+func TestRunDoesNotRewriteTicketsOnRescanWithoutChanges(t *testing.T) {
+	cfg := githubCfg()
+	sim := &linearSim{issues: map[string]*model.ExistingIssue{}}
+	for i, issueID := range []string{"issue-1", "issue-2"} {
+		f := scanFinding(issueID, commitA, 10+i)
+		issue := storedIssue(fmt.Sprintf("existing-%d", i+1), fmt.Sprintf("SNYK-%d", i+1), "Canceled", desiredIssue(cfg, f))
+		issue.Description = linearStored(issue.Description)
+		sim.issues[issue.ID] = &issue
+		sim.order = append(sim.order, issue.ID)
+	}
+	store := &fakeCache{}
+
+	run := func(name string, findings ...model.Finding) {
+		t.Helper()
+		sim.updates = nil
+		store.snapshot = store.saved
+		snyk := fakeSnyk{snapshot: model.SnykSnapshot{Findings: findings, ProjectIDs: map[string]struct{}{"project-a": {}}}}
+		if _, err := New(cfg, discardLogger(), snyk, sim, store).Run(context.Background()); err != nil {
+			t.Fatalf("%s: Run() error = %v", name, err)
+		}
+	}
+
+	run("first run, nothing changed", scanFinding("issue-1", commitA, 10), scanFinding("issue-2", commitA, 11))
+	if len(sim.updates) != 0 {
+		t.Fatalf("first run rewrote %v, want nothing", updatedIdentifiers(sim.updates))
+	}
+	run("rescan of a new commit", scanFinding("issue-1", commitB, 30), scanFinding("issue-2", commitB, 31))
+	if len(sim.updates) != 0 {
+		t.Fatalf("rescan rewrote %v, want nothing", updatedIdentifiers(sim.updates))
+	}
+
+	fixed := scanFinding("issue-2", commitB, 31)
+	fixed.Status = model.FindingFixed
+	run("real change", scanFinding("issue-1", commitB, 30), fixed)
+	if len(sim.updates) != 1 || sim.updates[0].Existing.ID != "existing-2" {
+		t.Fatalf("updates = %v, want only the fixed ticket", updatedIdentifiers(sim.updates))
+	}
+	if !strings.Contains(sim.issues["existing-2"].Description, commitB) {
+		t.Fatalf("a real update must still write the current commit:\n%s", sim.issues["existing-2"].Description)
+	}
+}
+
+func TestRunCachesHashOfMatchedTicketForDuplicateFingerprint(t *testing.T) {
+	cfg := minimalCfg()
+	finding := recreatedProjectFinding("project-a", "issue-a")
+	desired := desiredIssue(cfg, finding)
+	// The open copy is canonical; the older cancelled copy comes later in the
+	// snapshot, the way Linear lists newest first.
+	canonical := storedIssue("open", "SNYK-200", "Todo", desired)
+	olderCopy := storedIssue("old", "SNYK-100", "Cancelled", desired)
+	olderCopy.Title = "older title"
+	// A ticket with a pending change, so the run writes and refreshes the
+	// cache from Linear.
+	other := recreatedProjectFinding("project-a", "issue-b")
+	stale := desiredIssue(cfg, other)
+	stale.Title = "stale title"
+	linear := &fakeLinear{snapshot: []model.ExistingIssue{canonical, olderCopy, storedIssue("other", "SNYK-300", "Todo", stale)}}
+	snyk := fakeSnyk{snapshot: model.SnykSnapshot{
+		Findings:   []model.Finding{finding, other},
+		ProjectIDs: map[string]struct{}{"project-a": {}},
+	}}
+	store := &fakeCache{}
+
+	result, err := New(cfg, discardLogger(), snyk, linear, store).Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if result.PlannedUpdates != 1 {
+		t.Fatalf("planned updates = %d, want 1 so the cache is refreshed from Linear", result.PlannedUpdates)
+	}
+	if got, want := store.saved.LinearHashes[finding.Fingerprint], existingIssueHash(canonical); got != want {
+		t.Fatalf("cached Linear hash is not the matched ticket's: got %s, want %s (older copy %s)", got, want, existingIssueHash(olderCopy))
 	}
 }

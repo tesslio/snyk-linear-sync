@@ -65,6 +65,24 @@ const (
 )
 
 var linearAutoLinkPattern = regexp.MustCompile(`\[([^\]]+)\]\((?:<)?([^)\n>]+)(?:>)?\)`)
+
+// blankLineRunPattern matches one or more blank lines. Linear's markdown
+// serializer inserts a blank line after headings (and between some blocks),
+// so blank-line structure is not stable across a write/read round trip.
+var blankLineRunPattern = regexp.MustCompile(`\n(?:[ \t]*\n)+`)
+
+// scanPinnedLinePattern matches the description lines that pin a ticket to the
+// scan it was written from: the Ref or Commit line naming the scanned commit,
+// and the File line linking the flagged lines at that commit. The patterns
+// after it find those pins within such a line.
+var (
+	scanPinnedLinePattern = regexp.MustCompile(`(?m)^(?:Ref|Commit|File): .*$`)
+	scannedCommitPattern  = regexp.MustCompile("(` at \\[?|^Commit: \\[?)`[^`]*`")
+	commitPathPattern     = regexp.MustCompile(`/(commit|blob)/[0-9a-f]{7,40}\b`)
+	sourceRegionPattern   = regexp.MustCompile(`\(line [0-9:]+(?:-[0-9]+| to [0-9:]+)?\)`)
+	lineAnchorPattern     = regexp.MustCompile(`#L[0-9]+(?:-L[0-9]+)?`)
+)
+
 var markdownEscapePattern = regexp.MustCompile(`\\([\\` + "`" + `*_{}\[\]()#+\-.!~])`)
 
 type RunResult struct {
@@ -665,6 +683,18 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 				)
 			} else {
 				cacheLinearHashes = linearHashesByFingerprint(refreshedIssues)
+				// A fingerprint shared by several tickets must cache the hash of
+				// the ticket the finding is matched to, not whichever copy the
+				// snapshot happened to list last.
+				refreshedByID := make(map[string]model.ExistingIssue, len(refreshedIssues))
+				for _, issue := range refreshedIssues {
+					refreshedByID[issue.ID] = issue
+				}
+				for fingerprint, matched := range matchedExisting {
+					if issue, ok := refreshedByID[matched.ID]; ok {
+						cacheLinearHashes[fingerprint] = existingIssueHash(issue)
+					}
+				}
 			}
 		}
 		nextSnapshot := cache.Snapshot{
@@ -1898,6 +1928,7 @@ func FingerprintProjectID(fingerprint string) (string, bool) {
 
 func normalizeDescriptionForCompare(description string) string {
 	description = strings.TrimSpace(strings.ReplaceAll(description, "\r\n", "\n"))
+	description = blankLineRunPattern.ReplaceAllString(description, "\n")
 	description = linearAutoLinkPattern.ReplaceAllString(description, "[$1]($2)")
 	description = markdownEscapePattern.ReplaceAllString(description, "$1")
 	// Linear re-serializes underscore emphasis as asterisks (__x__ -> **x**,
@@ -1907,7 +1938,24 @@ func normalizeDescriptionForCompare(description string) string {
 	description = strings.ReplaceAll(description, "*", "_")
 	description = strings.ReplaceAll(description, "DO NOT EDIT OR REMOVE THIS BLOCK. Used by snyk-linear-sync for deduplication.", "__SNYK_LINEAR_METADATA_WARNING__")
 	description = strings.ReplaceAll(description, "DO NOT EDIT, REMOVE, OR REFORMAT THIS BLOCK. It is required by snyk-linear-sync for deduplication and safe updates.", "__SNYK_LINEAR_METADATA_WARNING__")
-	return description
+	return withoutScanPins(description)
+}
+
+// withoutScanPins blanks out the scanned commit and the flagged line region in
+// the Ref, Commit and File lines. Snyk rescans a repository on every push to
+// the monitored branch, and each rescan reports the new commit and often new
+// line numbers for every Snyk Code finding in it, with nothing else changed.
+// Comparing those would rewrite every Snyk Code ticket of the repository, most
+// of them long closed, after every merge. The links a ticket keeps are
+// permalinks to the commit they name, so they stay valid; they are refreshed
+// whenever anything else about the finding changes.
+func withoutScanPins(description string) string {
+	return scanPinnedLinePattern.ReplaceAllStringFunc(description, func(line string) string {
+		line = scannedCommitPattern.ReplaceAllString(line, "${1}`<commit>`")
+		line = commitPathPattern.ReplaceAllString(line, "/$1/<commit>")
+		line = sourceRegionPattern.ReplaceAllString(line, "(line <region>)")
+		return lineAnchorPattern.ReplaceAllString(line, "#L<line>")
+	})
 }
 
 func sourceFileLink(sourceCfg config.SourceConfig, finding model.Finding) (string, string) {

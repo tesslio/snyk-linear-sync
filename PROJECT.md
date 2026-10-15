@@ -146,7 +146,9 @@ The subject portion then uses this preference:
 
 The metadata block also records the managed automation label name when label management is enabled.
 
-Linear may rewrite parts of the description body when rendering or storing markdown. The sync therefore normalizes known Linear formatting changes during compare and cache hashing.
+Linear may rewrite parts of the description body when rendering or storing markdown. The sync therefore normalizes known Linear formatting changes during compare and cache hashing, including the blank lines Linear inserts after headings.
+
+The compare and the cache hash also ignore the scanned commit and the flagged line region in the `Ref`, `Commit` and `File` lines. Snyk reports a new commit, and often new line numbers, for every Snyk Code finding of a repository on each rescan of its branch, with nothing else changed. A ticket therefore keeps the commit and line links it was last written with; they are permalinks to that commit, and are refreshed whenever anything else about the finding changes.
 
 ## Source Hosting
 
@@ -322,7 +324,7 @@ Normal behavior:
 2. Read live Linear data.
 3. Compare both against the last successful cached hashes.
 4. Skip unchanged fingerprints.
-5. After successful writes, refresh the cache from the live post-write Linear snapshot.
+5. After successful writes, refresh the cache from the live post-write Linear snapshot. When several tickets share a fingerprint, the cached Linear hash is that of the ticket the finding was matched to, so the next run's comparison against the same ticket can hit.
 
 The post-write refresh matters because Linear may rewrite markdown bodies after mutation.
 
