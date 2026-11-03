@@ -67,6 +67,15 @@ type Finding struct {
 	SourceColumnEnd       int
 	IgnoreExpiresAt       time.Time
 	DisregardIfFixable    bool
+	// IgnoreEndedAt is when an ignore-until-fix-available ignore stopped
+	// applying to the finding: the first run on which Snyk reported every
+	// issue carrying it as ignored=false, remembered in the sync's ignore
+	// cache. It is the base of the due date (the SLA starts when the fix
+	// arrives, or the ignore is revoked) unless the ignore had already
+	// lapsed by its expiry, which then stays the base. Zero while the
+	// ignore still applies, when no disregard-if-fixable ignore is known,
+	// or when the sync runs without a cache.
+	IgnoreEndedAt time.Time
 
 	// LastResolvedAt is the most recent last_resolved_at Snyk reports across
 	// the issue's coordinates: when Snyk last saw this issue resolved. Zero

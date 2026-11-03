@@ -384,8 +384,12 @@ func (c *Client) LoadSnapshot(ctx context.Context) (model.SnykSnapshot, error) {
 		// lose nothing — the problems loop inside ignoreEntriesForIssue
 		// already covers every problem ID, and issue.ID is always added.
 		projectIgnoreState := ignoresByProject[projectID]
-		ignoreEntries := ignoreEntriesForIssue(projectIgnoreState.merged, issue.Attributes.Key, issue.ID, issue.Attributes.Problems, issue.Attributes.Ignored)
+		ignoreKeys := ignoreKeysForIssue(issue.Attributes.Key, issue.ID, gatedProblems(issue.Attributes.Problems, issue.Attributes.Ignored))
+		ignoreEntries := ignoreEntriesForKeys(projectIgnoreState.merged, ignoreKeys)
 		ignoreMeta := maxExpiryIgnoreMeta(ignoreEntries)
+		if ignoreMeta.DisregardIfFixable {
+			ignoreMeta.EndedAt = projectIgnoreState.endedAt(ignoreKeys)
+		}
 		ok := len(ignoreEntries) > 0
 		// If the issue is ignored but we found no v1 ignore metadata, the
 		// key format didn't match either fallback. Log a warning so
@@ -518,6 +522,7 @@ func (c *Client) findingFromIssue(
 		SourceColumnEnd:       source.Region.End.Column,
 		IgnoreExpiresAt:       ignoreMeta.ExpiresAt,
 		DisregardIfFixable:    ignoreMeta.DisregardIfFixable,
+		IgnoreEndedAt:         ignoreMeta.EndedAt,
 		LastResolvedAt:        lastResolvedAt,
 		LastResolvedAtInvalid: lastResolvedAtInvalid,
 		Classes:               issueClasses(issue.Attributes.Classes),
@@ -554,6 +559,10 @@ type projectIgnores struct {
 	// Until retain runs it holds every cached row; afterwards only the
 	// retained ones, and findings are built from it.
 	merged v1ProjectIgnores
+	// rows is what the cache holds after retain: the retained rows, with
+	// the unignored_at stamps decided this run. Findings read their
+	// IgnoreEndedAt from it.
+	rows map[string]cache.IgnoreMeta
 	// matches records, per ignore key, what the REST issues of the project
 	// that could carry the ignore report. Filled by recordIssue.
 	matches map[string]*ignoreKeyMatches
@@ -565,6 +574,8 @@ type projectIgnores struct {
 // decides which entries a finding consumes: this is about what Snyk asserts
 // for the ignore, not about which finding the ignore applies to.
 type ignoreKeyMatches struct {
+	// total counts the matching issues, whatever they report.
+	total int
 	// ignored counts matching issues that report ignored=true: Snyk still
 	// asserts the ignore for them, whatever the v1 endpoint returns.
 	ignored int
@@ -587,6 +598,7 @@ func (p *projectIgnores) recordIssue(issue issueResource) {
 			m = &ignoreKeyMatches{}
 			p.matches[key] = m
 		}
+		m.total++
 		switch {
 		case issue.Attributes.Ignored:
 			m.ignored++
@@ -607,6 +619,10 @@ func (p *projectIgnores) recordIssue(issue issueResource) {
 //   - A key the API did not return keeps its previous confirmation time and
 //     is kept, unless revoked says Snyk has contradicted it.
 //
+// An ignore-until-fix-available row is also stamped with the time the ignore
+// stopped applying (see unignoredAt), which the due date is based on from
+// then on.
+//
 // As before, a summary with no expiry and no disregard-if-fixable flag (a
 // plain permanent ignore) is not stored: an absent row plus issue.Ignored
 // already maps to a permanent ignore, so there is nothing to remember.
@@ -624,6 +640,7 @@ func (p *projectIgnores) retain(now time.Time) (rows map[string]cache.IgnoreMeta
 			CreatedAt:          meta.CreatedAt,
 		}
 		row.UpdatedAt = now
+		row.UnignoredAt = p.unignoredAt(key, meta, now)
 		if _, confirmed := p.apiConfirmed[key]; !confirmed {
 			confirmedAt := p.cached[key].UpdatedAt
 			if p.revoked(key, meta, confirmedAt, now) {
@@ -672,10 +689,52 @@ func (p *projectIgnores) revoked(key string, meta ignoreMetadata, confirmedAt, n
 	return now.Sub(confirmedAt) >= unconfirmedIgnoreGrace
 }
 
+// unignoredAt returns the time an ignore-until-fix-available ignore stopped
+// applying, for the row of the given key: the stamp the cache already holds,
+// or now on the first run on which every REST issue the key matches reports
+// ignored=false (the fix arrived, or the ignore was revoked; either way the
+// finding is actionable from now). The stamp is kept thereafter, since the
+// due date is based on it. It is cleared while any matching issue reports
+// ignored=true again (a later ignore-until-fix is in force, and its own end
+// will be stamped), and left as it was when no REST issue matches the key
+// (nothing is known this run). Rows without the flag are never stamped.
+func (p *projectIgnores) unignoredAt(key string, meta ignoreMetadata, now time.Time) time.Time {
+	if !meta.DisregardIfFixable {
+		return time.Time{}
+	}
+	previous := p.cached[key].UnignoredAt
+	m := p.matches[key]
+	switch {
+	case m == nil || m.total == 0:
+		return previous
+	case m.ignored > 0:
+		return time.Time{}
+	case !previous.IsZero():
+		return previous
+	default:
+		return now
+	}
+}
+
 // finalize rebuilds merged from the API entries and the retained rows, so
-// findings see exactly what the cache will remember.
+// findings see exactly what the cache will remember, and keeps the rows for
+// the IgnoreEndedAt lookup.
 func (p *projectIgnores) finalize(rows map[string]cache.IgnoreMeta) {
+	p.rows = rows
 	p.merged = mergeIgnores(p.api, cacheIgnoresToV1(rows))
+}
+
+// endedAt returns the latest unignored_at stamp among the rows of the given
+// keys, the time the finding's ignore-until-fix-available ignore stopped
+// applying, or zero when none is stamped.
+func (p *projectIgnores) endedAt(keys []string) time.Time {
+	var latest time.Time
+	for _, key := range keys {
+		if row, ok := p.rows[key]; ok && row.UnignoredAt.After(latest) {
+			latest = row.UnignoredAt
+		}
+	}
+	return latest
 }
 
 // commitProjectIgnores applies the retention decision for one project: it
@@ -1102,14 +1161,25 @@ func unionIgnoreEntries(first, second []v1IgnoreEntry) []v1IgnoreEntry {
 // none), never a coalesced fallback: a fallback derived from a problem ID
 // would smuggle a rule key past the ignored gate.
 func ignoreEntriesForIssue(projectIgnores v1ProjectIgnores, issueKey, issueID string, problems []problem, ignored bool) []v1IgnoreEntry {
+	return ignoreEntriesForKeys(projectIgnores, ignoreKeysForIssue(issueKey, issueID, gatedProblems(problems, ignored)))
+}
+
+// gatedProblems applies the issue.Ignored gate of ignoreEntriesForIssue:
+// rule/problem keys are consulted only for a finding Snyk reports ignored.
+func gatedProblems(problems []problem, ignored bool) []problem {
+	if !ignored {
+		return nil
+	}
+	return problems
+}
+
+// ignoreEntriesForKeys concatenates the entries filed under the given keys.
+func ignoreEntriesForKeys(projectIgnores v1ProjectIgnores, keys []string) []v1IgnoreEntry {
 	if len(projectIgnores) == 0 {
 		return nil
 	}
-	if !ignored {
-		problems = nil
-	}
 	var entries []v1IgnoreEntry
-	for _, key := range ignoreKeysForIssue(issueKey, issueID, problems) {
+	for _, key := range keys {
 		entries = append(entries, projectIgnores[key]...)
 	}
 	return entries
@@ -1222,12 +1292,14 @@ func cacheIgnoresToV1(cached map[string]cache.IgnoreMeta) v1ProjectIgnores {
 }
 
 // ignoreMetadata carries the v1 ignore fields that the sync logic needs:
-// the snooze expiry date and whether the ignore is conditional on no fix being
-// available (disregardIfFixable).
+// the snooze expiry date, whether the ignore is conditional on no fix being
+// available (disregardIfFixable), and, for such an ignore, when it stopped
+// applying (from the cache; see projectIgnores.unignoredAt).
 type ignoreMetadata struct {
 	ExpiresAt          time.Time
 	DisregardIfFixable bool
 	CreatedAt          time.Time
+	EndedAt            time.Time
 }
 
 func parseTime(raw string) (time.Time, error) {

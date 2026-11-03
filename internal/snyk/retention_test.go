@@ -491,3 +491,100 @@ func TestLoadSnapshotV1NotFoundKeepsEveryCachedRow(t *testing.T) {
 		})
 	}
 }
+
+func disregardEntry(created, expires time.Time) v1IgnoreEntry {
+	entry := snooze(created, expires)
+	entry.DisregardIfFixable = true
+	return entry
+}
+
+// TestLoadSnapshotStampsIgnoreEndWhenFixArrives: an "ignore until fix
+// available" ignore is lifted by Snyk (ignored=false) when a fix ships. The
+// first run that sees it stamps the cached row, the finding carries the
+// stamp as IgnoreEndedAt from then on, including after v1 forgets the
+// record, and a later re-ignore clears it until the next lift.
+func TestLoadSnapshotStampsIgnoreEndWhenFixArrives(t *testing.T) {
+	store := openIgnoresStore(t)
+	fx := &snykFixture{
+		issues: []issueResource{fixtureIssue("issue-1", "SNYK-100", true)},
+		v1:     map[string]v1ProjectIgnores{fixtureProject: {"SNYK-100": {disregardEntry(t0.Add(-24*time.Hour), time.Time{})}}},
+	}
+	now := t0
+	c := newSnapshotClient(t, fx, store, &now)
+
+	finding := loadOne(t, c)
+	if finding.Status != model.FindingAwaitingFix || !finding.IgnoreEndedAt.IsZero() {
+		t.Fatalf("run 1: status %q ended %v, want awaiting_fix with no end", finding.Status, finding.IgnoreEndedAt)
+	}
+
+	// The fix arrives; the v1 record is still returned for now.
+	fx.issues[0].Attributes.Ignored = false
+	lifted := t0.Add(10 * 24 * time.Hour)
+	now = lifted
+	finding = loadOne(t, c)
+	if finding.Status != model.FindingOpen || !finding.DisregardIfFixable || !finding.IgnoreEndedAt.Equal(lifted) {
+		t.Fatalf("run 2: status %q disregard %v ended %v, want open, disregard, ended %v", finding.Status, finding.DisregardIfFixable, finding.IgnoreEndedAt, lifted)
+	}
+	row, ok := cachedRow(t, store, "SNYK-100")
+	if !ok || !row.UnignoredAt.Equal(lifted) {
+		t.Fatalf("run 2: cached row = %+v (present %v), want unignored_at %v", row, ok, lifted)
+	}
+
+	// Later runs keep the stamp, even once v1 forgets the record.
+	fx.v1[fixtureProject] = v1ProjectIgnores{}
+	now = t0.Add(40 * 24 * time.Hour)
+	finding = loadOne(t, c)
+	if !finding.IgnoreEndedAt.Equal(lifted) || !finding.DisregardIfFixable {
+		t.Fatalf("run 3: ended %v disregard %v, want %v kept", finding.IgnoreEndedAt, finding.DisregardIfFixable, lifted)
+	}
+
+	// Re-ignored until a (better) fix: the end is cleared and the finding
+	// is awaiting a fix again; the next lift stamps a new end.
+	fx.issues[0].Attributes.Ignored = true
+	fx.v1[fixtureProject] = v1ProjectIgnores{"SNYK-100": {disregardEntry(t0.Add(41*24*time.Hour), time.Time{})}}
+	now = t0.Add(42 * 24 * time.Hour)
+	finding = loadOne(t, c)
+	if finding.Status != model.FindingAwaitingFix || !finding.IgnoreEndedAt.IsZero() {
+		t.Fatalf("run 4: status %q ended %v, want awaiting_fix with no end", finding.Status, finding.IgnoreEndedAt)
+	}
+	fx.issues[0].Attributes.Ignored = false
+	liftedAgain := t0.Add(50 * 24 * time.Hour)
+	now = liftedAgain
+	finding = loadOne(t, c)
+	if !finding.IgnoreEndedAt.Equal(liftedAgain) {
+		t.Fatalf("run 5: ended %v, want %v", finding.IgnoreEndedAt, liftedAgain)
+	}
+}
+
+// TestLoadSnapshotDisregardIgnoreLapsedByExpiryKeepsExpiry: an ignore until
+// fix available that also carries an expiry can simply reach it with no fix.
+// Snyk then reports the issue un-ignored like a fix arrival would, but the
+// finding carries both the expiry (before the end) and the end, so the sync
+// can base the due date on the expiry rather than claim a fix arrived.
+func TestLoadSnapshotDisregardIgnoreLapsedByExpiryKeepsExpiry(t *testing.T) {
+	store := openIgnoresStore(t)
+	expires := t0.Add(5 * 24 * time.Hour)
+	fx := &snykFixture{
+		issues: []issueResource{fixtureIssue("issue-1", "SNYK-100", true)},
+		v1:     map[string]v1ProjectIgnores{fixtureProject: {"SNYK-100": {disregardEntry(t0.Add(-24*time.Hour), expires)}}},
+	}
+	now := t0
+	c := newSnapshotClient(t, fx, store, &now)
+	if finding := loadOne(t, c); finding.Status != model.FindingAwaitingFix {
+		t.Fatalf("run 1: status = %q, want awaiting_fix", finding.Status)
+	}
+
+	fx.issues[0].Attributes.Ignored = false
+	fx.v1[fixtureProject] = v1ProjectIgnores{}
+	lapsedSeen := t0.Add(10 * 24 * time.Hour)
+	for _, days := range []int{10, 30} {
+		now = t0.Add(time.Duration(days) * 24 * time.Hour)
+		finding := loadOne(t, c)
+		if finding.Status != model.FindingOpen {
+			t.Fatalf("day %d: status = %q, want open", days, finding.Status)
+		}
+		if !finding.DisregardIfFixable || !finding.IgnoreExpiresAt.Equal(expires) || !finding.IgnoreEndedAt.Equal(lapsedSeen) {
+			t.Fatalf("day %d: disregard %v expiry %v ended %v, want disregard, expiry %v, ended %v", days, finding.DisregardIfFixable, finding.IgnoreExpiresAt, finding.IgnoreEndedAt, expires, lapsedSeen)
+		}
+	}
+}

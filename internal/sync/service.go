@@ -404,9 +404,7 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 		if matched {
 			// A fix arriving for an "ignored until fix available" finding: Snyk
 			// flips ignored=false, the issue comes back as open, and the sync
-			// must move the ticket it parked in Backlog out again. Computed
-			// once here because both the Backlog override below and the
-			// due-date recalculation further down depend on it.
+			// must move the ticket it parked in Backlog out again.
 			fixNowAvailable := finding.Status == model.FindingOpen && wasAwaitingFix(existing, s.cfg.Linear.Labels.AwaitingFix)
 			// The sync itself parked this ticket in Backlog while Snyk reported
 			// the ignore as "until fix available". That is not a manual triage
@@ -448,26 +446,18 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 			// Linear due-date updates and change-comments. Once the ticket
 			// already has a due date, keep it fixed instead of re-deriving it
 			// from a moving updated_at. A ticket that never had a due date
-			// set still gets one (the condition below is false), and the
-			// fix-availability recalculation further below still takes
-			// priority when it applies.
+			// set still gets one (the condition below is false).
 			if desired.DueDateUsedUpdatedAtFallback && existing.DueDate != "" {
 				desired.DueDate = existing.DueDate
 				desired.DueDateBase = existing.DueDate
 				desired.DueDateReason = "kept existing due date to avoid churn from Snyk updated_at re-detection"
 			}
 
-			// When a fix becomes available for a previously-blocked issue,
-			// recalculate the due date from today instead of the original
-			// created_at. The original SLA date is meaningless because the
-			// team couldn't act on the issue while no fix was available. A
-			// fresh SLA from fix-availability gives a meaningful triage
-			// deadline without the daily churn that the old floor-to-today
-			// caused for all overdue issues.
-			if fixNowAvailable {
-				desired.DueDate, desired.DueDateBase, desired.DueDateReason = issueDueDateFromFixAvailability(s.cfg.Linear.Due, finding)
-			}
-
+			// The due date of a finding whose fix just arrived is not
+			// recalculated here: it is based on the finding's IgnoreEndedAt,
+			// which the Snyk loader remembers in its ignore cache, so every
+			// run computes the same date (see issueDueDate). The marker
+			// only drives the move out of Backlog above.
 		}
 
 		if desired.Reopen {
@@ -1394,13 +1384,24 @@ func issueDueDate(dueCfg config.DueDateConfig, finding model.Finding) (effective
 	var baseDate time.Time
 	var basis string
 	switch {
+	case finding.DisregardIfFixable && !finding.IgnoreEndedAt.IsZero():
+		// An "ignore until fix available" ignore that stopped applying: the
+		// SLA clock starts when the fix arrived (or the ignore was revoked),
+		// not at the issue's creation, since the team could not act on it
+		// before. The Snyk loader remembers that time in its ignore cache,
+		// so every run computes the same date. When the ignore had already
+		// lapsed by its own expiry, the expiry stays the base, as for any
+		// expired snooze.
+		baseDate, basis = utcDate(finding.IgnoreEndedAt), "fix availability"
+		if !finding.IgnoreExpiresAt.IsZero() && !finding.IgnoreExpiresAt.After(finding.IgnoreEndedAt) {
+			baseDate, basis = utcDate(finding.IgnoreExpiresAt), "ignore expiry"
+		}
 	case !finding.IgnoreExpiresAt.IsZero():
-		expiresUTC := finding.IgnoreExpiresAt.UTC()
-		baseDate = time.Date(expiresUTC.Year(), expiresUTC.Month(), expiresUTC.Day(), 0, 0, 0, 0, time.UTC)
+		baseDate = utcDate(finding.IgnoreExpiresAt)
 		basis = "ignore expiry"
 	case !finding.CreatedAt.IsZero():
 		createdAtUTC := finding.CreatedAt.UTC()
-		baseDate = time.Date(createdAtUTC.Year(), createdAtUTC.Month(), createdAtUTC.Day(), 0, 0, 0, 0, time.UTC)
+		baseDate = utcDate(createdAtUTC)
 		basis = "issue creation"
 
 		// Snyk reuses issue IDs when the same vulnerability class reappears on
@@ -1430,6 +1431,13 @@ func issueDueDate(dueCfg config.DueDateConfig, finding model.Finding) (effective
 
 	effective, base, reason = dueDateFromBase(baseDate, basis, dueCfg, finding)
 	return effective, base, reason, usedUpdatedAtFallback
+}
+
+// utcDate truncates an instant to its UTC calendar date. Every due date is
+// derived from UTC dates so the result does not depend on the host's zone.
+func utcDate(t time.Time) time.Time {
+	t = t.UTC()
+	return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)
 }
 
 // severitySLADays returns the SLA day count for a given severity, or 0 if
@@ -1475,41 +1483,6 @@ func dueDateFromBase(baseDate time.Time, basis string, dueCfg config.DueDateConf
 	// SLA, not just that it is overdue. Flooring to today caused daily
 	// churn — each run would advance the floor by one day, triggering a
 	// spurious update even when the underlying Snyk data was unchanged.
-
-	return dueDateStr, dueDateStr, reason
-}
-
-// issueDueDateFromFixAvailability calculates a due date for an issue that has
-// just become actionable after being blocked on an upstream fix. Unlike
-// issueDueDate which uses the Snyk created_at as the base, this uses today
-// as the base — the SLA clock starts when the fix becomes available, not
-// when the issue was originally found (which would give a meaningless past
-// date because the team couldn't act on it while no fix existed).
-func issueDueDateFromFixAvailability(dueCfg config.DueDateConfig, finding model.Finding) (string, string, string) {
-	var days int
-	switch issuePriority(finding.Severity) {
-	case 1:
-		days = dueCfg.CriticalDays
-	case 2:
-		days = dueCfg.HighDays
-	case 3:
-		days = dueCfg.MediumDays
-	case 4:
-		days = dueCfg.LowDays
-	default:
-		return "", "", ""
-	}
-
-	now := time.Now()
-	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
-	dueDate := today.AddDate(0, 0, days)
-	dueDateStr := dueDate.Format(time.DateOnly)
-
-	severityName := strings.ToLower(strings.TrimSpace(finding.Severity))
-	if severityName == "" {
-		severityName = "unknown"
-	}
-	reason := fmt.Sprintf("%s severity SLA: %d days from fix availability", severityName, days)
 
 	return dueDateStr, dueDateStr, reason
 }

@@ -1,8 +1,6 @@
 package sync
 
 import (
-	"time"
-
 	"github.com/tesslio/snyk-linear-sync/internal/config"
 	"github.com/tesslio/snyk-linear-sync/internal/model"
 )
@@ -37,9 +35,6 @@ func DiagnoseDueDate(cfg config.Config, finding model.Finding, existing model.Ex
 	desired := desiredIssue(cfg, finding)
 
 	awaitingFix := wasAwaitingFix(existing, cfg.Linear.Labels.AwaitingFix)
-	if finding.Status == model.FindingOpen && awaitingFix {
-		desired.DueDate, desired.DueDateBase, desired.DueDateReason = issueDueDateFromFixAvailability(cfg.Linear.Due, finding)
-	}
 
 	diff := ComputeDiff(existing, desired, cfg.Linear.States)
 
@@ -61,7 +56,7 @@ func DiagnoseDueDate(cfg config.Config, finding model.Finding, existing model.Ex
 		})
 	}
 
-	fixAvailabilityDueDate, fixAvailabilityBase, fixAvailabilityReason := issueDueDateFromFixAvailability(cfg.Linear.Due, finding)
+	fixAvailabilityDueDate, fixAvailabilityBase, fixAvailabilityReason := issueDueDateFromIgnoreEnd(cfg.Linear.Due, finding)
 
 	return DueDateDiagnostics{
 		Finding:                   finding,
@@ -70,7 +65,7 @@ func DiagnoseDueDate(cfg config.Config, finding model.Finding, existing model.Ex
 		Diff:                      diff,
 		WouldUpdate:               needsUpdate(existing, desired, cfg.Linear.States),
 		WasAwaitingFix:            awaitingFix,
-		FixAvailabilityScenario:   dueDateScenario("fix availability (today + severity SLA)", fixAvailabilityDueDate, fixAvailabilityBase, fixAvailabilityReason),
+		FixAvailabilityScenario:   dueDateScenario("fix availability (IgnoreEndedAt + severity SLA)", fixAvailabilityDueDate, fixAvailabilityBase, fixAvailabilityReason),
 		Scenarios:                 scenarios,
 		SnykHash:                  desiredIssueHash(desired),
 		LinearHash:                existingIssueHash(existing),
@@ -91,16 +86,23 @@ func issueDueDateFromCreatedAt(dueCfg config.DueDateConfig, finding model.Findin
 	if finding.CreatedAt.IsZero() {
 		return "", "", ""
 	}
-	createdAtUTC := finding.CreatedAt.UTC()
-	baseDate := time.Date(createdAtUTC.Year(), createdAtUTC.Month(), createdAtUTC.Day(), 0, 0, 0, 0, time.UTC)
-	return dueDateFromBase(baseDate, "issue creation", dueCfg, finding)
+	return dueDateFromBase(utcDate(finding.CreatedAt), "issue creation", dueCfg, finding)
 }
 
 func issueDueDateFromIgnoreExpiry(dueCfg config.DueDateConfig, finding model.Finding) (string, string, string) {
 	if finding.IgnoreExpiresAt.IsZero() {
 		return "", "", ""
 	}
-	expiresUTC := finding.IgnoreExpiresAt.UTC()
-	baseDate := time.Date(expiresUTC.Year(), expiresUTC.Month(), expiresUTC.Day(), 0, 0, 0, 0, time.UTC)
-	return dueDateFromBase(baseDate, "ignore expiry", dueCfg, finding)
+	return dueDateFromBase(utcDate(finding.IgnoreExpiresAt), "ignore expiry", dueCfg, finding)
+}
+
+// issueDueDateFromIgnoreEnd is the scenario for an ignore-until-fix-available
+// ignore that stopped applying: the SLA from the day the fix arrived (or the
+// ignore was revoked), as the ignore cache remembers it. Empty when the
+// finding carries no such end.
+func issueDueDateFromIgnoreEnd(dueCfg config.DueDateConfig, finding model.Finding) (string, string, string) {
+	if finding.IgnoreEndedAt.IsZero() {
+		return "", "", ""
+	}
+	return dueDateFromBase(utcDate(finding.IgnoreEndedAt), "fix availability", dueCfg, finding)
 }

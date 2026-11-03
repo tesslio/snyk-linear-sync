@@ -3982,6 +3982,10 @@ func TestRunAwaitingFixToOpenRecalculatesDueDateFromFixAvailability(t *testing.T
 		Severity:    "high",
 		Status:      model.FindingOpen,                                      // fix is now available
 		CreatedAt:   time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC), // months ago
+		// The ignore cache remembers the "until fix available" ignore and
+		// the day it stopped applying.
+		DisregardIfFixable: true,
+		IgnoreEndedAt:      time.Date(2026, time.March, 10, 9, 30, 0, 0, time.UTC),
 	}
 
 	snyk := fakeSnyk{
@@ -4021,13 +4025,12 @@ func TestRunAwaitingFixToOpenRecalculatesDueDateFromFixAvailability(t *testing.T
 	}
 	updated := linear.updated[0]
 
-	// Due date should be calculated from today + 30 days (high severity SLA),
-	// NOT from 2026-01-01 + 30 days (which would give 2026-01-31, a meaningless
-	// past date for an issue that was blocked for months).
-	expectedDueDate := time.Now().AddDate(0, 0, 30)
-	expectedStr := time.Date(expectedDueDate.Year(), expectedDueDate.Month(), expectedDueDate.Day(), 0, 0, 0, 0, time.UTC).Format(time.DateOnly)
-	if updated.DueDate != expectedStr {
-		t.Fatalf("updated due date = %q, want %q (SLA from fix availability, not from months-old created_at)", updated.DueDate, expectedStr)
+	// Due date should be calculated from the day the ignore ended + 30 days
+	// (high severity SLA), NOT from 2026-01-01 + 30 days (which would give
+	// 2026-01-31, a meaningless past date for an issue that was blocked for
+	// months).
+	if updated.DueDate != "2026-04-09" {
+		t.Fatalf("updated due date = %q, want 2026-04-09 (SLA from fix availability, not from months-old created_at)", updated.DueDate)
 	}
 
 	// The triage-dependency label should be removed.
@@ -4079,6 +4082,10 @@ func TestRunAwaitingFixToOpenKeepsManuallyChosenInProgress(t *testing.T) {
 		Severity:    "high",
 		Status:      model.FindingOpen,                                      // fix is now available
 		CreatedAt:   time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC), // months ago
+		// The ignore cache remembers the "until fix available" ignore and
+		// the day it stopped applying.
+		DisregardIfFixable: true,
+		IgnoreEndedAt:      time.Date(2026, time.March, 10, 9, 30, 0, 0, time.UTC),
 	}
 
 	snyk := fakeSnyk{
@@ -4228,6 +4235,10 @@ func TestRunAwaitingFixLabelOffMarkerMovesBacklogToTodo(t *testing.T) {
 		Severity:    "high",
 		Status:      model.FindingOpen,                                      // fix is now available
 		CreatedAt:   time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC), // months ago
+		// The ignore cache remembers the "until fix available" ignore and
+		// the day it stopped applying.
+		DisregardIfFixable: true,
+		IgnoreEndedAt:      time.Date(2026, time.March, 10, 9, 30, 0, 0, time.UTC),
 	}
 
 	snyk := fakeSnyk{
@@ -4288,10 +4299,8 @@ func TestRunAwaitingFixLabelOffMarkerMovesBacklogToTodo(t *testing.T) {
 
 	// Due date is recalculated from fix availability, not from the months-old
 	// created_at the SLA was originally based on.
-	expectedDueDate := time.Now().AddDate(0, 0, 30)
-	expectedStr := time.Date(expectedDueDate.Year(), expectedDueDate.Month(), expectedDueDate.Day(), 0, 0, 0, 0, time.UTC).Format(time.DateOnly)
-	if updated.DueDate != expectedStr {
-		t.Fatalf("updated due date = %q, want %q (SLA from fix availability)", updated.DueDate, expectedStr)
+	if updated.DueDate != "2026-04-09" {
+		t.Fatalf("updated due date = %q, want 2026-04-09 (SLA from fix availability)", updated.DueDate)
 	}
 
 	// The marker has served its purpose and must not outlive the

@@ -34,6 +34,13 @@ type IgnoreMeta struct {
 	// confirmation time is then unknown, and the next write stamps the row
 	// with the time of that write.
 	UpdatedAt time.Time
+	// UnignoredAt is set on an ignore-until-fix-available row the first run
+	// on which every REST issue it applies to reports ignored=false: the
+	// fix arrived (or the ignore was revoked) and the SLA clock starts. It
+	// is the base of the due date from then on, so it is kept. Zero while
+	// Snyk still reports the ignore, and for rows without the
+	// disregard-if-fixable flag.
+	UnignoredAt time.Time
 }
 
 type Snapshot struct {
@@ -252,6 +259,7 @@ func (s *Store) init(ctx context.Context) error {
 			disregard_if_fixable INTEGER NOT NULL DEFAULT 0,
 			created_at TEXT,
 			updated_at TEXT,
+			unignored_at TEXT,
 			PRIMARY KEY (project_id, issue_key)
 		)`,
 	}
@@ -289,7 +297,7 @@ func (s *Store) migrateSnykIgnoresCache(ctx context.Context) error {
 	}
 	defer rows.Close()
 
-	var hasUpdatedAt bool
+	columns := map[string]bool{}
 	for rows.Next() {
 		var cid, notNull, pk int
 		var name string
@@ -297,21 +305,25 @@ func (s *Store) migrateSnykIgnoresCache(ctx context.Context) error {
 		if err := rows.Scan(&cid, &name, &typ, &notNull, &dfltValue, &pk); err != nil {
 			return fmt.Errorf("scan table_info: %w", err)
 		}
-		if name == "updated_at" {
-			hasUpdatedAt = true
-			break
-		}
+		columns[name] = true
 	}
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("iterate table_info: %w", err)
 	}
 
-	if !hasUpdatedAt {
+	if !columns["updated_at"] {
 		if _, err := s.db.ExecContext(ctx, "ALTER TABLE snyk_ignores ADD COLUMN updated_at TEXT"); err != nil {
 			return fmt.Errorf("add updated_at column: %w", err)
 		}
 		if _, err := s.db.ExecContext(ctx, "UPDATE snyk_ignores SET updated_at = CURRENT_TIMESTAMP"); err != nil {
 			return fmt.Errorf("seed updated_at column: %w", err)
+		}
+	}
+	if !columns["unignored_at"] {
+		// Left empty for existing rows: the next run stamps the rows whose
+		// findings are already un-ignored.
+		if _, err := s.db.ExecContext(ctx, "ALTER TABLE snyk_ignores ADD COLUMN unignored_at TEXT"); err != nil {
+			return fmt.Errorf("add unignored_at column: %w", err)
 		}
 	}
 	return nil
@@ -349,7 +361,7 @@ func (s *Store) LoadIgnores(ctx context.Context, projectID string) (map[string]I
 	out := make(map[string]IgnoreMeta)
 
 	query, args, err := s.builder.
-		Select("issue_key", "expires_at", "disregard_if_fixable", "created_at", "updated_at").
+		Select("issue_key", "expires_at", "disregard_if_fixable", "created_at", "updated_at", "unignored_at").
 		From("snyk_ignores").
 		Where(sq.Eq{"project_id": projectID}).
 		ToSql()
@@ -366,8 +378,9 @@ func (s *Store) LoadIgnores(ctx context.Context, projectID string) (map[string]I
 	for rows.Next() {
 		var issueKey string
 		var expiresAtRaw, createdAtRaw, updatedAtRaw string
+		var unignoredAtRaw sql.NullString
 		var disregardIfFixable int
-		if err := rows.Scan(&issueKey, &expiresAtRaw, &disregardIfFixable, &createdAtRaw, &updatedAtRaw); err != nil {
+		if err := rows.Scan(&issueKey, &expiresAtRaw, &disregardIfFixable, &createdAtRaw, &updatedAtRaw, &unignoredAtRaw); err != nil {
 			return nil, fmt.Errorf("scan cache ignore row: %w", err)
 		}
 
@@ -377,6 +390,7 @@ func (s *Store) LoadIgnores(ctx context.Context, projectID string) (map[string]I
 			ExpiresAt:          parseTimestamp(expiresAtRaw),
 			CreatedAt:          parseTimestamp(createdAtRaw),
 			UpdatedAt:          parseTimestamp(updatedAtRaw),
+			UnignoredAt:        parseTimestamp(unignoredAtRaw.String),
 		}
 	}
 
@@ -424,6 +438,10 @@ func (s *Store) SaveIgnores(ctx context.Context, projectID string, ignores map[s
 		if !meta.UpdatedAt.IsZero() {
 			updatedAtRaw = meta.UpdatedAt.UTC().Format(time.RFC3339)
 		}
+		unignoredAtRaw := ""
+		if !meta.UnignoredAt.IsZero() {
+			unignoredAtRaw = meta.UnignoredAt.UTC().Format(time.RFC3339)
+		}
 		var disregard int64
 		if meta.DisregardIfFixable {
 			disregard = 1
@@ -431,8 +449,8 @@ func (s *Store) SaveIgnores(ctx context.Context, projectID string, ignores map[s
 
 		query, args, err = s.builder.
 			Insert("snyk_ignores").
-			Columns("project_id", "issue_key", "expires_at", "disregard_if_fixable", "created_at", "updated_at").
-			Values(projectID, issueKey, expiresAtRaw, disregard, createdAtRaw, updatedAtRaw).
+			Columns("project_id", "issue_key", "expires_at", "disregard_if_fixable", "created_at", "updated_at", "unignored_at").
+			Values(projectID, issueKey, expiresAtRaw, disregard, createdAtRaw, updatedAtRaw, unignoredAtRaw).
 			ToSql()
 		if err != nil {
 			return fmt.Errorf("build insert cache ignore row: %w", err)
