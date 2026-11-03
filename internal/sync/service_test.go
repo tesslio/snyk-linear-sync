@@ -4173,10 +4173,8 @@ func TestRunAwaitingFixToOpenKeepsManuallyChosenInProgress(t *testing.T) {
 // contract for tickets written before the awaiting_fix marker existed: a
 // Backlog ticket whose metadata block carries neither the awaiting-fix label
 // (the label is off) nor the marker cannot be told apart from a manual Backlog
-// move, so the sync leaves it in Backlog. No one-time mass update fires on
-// upgrade; a legacy ticket only becomes eligible for the automatic move after
-// the sync rewrites its description (any later awaiting-fix run adds the
-// marker).
+// move, so the sync leaves it in Backlog. A legacy ticket becomes eligible
+// for the automatic move after an awaiting-fix run backfills the marker.
 func TestRunAwaitingFixLabelOffLeavesBacklogAlone(t *testing.T) {
 	cfg := minimalCfg()
 	cfg.Linear.States.Backlog = "Backlog"
@@ -5484,6 +5482,69 @@ func TestRunIdentityBackfillHappensOnce(t *testing.T) {
 	}
 	if len(linear2.updates) != 0 {
 		t.Fatalf("run 2: updates = %d, want 0 (backfill must happen exactly once)", len(linear2.updates))
+	}
+}
+
+// Legacy awaiting-fix tickets receive the marker once, including when their
+// old cache hashes match. The metadata-only backfill does not post a comment.
+func TestRunAwaitingFixMarkerBackfillHappensOnce(t *testing.T) {
+	for _, label := range []string{"", "triage-dependency"} {
+		for _, useCache := range []bool{false, true} {
+			t.Run(fmt.Sprintf("label=%q/cache=%t", label, useCache), func(t *testing.T) {
+				cfg := minimalCfg()
+				cfg.Linear.Labels.AwaitingFix = label
+				finding := recreatedProjectFinding("project-a", "issue-a")
+				finding.Status = model.FindingAwaitingFix
+				desired := desiredIssue(cfg, finding)
+				legacy := desired
+				// A prior matched Backlog run preserves the existing state too;
+				// only the missing marker should invalidate its cached hash.
+				legacy.PreserveState = true
+				legacy.Description = strings.Replace(desired.Description, "awaiting_fix: yes\n", "", 1)
+				existing := storedIssue("existing-1", "SNYK-100", "Backlog", legacy)
+				if existing.AwaitingFix || existing.Description == desired.Description {
+					t.Fatal("fixture must lack the awaiting-fix marker")
+				}
+				snyk := fakeSnyk{snapshot: model.SnykSnapshot{
+					Findings: []model.Finding{finding}, ProjectIDs: map[string]struct{}{"project-a": {}},
+				}}
+				var store *fakeCache
+				var state CacheStore
+				if useCache {
+					store = &fakeCache{snapshot: cache.Snapshot{
+						SchemaSignature: managedSchemaSignature(),
+						SnykHashes:      map[string]string{finding.Fingerprint: desiredIssueHash(legacy)},
+						LinearHashes:    map[string]string{finding.Fingerprint: existingIssueHash(existing)},
+					}}
+					state = store
+				}
+				linear1 := &fakeLinear{snapshot: []model.ExistingIssue{existing}}
+				if _, err := New(cfg, discardLogger(), snyk, linear1, state).Run(context.Background()); err != nil {
+					t.Fatalf("run 1: %v", err)
+				}
+				if len(linear1.updates) != 1 {
+					t.Fatalf("run 1: updates = %d, want one marker backfill", len(linear1.updates))
+				}
+				update := linear1.updates[0]
+				if !update.Diff.DescriptionChanged || !update.Diff.MetadataOnlyDescriptionChange || len(linear1.comments) != 0 {
+					t.Fatalf("run 1: diff = %+v comments = %d, want metadata-only without comment", update.Diff, len(linear1.comments))
+				}
+				written := storedIssue("existing-1", "SNYK-100", "Backlog", update.Desired)
+				if !written.AwaitingFix {
+					t.Fatal("run 1 did not write the awaiting-fix marker")
+				}
+				if store != nil {
+					store.snapshot = store.saved
+				}
+				linear2 := &fakeLinear{snapshot: []model.ExistingIssue{written}}
+				if _, err := New(cfg, discardLogger(), snyk, linear2, state).Run(context.Background()); err != nil {
+					t.Fatalf("run 2: %v", err)
+				}
+				if len(linear2.updates) != 0 {
+					t.Fatalf("run 2: updates = %d, want no repeated backfill", len(linear2.updates))
+				}
+			})
+		}
 	}
 }
 

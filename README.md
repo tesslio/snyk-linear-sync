@@ -262,7 +262,9 @@ When an issue is in the awaiting-fix state, the sync:
 - writes an `awaiting_fix: yes` marker into the metadata block
 - removes the awaiting-fix label and clears the marker when a fix becomes available and the issue moves to `Todo`
 
-The `awaiting_fix` marker is written regardless of the label configuration, so even with `LINEAR_AWAITING_FIX_LABEL=off` a later run can tell a `Backlog` placement the sync made itself from one a person made by hand: when the fix arrives, the ticket still moves back to `Todo`. Tickets written before the marker existed carry no `awaiting_fix` line; they keep the old behavior (they stay in `Backlog` once the fix arrives) until the sync rewrites their description in a later awaiting-fix run — no one-time mass update happens on upgrade. Keep the label enabled (the default) to make these tickets filterable. The marker and label only drive the state move; the due date of a ticket whose fix arrived comes from the sync's ignore memory (see [Due Dates](#due-dates)), label or no label.
+The `awaiting_fix` marker records awaiting-fix history regardless of the label configuration, so the transition back to `Todo` also works with `LINEAR_AWAITING_FIX_LABEL=off`. Legacy tickets with the configured awaiting-fix label recorded in their managed labels are recognized without a marker. A ticket lacking both signals stays in `Backlog` when the fix arrives, unless an earlier awaiting-fix run first adds the marker.
+
+The first upgraded run backfills the marker on matched, non-archived tickets that are still awaiting a fix, even if nothing else changed. This is a one-time metadata-only update, without a change comment; subsequent unchanged runs do not repeat it. Keep the label enabled (the default) to make these tickets filterable. The marker and label only drive the state move; the due date of a ticket whose fix arrived comes from the sync's ignore memory (see [Due Dates](#due-dates)), label or no label.
 
 When tool, origin, or awaiting-fix label mapping is enabled, the sync manages the global automation label plus the derived label set recorded in the metadata block.
 
@@ -400,7 +402,7 @@ A ticket whose project is still active is never taken (two live projects scannin
 
 If a user manually moves a managed open ticket from `Todo` to `Backlog` in Linear, subsequent syncs will preserve the `Backlog` state instead of overriding it back to `Todo`. This prevents the automation from fighting intentional user triage decisions. The override applies when the existing Linear issue state matches the configured `LINEAR_STATE_BACKLOG` value.
 
-The override does not apply to a ticket the sync itself parked in `Backlog` for an "ignored until fix available" finding — that placement is the sync's own, not a manual move. When a fix becomes available Snyk flips `ignored=false` and the next run moves the ticket to `Todo` with a recalculated due date and a change comment explaining the move. Only the `Backlog` state the sync chose is overridden: a person who moved the awaiting-fix ticket to some other non-terminal state (for example `In Progress`) still has that choice preserved by the general override below.
+A `Backlog` ticket recognized as previously awaiting a fix moves to `Todo` when Snyk reports `ignored=false`, with a recalculated due date and a change comment explaining the move. The marker or recorded configured label provides that history. These signals do not establish who selected `Backlog`, so a manual `Backlog` placement made before or during the awaiting-fix period can also move to `Todo` when the fix arrives. Distinguishing those placements requires additional ownership tracking. Other manually chosen non-terminal states, such as `In Progress`, remain preserved.
 
 ### Manual Non-Terminal State Override
 
