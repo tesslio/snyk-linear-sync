@@ -24,8 +24,8 @@ github.com/tesslio/snyk-linear-sync
 - Cancels managed Linear issues when their Snyk project no longer exists, such as after project deletion.
 - Rebinds a ticket to its finding when Snyk recreates the project under a new project ID (see [Project Recreation](#project-recreation)), instead of cancelling it and creating a copy.
 - Reopens a ticket that was closed while Snyk kept reporting the exact same occurrence as open, instead of creating a duplicate (see [Reopen Guard](#reopen-guard)).
-- Uses a local SQLite cache to skip unchanged findings and unchanged Linear issues on steady-state runs.
-- Sets Linear due dates from Snyk issue creation time using configurable per-severity offsets.
+- Uses a local SQLite cache to skip unchanged findings and unchanged Linear issues on steady-state runs, and as its memory of Snyk ignores that Snyk has since stopped reporting (see [Cache Behavior](#cache-behavior)).
+- Sets Linear due dates from Snyk issue creation time using configurable per-severity offsets, or from the ignore expiry or the day an ignore until fix available ended (see [Due Dates](#due-dates)).
 
 The fingerprint format is:
 
@@ -82,6 +82,12 @@ Bypass cache:
 
 ```bash
 go run ./cmd/snyk-linear-sync --env-file .env --bypass-cache
+```
+
+Release due dates held back by the ignore-cache cold-start guard (see [Cache Behavior](#cache-behavior)):
+
+```bash
+go run ./cmd/snyk-linear-sync --env-file .env --clear-ignores-cold-start
 ```
 
 `--env-file` uses `github.com/joho/godotenv`, so the file can be a normal dotenv file and does not need to be sourced by your shell.
@@ -256,7 +262,7 @@ When an issue is in the awaiting-fix state, the sync:
 - writes an `awaiting_fix: yes` marker into the metadata block
 - removes the awaiting-fix label and clears the marker when a fix becomes available and the issue moves to `Todo`
 
-The `awaiting_fix` marker is written regardless of the label configuration, so even with `LINEAR_AWAITING_FIX_LABEL=off` a later run can tell a `Backlog` placement the sync made itself from one a person made by hand: when the fix arrives, the ticket still moves back to `Todo` with a recalculated due date. Tickets written before the marker existed carry no `awaiting_fix` line; they keep the old behavior (they stay in `Backlog` once the fix arrives) until the sync rewrites their description in a later awaiting-fix run — no one-time mass update happens on upgrade. Keep the label enabled (the default) to make these tickets filterable.
+The `awaiting_fix` marker is written regardless of the label configuration, so even with `LINEAR_AWAITING_FIX_LABEL=off` a later run can tell a `Backlog` placement the sync made itself from one a person made by hand: when the fix arrives, the ticket still moves back to `Todo`. Tickets written before the marker existed carry no `awaiting_fix` line; they keep the old behavior (they stay in `Backlog` once the fix arrives) until the sync rewrites their description in a later awaiting-fix run — no one-time mass update happens on upgrade. Keep the label enabled (the default) to make these tickets filterable. The marker and label only drive the state move; the due date of a ticket whose fix arrived comes from the sync's ignore memory (see [Due Dates](#due-dates)), label or no label.
 
 When tool, origin, or awaiting-fix label mapping is enabled, the sync manages the global automation label plus the derived label set recorded in the metadata block.
 
@@ -365,7 +371,7 @@ The configured Linear state names are resolved by name first, then by workflow t
 
 These distinctions are intentional:
 
-- Issues ignored "until fix is available" are placed in `Backlog` with no due date because the team cannot act on them until an upstream fix ships. The `triage-dependency` label (configurable via `LINEAR_AWAITING_FIX_LABEL`) makes them filterable. When a fix becomes available, Snyk flips `ignored=false` and the next run moves the issue to `Todo` with a due date.
+- Issues ignored "until fix is available" are placed in `Backlog` with no due date because the team cannot act on them until an upstream fix ships. The `triage-dependency` label (configurable via `LINEAR_AWAITING_FIX_LABEL`) makes them filterable. When a fix becomes available, Snyk flips `ignored=false` and the next run moves the issue to `Todo` with a due date based on the day the ignore ended.
 - Temporarily ignored issues (those with a scheduled expiry) are kept open in `Todo` rather than cancelled, because they require attention once the ignore expires. This applies only while the finding still exists in Snyk: a finding Snyk reports as resolved is treated as `Done` regardless of any ignore (active, expired, or "until fix available") still attached to it, so a vulnerability that no longer exists never lingers as an open or overdue ticket.
 - If a Snyk issue disappears but the project still exists and is active, the tool treats that as the issue being resolved and moves the Linear ticket to `Done`.
 - If the Snyk project itself is gone or has been de-activated (inactive), the tool treats the managed Linear ticket as no longer actionable and moves it to `Cancelled`. A ticket that was already closed keeps its state: a `Done` ticket stays `Done`, because the project going away says nothing about how the finding was closed.
@@ -411,9 +417,11 @@ Default due date offsets:
 - medium -> 45 days
 - low -> 90 days
 
-The base date is normally the Snyk issue `created_at` timestamp. For temporarily ignored issues, the base date is the ignore expiry date, so the due date extends to the normal severity SLA calculated from when the ignore expires.
+The base date is normally the Snyk issue `created_at` timestamp. For temporarily ignored issues, the base date is the ignore expiry date, so the due date extends to the normal severity SLA calculated from when the ignore expires. That stays true after the ignore has lapsed, and after Snyk's v1 ignores endpoint has stopped returning the expired record: the sync remembers the expiry in its cache (see [Cache Behavior](#cache-behavior)), so the due date does not regress to `created_at` + SLA.
 
-Issues ignored "until fix is available" have no due date. The SLA clock is paused while the issue is blocked on an upstream fix. When a fix becomes available, Snyk flips `ignored=false` and the next run recalculates the due date from fix availability (today + severity offset), moving the issue to `Todo`.
+Issues ignored "until fix is available" have no due date. The SLA clock is paused while the issue is blocked on an upstream fix. When a fix becomes available, Snyk flips `ignored=false`; the sync records the day it first sees that, and the due date is that day + severity offset from then on, so it is the same on every later run. An ignore of this kind that reaches its own expiry with no fix is dated from the expiry, like any expired snooze, and the change comment names the ignore expiry rather than fix availability. A revoked ignore until fix available is dated like a fix arrival.
+
+All bases are UTC calendar dates, whatever the host's time zone.
 
 ## Cache Behavior
 
@@ -422,6 +430,7 @@ The cache lives in SQLite and stores:
 - a schema signature for the managed issue format
 - a normalized hash for each Snyk finding
 - a normalized hash for each managed Linear issue
+- the sync's memory of Snyk v1 ignores, per project and issue key
 
 On a normal run:
 
@@ -431,7 +440,27 @@ On a normal run:
 4. Apply creates, updates, and resolves for the rest.
 5. Refresh the cache from the live post-write Linear snapshot.
 
-Use `--bypass-cache` to ignore the cache for a run and rebuild it from live data.
+Use `--bypass-cache` to ignore the hashes for a run and rebuild them from live data. It does not touch the ignore memory.
+
+### Ignore memory
+
+Snyk's v1 ignores endpoint stops returning an expired ignore after a while, but the expiry stays the base of the ticket's due date. The sync therefore remembers each ignore it has seen (expiry, the until-fix-available flag, when the v1 API last confirmed it, and when an until-fix-available ignore stopped applying) and keeps a row until Snyk contradicts it, judged at the end of each Snyk load against the REST issues:
+
+- an ignore the v1 API still returns is refreshed as before (latest entry wins, a permanent ignore drops the expiry, the expiry only moves forward);
+- an ignore the API no longer returns is kept while Snyk still reports a finding it applies to as ignored, while its expiry has passed, while it is an until-fix-available ignore, or while no open un-ignored finding matches it;
+- an active snooze whose finding Snyk reports open and not ignored is kept for seven days (partial v1 responses happen) and then dropped as revoked, with a log line.
+
+A v1 request that fails or 404s after its retries falls back to the cached rows and never drops one. Rows written by older versions are kept too.
+
+### Cold-start guard
+
+A run that starts with an empty ignore memory (a new or lost cache file) while Linear already holds open tickets with due dates cannot tell an earlier due date that is a real change from one that only reflects an expiry it no longer remembers. Such a run keeps the current due date of any matched open ticket whose desired date is earlier, logs a warning with the count (`held_due_dates` in the summary), and leaves an `ignores_cold_start_at` marker in the cache so later runs keep holding too. Later due dates still apply. Once the ignore memory is trusted again, release the held dates with:
+
+```bash
+go run ./cmd/snyk-linear-sync --env-file .env --clear-ignores-cold-start
+```
+
+Deleting the `ignores_cold_start_at` row from the cache's `sync_meta` table has the same effect. A fresh deployment with no open dated tickets never engages the guard.
 
 ## Configuration
 
@@ -446,6 +475,9 @@ Required:
 Optional:
 
 - `--env-file`
+- `--dry-run`
+- `--bypass-cache`
+- `--clear-ignores-cold-start`
 - `SNYK_REGION`
 - `SNYK_OAUTH_SCOPES`
 - `SOURCE_PROVIDER`
@@ -478,7 +510,7 @@ See [.env.example](/workspace/.env.example).
 ## Logs
 
 - Console logs show startup, load progress, work progress, cache refresh, and final summary.
-- The final `sync complete` line reports `findings`, `existing_issues`, `active_projects`, `inactive_projects`, `cluster_lookup_failures`, `conflicts`, `rebound`, `reopened`, `deferred_creates`, `planned_creates`, `planned_updates`, `planned_resolves`, `cancelled_duplicates`, and `failed_ops`. Each rebind is also logged individually with the old and new project ID and the Linear identifier.
+- The final `sync complete` line reports `findings`, `existing_issues`, `active_projects`, `inactive_projects`, `cluster_lookup_failures`, `conflicts`, `rebound`, `reopened`, `deferred_creates`, `held_due_dates`, `planned_creates`, `planned_updates`, `planned_resolves`, `cancelled_duplicates`, and `failed_ops`. Each rebind is also logged individually with the old and new project ID and the Linear identifier. A dropped cached ignore and an engaged cold-start guard are logged too.
 - Error logs are appended to `ERROR_LOG_FILE`.
 - Default error log path: `logs/snyk-linear-sync-errors.log`
 
