@@ -53,6 +53,17 @@ type fakeLinear struct {
 	lastOpenStates      map[string]model.WorkflowState
 	lastOpenStatesErr   error
 	lastOpenStatesCalls [][]string
+
+	// updateFailIssueIDs, when non-empty, fails every UpdateIssues call whose
+	// batch carries one of these issue IDs — the multi-item batch call and
+	// that issue's single-item retry alike — while every other item succeeds.
+	// It mirrors a live-label-read refusal, which follows the issue rather
+	// than the call: each retry re-reads that issue's labels and refuses
+	// again.
+	updateFailIssueIDs map[string]bool
+	// updateCallBatches records the batch passed to each UpdateIssues call, in
+	// order, so a test can prove the per-item fallback actually happened.
+	updateCallBatches [][]model.IssueUpdate
 }
 
 type fakeCache struct {
@@ -79,6 +90,12 @@ func (f *fakeLinear) CreateIssues(_ context.Context, desired []model.DesiredIssu
 }
 
 func (f *fakeLinear) UpdateIssues(_ context.Context, updates []model.IssueUpdate) error {
+	f.updateCallBatches = append(f.updateCallBatches, append([]model.IssueUpdate(nil), updates...))
+	for _, update := range updates {
+		if f.updateFailIssueIDs[update.Existing.ID] {
+			return fmt.Errorf("refusing to update Linear issue %s: its current labels could not be read, so labels the sync does not own cannot be preserved", update.Existing.Identifier)
+		}
+	}
 	for _, update := range updates {
 		f.updated = append(f.updated, update.Desired)
 		f.updates = append(f.updates, update)
@@ -5972,5 +5989,56 @@ func TestRunCachesHashOfMatchedTicketForDuplicateFingerprint(t *testing.T) {
 	}
 	if got, want := store.saved.LinearHashes[finding.Fingerprint], existingIssueHash(canonical); got != want {
 		t.Fatalf("cached Linear hash is not the matched ticket's: got %s, want %s (older copy %s)", got, want, existingIssueHash(olderCopy))
+	}
+}
+
+// TestExecuteJobCountsOneRefusedIssueWithoutBlockingTheBatch covers the refusal
+// the linear client reports when an issue's live labels cannot be read —
+// including when the label page is truncated: the multi-item batch call fails,
+// and the per-item fallback retries every item, where the refused issue fails
+// again while its batch-mates land. The refused issue counts once in
+// FailedOps; the rest of the batch is not blocked.
+func TestExecuteJobCountsOneRefusedIssueWithoutBlockingTheBatch(t *testing.T) {
+	cfg := minimalCfg()
+	batch := make([]model.IssueUpdate, 0, 3)
+	for _, ident := range []string{"SNYK-1", "SNYK-2", "SNYK-3"} {
+		existing := model.ExistingIssue{
+			ID:          "issue-" + ident,
+			Identifier:  ident,
+			StateName:   "Backlog",
+			Fingerprint: "snyk:project-a:" + ident,
+		}
+		desired := model.DesiredIssue{Fingerprint: existing.Fingerprint, State: model.StateDone, PreserveState: true}
+		batch = append(batch, model.IssueUpdate{Existing: existing, Desired: desired})
+	}
+	linear := &fakeLinear{updateFailIssueIDs: map[string]bool{"issue-SNYK-2": true}}
+	service := New(cfg, discardLogger(), fakeSnyk{}, linear, nil)
+	var result RunResult
+	if err := service.executeJob(context.Background(), job{kind: jobUpdate, updateBatch: batch}, &result); err != nil {
+		t.Fatalf("executeJob(jobUpdate) error = %v", err)
+	}
+
+	if result.FailedOps != 1 {
+		t.Fatalf("FailedOps = %d, want 1 (only the refused issue counts)", result.FailedOps)
+	}
+	if len(linear.updateCallBatches) != 4 {
+		t.Fatalf("UpdateIssues calls = %d, want 4 (one batch plus three per-item retries)", len(linear.updateCallBatches))
+	}
+	if got := len(linear.updateCallBatches[0]); got != 3 {
+		t.Fatalf("first UpdateIssues call carried %d updates, want the whole batch of 3", got)
+	}
+	for i, call := range linear.updateCallBatches[1:] {
+		if len(call) != 1 {
+			t.Fatalf("per-item retry %d carried %d updates, want 1", i, len(call))
+		}
+	}
+	// The refused issue is absent from the landed writes; its batch-mates are
+	// not blocked by it.
+	var landedIdentifiers []string
+	for _, u := range linear.updates {
+		landedIdentifiers = append(landedIdentifiers, u.Existing.Identifier)
+	}
+	if !slices.Equal(landedIdentifiers, []string{"SNYK-1", "SNYK-3"}) {
+		t.Fatalf("landed updates = %v, want SNYK-1 and SNYK-3 (SNYK-2 is refused, the rest not blocked)", landedIdentifiers)
 	}
 }
