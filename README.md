@@ -211,6 +211,15 @@ The subject portion then uses this preference:
 - set to another label name to use that label instead
 - set to `off` to disable label management
 
+`off` turns off the whole managed label set, not just the global label: the
+derived awaiting-fix, tool and origin labels are not applied either (their
+defaults and any explicit mapping are ignored), no label is recorded in the
+metadata block, and no managed label is looked up in Linear — so a workspace
+without `snyk-automation` or `triage-dependency` does not fail the run.
+`LINEAR_CREATE_ONLY_LABELS` is a separate set, not part of label management:
+its labels are still resolved and stamped on create, so they must still exist
+in Linear.
+
 When label management is enabled, the sync:
 
 - adds the configured label to newly created managed issues
@@ -255,7 +264,7 @@ When an issue is in the awaiting-fix state, the sync:
 - renders `Status: ignored (no fix available)` in the description
 - removes the awaiting-fix label when a fix becomes available and the issue moves to `Todo`
 
-When tool, origin, or awaiting-fix label mapping is enabled, the sync manages the global automation label plus the derived label set recorded in the metadata block.
+When label management is enabled and tool, origin, or awaiting-fix label mapping is configured, the sync manages the global automation label plus the derived label set recorded in the metadata block.
 
 ### Label ownership
 
