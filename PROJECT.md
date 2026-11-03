@@ -263,13 +263,17 @@ The sync also normalizes workflow naming differences such as `Canceled` vs `Canc
 
 Resolution takes precedence over ignore state: if Snyk reports a finding as resolved (status `resolved`/`fixed`, resolution `fixed`, or all coordinates resolved), it maps to `Done` even when the finding still carries an ignore. The ignore branches (`until fix available`, `temporarily ignored`, `permanently ignored`) apply only to findings that still exist in Snyk. Without this precedence, a resolved finding that still has an active or expired ignore would map to a non-terminal state and resurface as a permanently-open, birth-overdue ticket for a vulnerability that no longer exists.
 
-The `ignored until fix available` state is distinct from other ignored states because the ignore is conditional on an upstream fix. These issues are placed in `Backlog` with no due date and the `triage-dependency` label (configurable via `LINEAR_AWAITING_FIX_LABEL`). The description renders `Status: ignored (no fix available)` so the Snyk-side reality is visible in Linear. When a fix becomes available, Snyk flips `ignored=false` and the next run moves the issue to `Todo` with a recalculated due date.
+The `ignored until fix available` state is distinct from other ignored states because the ignore is conditional on an upstream fix. These issues are placed in `Backlog` with no due date and the `triage-dependency` label (configurable via `LINEAR_AWAITING_FIX_LABEL`). The description renders `Status: ignored (no fix available)` so the Snyk-side reality is visible in Linear. When a fix becomes available, Snyk flips `ignored=false` and the next run moves the issue to `Todo` with a due date based on the day the ignore ended (see Due Dates).
 
 ### Manual Backlog Override
 
 When a user manually moves a managed open ticket from `Todo` to `Backlog` in Linear, subsequent syncs preserve the `Backlog` state instead of overriding it back to `Todo`. This prevents the automation from fighting intentional user triage decisions. The override matches the configured `LINEAR_STATE_BACKLOG` value with case-insensitive normalization.
 
-The override does not apply to a ticket the sync itself parked in `Backlog` for an `ignored until fix available` finding: that placement is the sync's own, not a manual move. When the fix becomes available Snyk flips `ignored=false`, the next run moves the ticket to `Todo` with a recalculated due date, and the change comment says why. Only the `Backlog` state the sync chose is overridden this way — if a person moved the awaiting-fix ticket to some other non-terminal state (for example `In Progress`), the general manual non-terminal state override below still preserves their choice. The detection reads the `awaiting_fix` marker in the metadata block, which the sync writes regardless of the label configuration, so it works with `LINEAR_AWAITING_FIX_LABEL=off` too. Tickets written before the marker existed carry neither marker nor label and keep the old behavior: the sync cannot tell its own `Backlog` placement from a manual one, and the ticket stays in `Backlog` when the fix arrives, until the sync rewrites its description in a later awaiting-fix run.
+A ticket in `Backlog` that was previously awaiting a fix moves to `Todo` when Snyk reports `ignored=false`, with a recalculated due date and a change comment explaining the move. The detection reads the `awaiting_fix` marker in the metadata block or, for legacy tickets, the configured awaiting-fix label recorded in the managed labels. The marker is written regardless of the label configuration, so the transition also works with `LINEAR_AWAITING_FIX_LABEL=off`.
+
+Legacy tickets with a usable configured label are recognized even without the marker. A ticket lacking both signals stays in `Backlog` when the fix arrives, unless an earlier awaiting-fix run first adds the marker. The first upgraded run backfills the marker on matched, non-archived tickets that are still awaiting a fix, even if nothing else changed. This is a one-time metadata-only update, without a change comment; subsequent unchanged runs do not repeat it.
+
+The marker and label record awaiting-fix history, not who selected `Backlog`. Consequently, a manual `Backlog` placement made before or during that awaiting-fix period can also move to `Todo` when the fix arrives. Other manually chosen non-terminal states, such as `In Progress`, remain preserved. Distinguishing manual and sync-owned `Backlog` placements requires additional ownership tracking.
 
 ### Manual Non-Terminal State Override
 
@@ -285,9 +289,11 @@ Terminal states (`Done`, `Cancelled`) are never preserved: the sync always trans
 
 ### Due Dates
 
-Due dates are normally derived from the Snyk issue creation timestamp, not from when the issue first appears in Linear. For temporarily ignored issues, the due date is instead calculated from the ignore expiry date so the SLA extends to the normal severity offset from when the ignore expires.
+Due dates are normally derived from the Snyk issue creation timestamp, not from when the issue first appears in Linear. For temporarily ignored issues, the due date is instead calculated from the ignore expiry date so the SLA extends to the normal severity offset from when the ignore expires. The expiry keeps being the base after the ignore has lapsed, including once Snyk itself no longer reports the ignore: the sync remembers it (see Ignore Memory under SQLite Cache).
 
-Issues ignored "until fix is available" have no due date. The SLA clock is paused while the issue is blocked on an upstream fix. When a fix becomes available, Snyk flips `ignored=false` and the next run recalculates the due date from fix availability (today + severity offset), moving the issue to `Todo`.
+Issues ignored "until fix is available" have no due date. The SLA clock is paused while the issue is blocked on an upstream fix. When a fix becomes available, Snyk flips `ignored=false`; the sync records the day it first saw that in its ignore memory, and from then on the due date is that day + severity offset ("fix availability"), so every run computes the same date. An ignore of this kind that reaches its own expiry with no fix is treated as an expired snooze: the expiry stays the base and the reason says so. A revoked ignore until fix available is dated the same way as a fix arrival, from the day the sync first saw it un-ignored.
+
+Every base is taken as a UTC calendar date, so the result does not depend on the host's time zone.
 
 Default offsets:
 
@@ -317,8 +323,9 @@ The SQLite cache stores:
 - Snyk-side normalized hashes keyed by fingerprint
 - Linear-side normalized hashes keyed by fingerprint
 - a schema signature for the managed issue format
+- the sync's memory of Snyk v1 ignores, per project and issue key (below)
 
-The cache is used only as an optimization. It should never be the only source used to infer real current state.
+The hashes are used only as an optimization and are never the only source used to infer real current state. The ignore memory is the one exception, by necessity: it holds what Snyk reported and has since stopped reporting.
 
 Normal behavior:
 
@@ -329,6 +336,28 @@ Normal behavior:
 5. After successful writes, refresh the cache from the live post-write Linear snapshot. When several tickets share a fingerprint, the cached Linear hash is that of the ticket the finding was matched to, so the next run's comparison against the same ticket can hit.
 
 The post-write refresh matters because Linear may rewrite markdown bodies after mutation.
+
+### Ignore Memory
+
+The Snyk v1 ignores endpoint stops returning an expired ignore after an undocumented period, while the expiry is the base of the ticket's due date for good. The `snyk_ignores` table remembers, per project and issue key, the expiry, the disregard-if-fixable flag, when the v1 API last confirmed the ignore (`updated_at`), and when an ignore until fix available stopped applying (`unignored_at`). Nothing is aged out on read. Snyk stays authoritative: which rows survive a run is decided once every REST issue of the project has been seen, so a row is only forgotten when Snyk contradicts it.
+
+Per project and key, at the end of the Snyk snapshot load:
+
+- a key the v1 API returned this run is stored as the summary of the union of API and cached entries (the latest created entry decides, a permanent ignore zeroes the expiry, the expiry is a high-water mark) and its confirmation time is refreshed;
+- a key the API did not return is kept while any REST issue it can apply to still reports `ignored=true` (Snyk asserts the ignore; this wins over an un-ignored sibling under a rule key), while its expiry has passed (it is the due-date base), while it is an ignore until fix available (its end is the due-date base), and while no open un-ignored REST issue matches it (resolved or disappeared: the row is inert);
+- an active snooze (expiry ahead) whose finding Snyk reports open and not ignored is kept for seven days of grace against partial v1 responses, then dropped and logged: Snyk revoked it.
+
+A failed or 404ing v1 fetch falls back to the cached rows and never ages one into a drop. A row written before `updated_at` existed, or whose value cannot be parsed, is kept with an unknown confirmation time; its grace clock starts on the next write.
+
+The `unignored_at` stamp is set on a disregard-if-fixable row the first run on which every REST issue carrying the ignore reports `ignored=false`, kept from then on, and cleared while the issue is ignored again. Findings carry it as `IgnoreEndedAt`. A newer ignore creation resets a direct key's old end even if its whole lifecycle occurred between snapshots; the next observation is the known end, not a claimed actual lift time.
+
+The `observed_issues` column also preserves the effective metadata and first observed end per REST finding seen ignored under a key. Historical rule-key lookup requires that evidence, because v1 rule keys can include path-scoped ignores and never-ignored siblings must keep their own SLA. A newer rule ignore for a sibling does not replace an already actionable finding's observed metadata. Superseding or revoking a newer rule ignore preserves older expired-snooze or until-fix observations belonging to other findings. Cached-only rule metadata cannot establish a new finding association, and a newer direct-key ignore prevents attributing an older rule ignore to that finding. Legacy rule rows have no recoverable per-finding scope. For an open, unignored occurrence, ignore metadata predating a known resolution of every coordinate is excluded so issue-ID reuse does not carry an old ignore deadline forward.
+
+When a configured ignore-memory store cannot be read or written, snapshot loading fails before any Linear reconciliation. Newly observed ignore ends must be persisted before they can become SLA bases; a retry reuses only durable history rather than publishing a date that would be forgotten after a failed write.
+
+### Cold-Start Guard
+
+With an empty ignore memory, the sync cannot tell an earlier due date that is a real change from one that merely reflects an expiry it no longer knows about. A run that starts with no cached ignore rows while the Linear snapshot holds managed open tickets with due dates therefore engages a guard: for a matched open ticket whose desired due date is earlier than its current one, the current date is kept this run (the reason says why) and the run warns with the count, reported as `held_due_dates`. Later dates still apply. Before loading can populate the cache, `ignores_memory_state` in `sync_meta` records a pending empty start. Both sync and diagnostic Snyk loads preserve this evidence across failures or interruptions, even when rows were already committed. After a successful pair of snapshots, an open dated ticket promotes that pending state to the `ignores_cold_start_at` guard; otherwise memory is marked trusted and no guard is engaged. The guard holds until `--clear-ignores-cold-start` records trusted memory and removes the marker. Trust persists even when the table stays empty, including on subsequent normal runs. Deleting only the guard key does not release pending memory; use the flag.
 
 ## Safety Assumptions
 
@@ -367,6 +396,12 @@ Use cache bypass when you intentionally changed the managed rendering or need a 
 
 ```bash
 go run ./cmd/snyk-linear-sync --env-file .env --bypass-cache
+```
+
+Cache bypass does not touch the ignore memory. After a run has warned that the ignore cache was cold, release the held due dates once the cache is trusted (for example after the ignores have been re-seeded from Snyk and checked):
+
+```bash
+go run ./cmd/snyk-linear-sync --env-file .env --clear-ignores-cold-start
 ```
 
 ## Design Boundaries

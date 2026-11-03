@@ -1,6 +1,7 @@
 package sync
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -82,12 +83,15 @@ func TestDiagnoseDueDateDetectsFixAvailabilityOverride(t *testing.T) {
 		},
 	}
 	finding := model.Finding{
-		Fingerprint: "snyk:project-a:issue-1",
-		SnykIssueID: "issue-1",
-		ProjectName: "Project A",
-		Severity:    "high",
-		Status:      model.FindingOpen,
-		CreatedAt:   time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC),
+		Fingerprint:        "snyk:project-a:issue-1",
+		SnykIssueID:        "issue-1",
+		ProjectName:        "Project A",
+		Severity:           "high",
+		Status:             model.FindingOpen,
+		CreatedAt:          time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC),
+		DisregardIfFixable: true,
+		// The ignore cache remembers when the fix arrived.
+		IgnoreEndedAt: time.Date(2026, time.March, 10, 9, 0, 0, 0, time.UTC),
 	}
 	existing := model.ExistingIssue{
 		ID:            "existing-1",
@@ -105,13 +109,24 @@ func TestDiagnoseDueDateDetectsFixAvailabilityOverride(t *testing.T) {
 	if !diag.WasAwaitingFix {
 		t.Fatal("WasAwaitingFix = false, want true")
 	}
-	if diag.Desired.DueDate == "" {
-		t.Fatalf("desired due date is empty, want fix-availability based date")
+	if diag.Desired.DueDate != "2026-04-09" {
+		t.Fatalf("desired due date = %q, want 2026-04-09 (30 days from the day the ignore ended)", diag.Desired.DueDate)
 	}
-	if diag.FixAvailabilityScenario.DueDate == "" {
-		t.Fatalf("fix availability scenario due date is empty")
+	if diag.FixAvailabilityScenario.DueDate != diag.Desired.DueDate {
+		t.Fatalf("fix availability scenario %q != desired due date %q", diag.FixAvailabilityScenario.DueDate, diag.Desired.DueDate)
 	}
-	if diag.Desired.DueDate != diag.FixAvailabilityScenario.DueDate {
-		t.Fatalf("desired due date %q != fix availability scenario %q", diag.Desired.DueDate, diag.FixAvailabilityScenario.DueDate)
+	if !strings.Contains(diag.Desired.DueDateReason, "fix availability") {
+		t.Fatalf("due date reason = %q, want it to name fix availability", diag.Desired.DueDateReason)
+	}
+
+	// Without a remembered end the fix-availability scenario does not exist
+	// and the due date falls back to the issue's creation.
+	finding.IgnoreEndedAt = time.Time{}
+	diag = DiagnoseDueDate(cfg, finding, existing)
+	if diag.FixAvailabilityScenario.DueDate != "" {
+		t.Fatalf("fix availability scenario = %q, want empty without IgnoreEndedAt", diag.FixAvailabilityScenario.DueDate)
+	}
+	if diag.Desired.DueDate != "2026-01-31" {
+		t.Fatalf("desired due date = %q, want 2026-01-31 (issue creation + 30 days)", diag.Desired.DueDate)
 	}
 }

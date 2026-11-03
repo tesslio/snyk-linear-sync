@@ -69,6 +69,7 @@ func run(cfg config.Config, logger *slog.Logger) error {
 		slog.Int64("rebound", result.Rebound),
 		slog.Int64("reopened", result.Reopened),
 		slog.Int64("deferred_creates", result.DeferredCreates),
+		slog.Int64("held_due_dates", result.HeldDueDates),
 		slog.Int64("planned_creates", result.PlannedCreates),
 		slog.Int64("planned_updates", result.PlannedUpdates),
 		slog.Int64("planned_resolves", result.PlannedResolves),

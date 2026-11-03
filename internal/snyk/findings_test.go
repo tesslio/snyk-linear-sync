@@ -873,7 +873,7 @@ func TestFetchProjectIgnoresRetriesAndUsesMaxExpiry(t *testing.T) {
 		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 
-	ignores, err := c.fetchProjectIgnores(context.Background(), "test-project")
+	state, err := c.fetchProjectIgnores(context.Background(), "test-project")
 	if err != nil {
 		t.Fatalf("fetchProjectIgnores() error = %v", err)
 	}
@@ -881,7 +881,7 @@ func TestFetchProjectIgnoresRetriesAndUsesMaxExpiry(t *testing.T) {
 		t.Fatalf("requestCount = %d, want 3", requestCount)
 	}
 
-	entries, ok := ignores["SNYK-1"]
+	entries, ok := state.merged["SNYK-1"]
 	if !ok {
 		t.Fatal("ignores missing SNYK-1")
 	}
@@ -931,7 +931,7 @@ func TestFetchProjectIgnoresRetriesOn404(t *testing.T) {
 		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 
-	ignores, err := c.fetchProjectIgnores(context.Background(), "test-project")
+	state, err := c.fetchProjectIgnores(context.Background(), "test-project")
 	if err != nil {
 		t.Fatalf("fetchProjectIgnores() error = %v", err)
 	}
@@ -939,7 +939,7 @@ func TestFetchProjectIgnoresRetriesOn404(t *testing.T) {
 		t.Fatalf("requestCount = %d, want 3 (404 on attempt 1 must be retried, not accepted immediately)", requestCount)
 	}
 
-	meta := maxExpiryIgnoreMeta(ignores["SNYK-1"])
+	meta := maxExpiryIgnoreMeta(state.merged["SNYK-1"])
 	if meta.ExpiresAt.Format(time.RFC3339) != "2026-06-17T23:00:00Z" {
 		t.Fatalf("expires = %q, want 2026-06-17T23:00:00Z (data from the retries after the 404 must survive)", meta.ExpiresAt.Format(time.RFC3339))
 	}
@@ -978,7 +978,7 @@ func TestFetchProjectIgnoresLater404KeepsEarlierAttemptsData(t *testing.T) {
 		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 
-	ignores, err := c.fetchProjectIgnores(context.Background(), "test-project")
+	state, err := c.fetchProjectIgnores(context.Background(), "test-project")
 	if err != nil {
 		t.Fatalf("fetchProjectIgnores() error = %v", err)
 	}
@@ -986,7 +986,7 @@ func TestFetchProjectIgnoresLater404KeepsEarlierAttemptsData(t *testing.T) {
 		t.Fatalf("requestCount = %d, want 3", requestCount)
 	}
 
-	meta := maxExpiryIgnoreMeta(ignores["SNYK-1"])
+	meta := maxExpiryIgnoreMeta(state.merged["SNYK-1"])
 	if meta.ExpiresAt.Format(time.RFC3339) != "2026-06-17T23:00:00Z" {
 		t.Fatalf("expires = %q, want 2026-06-17T23:00:00Z (a later 404 must not erase an earlier attempt's data)", meta.ExpiresAt.Format(time.RFC3339))
 	}
@@ -1016,23 +1016,27 @@ func TestFetchProjectIgnoresPersistent404IsNonFatal(t *testing.T) {
 		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 
-	ignores, err := c.fetchProjectIgnores(context.Background(), "test-project")
+	state, err := c.fetchProjectIgnores(context.Background(), "test-project")
 	if err != nil {
 		t.Fatalf("fetchProjectIgnores() error = %v, want nil (persistent 404 is non-fatal)", err)
 	}
 	if requestCount != 3 {
 		t.Fatalf("requestCount = %d, want 3 (404 must be retried like any other failure)", requestCount)
 	}
-	if len(ignores) != 0 {
-		t.Fatalf("ignores = %+v, want empty", ignores)
+	if len(state.merged) != 0 {
+		t.Fatalf("ignores = %+v, want empty", state.merged)
+	}
+	if !state.apiUnavailable {
+		t.Fatal("apiUnavailable = false, want true (a persistent 404 says nothing about the ignores)")
 	}
 }
 
 // TestFetchProjectIgnoresPreservesUpdatedAtForUnconfirmedKeys is the
-// findings.go-level integration test for Fix 2: an issue key that is present
-// in the cache but NOT reported by the API this run must keep its original
-// cached updated_at (so it eventually ages out past ignoreEntryTTL), while a
-// key the API does confirm this run gets its updated_at refreshed.
+// findings.go-level integration test for the confirmation time: an issue key
+// that is present in the cache but NOT reported by the API this run must keep
+// its original cached updated_at (so the grace in projectIgnores.revoked is
+// measured from the last real confirmation), while a key the API does confirm
+// this run gets its updated_at refreshed.
 func TestFetchProjectIgnoresPreservesUpdatedAtForUnconfirmedKeys(t *testing.T) {
 	dir := t.TempDir()
 	store, err := cache.Open(filepath.Join(dir, "cache.db"))
@@ -1091,8 +1095,12 @@ func TestFetchProjectIgnoresPreservesUpdatedAtForUnconfirmedKeys(t *testing.T) {
 		cache:      store,
 	}
 
-	if _, err := c.fetchProjectIgnores(ctx, projectID); err != nil {
+	state, err := c.fetchProjectIgnores(ctx, projectID)
+	if err != nil {
 		t.Fatalf("fetchProjectIgnores() error = %v", err)
+	}
+	if err := c.commitProjectIgnores(ctx, projectID, state, c.clock()); err != nil {
+		t.Fatalf("commitProjectIgnores() error = %v", err)
 	}
 
 	loaded, err := store.LoadIgnores(ctx, projectID)
@@ -1105,7 +1113,7 @@ func TestFetchProjectIgnoresPreservesUpdatedAtForUnconfirmedKeys(t *testing.T) {
 		t.Fatal("SNYK-STALE missing after round trip")
 	}
 	if !stale.UpdatedAt.Equal(staleUpdatedAt) {
-		t.Fatalf("SNYK-STALE UpdatedAt = %v, want unchanged %v (not confirmed by API this run, so TTL clock must keep ticking)", stale.UpdatedAt, staleUpdatedAt)
+		t.Fatalf("SNYK-STALE UpdatedAt = %v, want unchanged %v (not confirmed by API this run, so the grace clock must keep ticking)", stale.UpdatedAt, staleUpdatedAt)
 	}
 
 	confirmed, ok := loaded["SNYK-CONFIRMED"]
@@ -1244,9 +1252,18 @@ func TestMergeIgnoresPreferAPIOnCreatedTie(t *testing.T) {
 		t.Fatalf("ExpiresAt = %v, want zero (API's permanent ignore wins the Created tie)", meta.ExpiresAt)
 	}
 
-	// The same cache-write-back path (v1IgnoresToCache) must also see the
+	// The cache write-back path (projectIgnores.retain) must also see the
 	// clean, zeroed result rather than the stale conflated expiry.
-	cacheOut := v1IgnoresToCache(merged, map[string]struct{}{"SNYK-1": {}}, nil)
+	state := &projectIgnores{
+		api:          api,
+		apiConfirmed: map[string]struct{}{"SNYK-1": {}},
+		merged:       merged,
+		matches:      map[string]*ignoreKeyMatches{},
+	}
+	cacheOut, dropped := state.retain(time.Date(2026, time.July, 2, 0, 0, 0, 0, time.UTC))
+	if len(dropped) != 0 {
+		t.Fatalf("dropped = %v, want none (a confirmed key is never dropped)", dropped)
+	}
 	if got, ok := cacheOut["SNYK-1"]; ok && !got.ExpiresAt.IsZero() {
 		t.Fatalf("cached ExpiresAt = %v, want zero or absent", got.ExpiresAt)
 	}

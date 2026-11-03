@@ -75,6 +75,25 @@ func TestLoadDefaultsAndValidation(t *testing.T) {
 	if cfg.Cache.BypassCache {
 		t.Fatal("BypassCache = true, want false")
 	}
+	if cfg.Cache.ClearIgnoresColdStart {
+		t.Fatal("ClearIgnoresColdStart = true, want false")
+	}
+}
+
+func TestLoadClearIgnoresColdStartFlag(t *testing.T) {
+	t.Setenv("SNYK_CLIENT_ID", "client-id")
+	t.Setenv("SNYK_CLIENT_SECRET", "client-secret")
+	t.Setenv("SNYK_ORG_ID", "org-1")
+	t.Setenv("LINEAR_API_KEY", "linear-key")
+	t.Setenv("LINEAR_TEAM_ID", "team-1")
+
+	cfg, err := Load([]string{"--clear-ignores-cold-start"})
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if !cfg.Cache.ClearIgnoresColdStart {
+		t.Fatal("ClearIgnoresColdStart = false, want true")
+	}
 }
 
 func TestLoadRequiresCredentials(t *testing.T) {

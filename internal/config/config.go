@@ -63,6 +63,10 @@ type LogConfig struct {
 type CacheConfig struct {
 	DBFile      string
 	BypassCache bool
+	// ClearIgnoresColdStart removes the marker the cold-start guard leaves
+	// in the cache when it finds the ignore cache empty while Linear holds
+	// open tickets with due dates, releasing the due dates it held back.
+	ClearIgnoresColdStart bool
 }
 
 type SnykConfig struct {
@@ -137,6 +141,7 @@ func Load(args []string) (Config, error) {
 
 	dryRun := fs.Bool("dry-run", false, "plan changes without mutating Linear")
 	bypassCache := fs.Bool("bypass-cache", false, "ignore the SQLite sync cache and fetch/compare everything directly")
+	clearIgnoresColdStart := fs.Bool("clear-ignores-cold-start", false, "clear the ignore-cache cold-start marker so held-back earlier due dates are written again")
 	envFile := fs.String("env-file", "", "load configuration from a dotenv-style file before reading the process environment")
 
 	if err := fs.Parse(args); err != nil {
@@ -164,8 +169,9 @@ func Load(args []string) (Config, error) {
 			ErrorFile: getEnv("ERROR_LOG_FILE", defaultErrorLogFile),
 		},
 		Cache: CacheConfig{
-			DBFile:      getEnv("CACHE_DB_FILE", defaultCacheDBFile),
-			BypassCache: *bypassCache,
+			DBFile:                getEnv("CACHE_DB_FILE", defaultCacheDBFile),
+			BypassCache:           *bypassCache,
+			ClearIgnoresColdStart: *clearIgnoresColdStart,
 		},
 		Snyk: SnykConfig{
 			Region:       getEnv("SNYK_REGION", defaultSnykRegion),
