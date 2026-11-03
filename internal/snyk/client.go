@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	snyksdk "github.com/pavel-snyk/snyk-sdk-go/v2/snyk"
 	"golang.org/x/oauth2"
@@ -29,6 +30,9 @@ type Client struct {
 	sdk        *snyksdk.Client
 	logger     *slog.Logger
 	cache      *cache.Store
+	// now, when set, replaces time.Now for the retention decisions on cached
+	// ignores, so tests can simulate the passage of days.
+	now func() time.Time
 }
 
 func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Client, error) {

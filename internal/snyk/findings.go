@@ -3,6 +3,7 @@ package snyk
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -224,6 +225,19 @@ func (e *v1IgnoreEntry) UnmarshalJSON(data []byte) error {
 // the project type; values are arrays of ignore entries.
 type v1ProjectIgnores map[string][]v1IgnoreEntry
 
+// unconfirmedIgnoreGrace is how long an active snooze (expiry still ahead)
+// that the v1 ignores API stopped returning is kept while the REST API
+// reports its finding as open and not ignored, before the sync concludes the
+// ignore was revoked and forgets it. It covers partial v1 responses. It never
+// applies to a lapsed snooze (expiry behind): Snyk forgets expired ignores
+// after a while, and the cached expiry is then the only record of the date
+// the due date is based on. See projectIgnores.revoked for the full rule.
+const unconfirmedIgnoreGrace = 7 * 24 * time.Hour
+
+// errIgnoresNotFound reports that every attempt to read a project's v1
+// ignores ended in 404, so the API said nothing about the project this run.
+var errIgnoresNotFound = errors.New("v1 ignores endpoint returned 404 after all retries")
+
 func (c *Client) LoadSnapshot(ctx context.Context) (model.SnykSnapshot, error) {
 	orgSlug, err := c.orgSlug(ctx)
 	if err != nil {
@@ -247,31 +261,26 @@ func (c *Client) LoadSnapshot(ctx context.Context) (model.SnykSnapshot, error) {
 		}
 	}
 
-	findings := make([]model.Finding, 0, len(projects))
-	// Cache v1 ignores per project ID to avoid redundant API calls when the
-	// same project spans multiple pages of issues. Keying the per-finding
-	// lookup off this project-scoped map (rather than a global issueKey map)
-	// also removes the cross-project collision risk where the same
-	// vulnerability key in two projects with different expiries overwrote each
-	// other.
+	// v1 ignores are fetched once per project ID that appears in the issues
+	// pages. Keying the per-finding lookup off this project-scoped map (rather
+	// than a global issueKey map) removes the cross-project collision where
+	// the same vulnerability key in two projects with different expiries
+	// overwrote each other.
 	//
 	// We fetch v1 ignore metadata for all projects that appear in the issues
 	// pages, not just those with currently-ignored issues. This ensures we
 	// preserve the snooze expiry for due date calculation even after a timed
-	// ignore expires (the REST API flips ignored=false but the v1 record
-	// persists), and also captures disregardIfFixable for "ignore until fix
-	// available" ignores.
-	v1IgnoresCache := make(map[string]v1ProjectIgnores)
-
-	// k8sClusterCache holds the cluster name for kubernetes-origin projects,
-	// fetched lazily from the v1 project detail endpoint (the REST project
-	// resource does not expose it). In-memory only: one GET per kubernetes
-	// project per run, mirroring the v1IgnoresCache pattern. A failed fetch
-	// is recorded in k8sClusterFailed so we don't retry a broken project for
-	// every finding, and so its findings are marked cluster-unknown rather
-	// than "no cluster".
-	k8sClusterCache := make(map[string]string)
-	k8sClusterFailed := make(map[string]struct{})
+	// ignore expires (the REST API flips ignored=false while the v1 record
+	// persists for a while), and also captures disregardIfFixable for "ignore
+	// until fix available" ignores.
+	//
+	// The issues are collected before any finding is built: which cached
+	// ignore rows to keep depends on what every REST issue of the project
+	// says (see projectIgnores.retain), and the findings must be built from
+	// the rows that survive that decision, so a row dropped this run does not
+	// feed one last due date.
+	ignoresByProject := make(map[string]*projectIgnores)
+	var issues []issueResource
 
 	nextCursor := ""
 	for {
@@ -280,129 +289,147 @@ func (c *Client) LoadSnapshot(ctx context.Context) (model.SnykSnapshot, error) {
 			return model.SnykSnapshot{}, err
 		}
 
-		// Collect all project IDs that appear in this page so we can fetch
-		// v1 ignore metadata (expiration dates and disregardIfFixable).
-		projectIDsInPage := make(map[string]struct{})
-		for _, issue := range page {
-			projectID := issue.Relationships.ScanItem.Data.ID
-			if projectID != "" {
-				projectIDsInPage[projectID] = struct{}{}
-			}
-		}
-
-		for projectID := range projectIDsInPage {
-			ignores, ok := v1IgnoresCache[projectID]
-			if !ok {
-				var err error
-				ignores, err = c.fetchProjectIgnores(ctx, projectID)
-				if err != nil {
-					return model.SnykSnapshot{}, fmt.Errorf("fetch v1 ignores for project %s: %w", projectID, err)
-				}
-				v1IgnoresCache[projectID] = ignores
-			}
-		}
-
 		for _, issue := range page {
 			projectID := issue.Relationships.ScanItem.Data.ID
 			if projectID == "" {
 				continue
 			}
-			if issue.Relationships.ScanItem.Data.Type != "" && issue.Relationships.ScanItem.Data.Type != "project" {
+			if _, ok := ignoresByProject[projectID]; ok {
 				continue
 			}
-			if _, inactive := inactiveProjectIDs[projectID]; inactive {
-				continue
-			}
-
-			project := projectDetails[projectID]
-			issueKey := coalesce(issue.Attributes.Key, firstProblemID(issue.Attributes.Problems), issue.ID)
-			// The Snyk UI URL fragment needs a SNYK-* key or issue UUID, not a
-			// CVE ID. When issue.Attributes.Key is empty, firstProblemID may
-			// return a CVE identifier (e.g. "CVE-2025-7783") which doesn't
-			// resolve in the Snyk UI. Prefer issue.ID (always a UUID) for the
-			// URL in that case.
-			urlKey := issue.Attributes.Key
-			if strings.TrimSpace(urlKey) == "" {
-				urlKey = issue.ID
-			}
-			createdAt, err := parseIssueCreatedAt(issue.Attributes.CreatedAt)
+			state, err := c.fetchProjectIgnores(ctx, projectID)
 			if err != nil {
-				return model.SnykSnapshot{}, fmt.Errorf("parse Snyk issue created_at for %s: %w", issue.ID, err)
+				return model.SnykSnapshot{}, fmt.Errorf("fetch v1 ignores for project %s: %w", projectID, err)
 			}
-			updatedAt := parseIssueTimestamp(issue.Attributes.UpdatedAt)
-
-			// Snyk files a finding's ignore records under different top-level
-			// keys depending on project type: the issue-key hash, the issue
-			// UUID, or (for config/IaC findings) the Snyk rule ID. A single
-			// finding can have records under more than one of these at once —
-			// e.g. a stale, expired temporary-ignore under its issue-key hash
-			// alongside a *permanent* wont-fix filed under its rule ID. Snyk's
-			// issue.Ignored flag already reflects all of them; the v1 records
-			// only tell us whether that ignore is a timed snooze or permanent.
-			// So we summarise the union of every candidate record (rule keys
-			// gated on issue.Ignored — see ignoreEntriesForIssue), not just the
-			// first that matches — otherwise the expired snooze masks the
-			// permanent ignore and mapStatus treats a permanently-ignored
-			// finding as open, minting a fresh birth-overdue ticket every run.
-			//
-			// Pass issue.Attributes.Key rather than the coalesced issueKey:
-			// when Attributes.Key is empty, issueKey falls back to
-			// firstProblemID, and feeding that in unconditionally would smuggle
-			// a rule/problem key past the issue.Ignored gate. Ignored findings
-			// lose nothing — the problems loop inside ignoreEntriesForIssue
-			// already covers every problem ID, and issue.ID is always added.
-			ignoreEntries := ignoreEntriesForIssue(v1IgnoresCache[projectID], issue.Attributes.Key, issue.ID, issue.Attributes.Problems, issue.Attributes.Ignored)
-			ignoreMeta := maxExpiryIgnoreMeta(ignoreEntries)
-			ok := len(ignoreEntries) > 0
-			// If the issue is ignored but we found no v1 ignore metadata, the
-			// key format didn't match either fallback. Log a warning so
-			// operators can detect key-format mismatches; without metadata we
-			// can't distinguish a temporary snooze from a permanent ignore, so
-			// the issue would be treated as permanently ignored (Cancelled).
-			if issue.Attributes.Ignored && !ok {
-				c.logger.Warn("ignored issue has no v1 ignore metadata; treating as permanent ignore",
-					slog.String("issue_id", issue.ID),
-					slog.String("issue_key", issueKey),
-					slog.String("project_id", projectID),
-				)
-			}
-
-			cluster := ""
-			clusterUnknown := false
-			if project.Origin == "kubernetes" {
-				var ok bool
-				cluster, ok = k8sClusterCache[projectID]
-				if !ok {
-					cluster, err = c.fetchProjectClusterWithRetry(ctx, projectID, clusterLookupAttempts)
-					if err != nil {
-						// Cluster is ticket enrichment, not sync-critical: log
-						// and continue rather than failing the whole run. The
-						// findings are marked cluster-unknown, which is not the
-						// same as "Snyk reports no cluster": the sync then
-						// writes no identity for them this run and keeps the
-						// cluster and identity a matched ticket already has.
-						c.logger.Warn("could not fetch kubernetes cluster for project; cluster treated as unknown this run",
-							slog.String("project_id", projectID),
-							slog.String("error", err.Error()),
-						)
-						cluster = ""
-						k8sClusterFailed[projectID] = struct{}{}
-					}
-					k8sClusterCache[projectID] = cluster
-				}
-				_, clusterUnknown = k8sClusterFailed[projectID]
-			}
-
-			finding := c.findingFromIssue(issue, projectID, project, cluster, orgSlug, issueKey, urlKey, createdAt, updatedAt, ignoreMeta)
-			finding.ProjectClusterUnknown = clusterUnknown
-
-			findings = append(findings, finding)
+			ignoresByProject[projectID] = state
 		}
+		issues = append(issues, page...)
 
 		if cursor == "" {
 			break
 		}
 		nextCursor = cursor
+	}
+
+	for _, issue := range issues {
+		projectID := issue.Relationships.ScanItem.Data.ID
+		if !isProjectIssue(issue) {
+			continue
+		}
+		if _, inactive := inactiveProjectIDs[projectID]; inactive {
+			continue
+		}
+		ignoresByProject[projectID].recordIssue(issue)
+	}
+
+	now := c.clock()
+	for projectID, state := range ignoresByProject {
+		c.commitProjectIgnores(ctx, projectID, state, now)
+	}
+
+	// k8sClusterCache holds the cluster name for kubernetes-origin projects,
+	// fetched lazily from the v1 project detail endpoint (the REST project
+	// resource does not expose it). In-memory only: one GET per kubernetes
+	// project per run. A failed fetch is recorded in k8sClusterFailed so we
+	// don't retry a broken project for every finding, and so its findings are
+	// marked cluster-unknown rather than "no cluster".
+	k8sClusterCache := make(map[string]string)
+	k8sClusterFailed := make(map[string]struct{})
+
+	findings := make([]model.Finding, 0, len(issues))
+	for _, issue := range issues {
+		projectID := issue.Relationships.ScanItem.Data.ID
+		if !isProjectIssue(issue) {
+			continue
+		}
+		if _, inactive := inactiveProjectIDs[projectID]; inactive {
+			continue
+		}
+
+		project := projectDetails[projectID]
+		issueKey := coalesce(issue.Attributes.Key, firstProblemID(issue.Attributes.Problems), issue.ID)
+		// The Snyk UI URL fragment needs a SNYK-* key or issue UUID, not a
+		// CVE ID. When issue.Attributes.Key is empty, firstProblemID may
+		// return a CVE identifier (e.g. "CVE-2025-7783") which doesn't
+		// resolve in the Snyk UI. Prefer issue.ID (always a UUID) for the
+		// URL in that case.
+		urlKey := issue.Attributes.Key
+		if strings.TrimSpace(urlKey) == "" {
+			urlKey = issue.ID
+		}
+		createdAt, err := parseIssueCreatedAt(issue.Attributes.CreatedAt)
+		if err != nil {
+			return model.SnykSnapshot{}, fmt.Errorf("parse Snyk issue created_at for %s: %w", issue.ID, err)
+		}
+		updatedAt := parseIssueTimestamp(issue.Attributes.UpdatedAt)
+
+		// Snyk files a finding's ignore records under different top-level
+		// keys depending on project type: the issue-key hash, the issue
+		// UUID, or (for config/IaC findings) the Snyk rule ID. A single
+		// finding can have records under more than one of these at once —
+		// e.g. a stale, expired temporary-ignore under its issue-key hash
+		// alongside a *permanent* wont-fix filed under its rule ID. Snyk's
+		// issue.Ignored flag already reflects all of them; the v1 records
+		// only tell us whether that ignore is a timed snooze or permanent.
+		// So we summarise the union of every candidate record (rule keys
+		// gated on issue.Ignored — see ignoreEntriesForIssue), not just the
+		// first that matches — otherwise the expired snooze masks the
+		// permanent ignore and mapStatus treats a permanently-ignored
+		// finding as open, minting a fresh birth-overdue ticket every run.
+		//
+		// Pass issue.Attributes.Key rather than the coalesced issueKey:
+		// when Attributes.Key is empty, issueKey falls back to
+		// firstProblemID, and feeding that in unconditionally would smuggle
+		// a rule/problem key past the issue.Ignored gate. Ignored findings
+		// lose nothing — the problems loop inside ignoreEntriesForIssue
+		// already covers every problem ID, and issue.ID is always added.
+		projectIgnoreState := ignoresByProject[projectID]
+		ignoreEntries := ignoreEntriesForIssue(projectIgnoreState.merged, issue.Attributes.Key, issue.ID, issue.Attributes.Problems, issue.Attributes.Ignored)
+		ignoreMeta := maxExpiryIgnoreMeta(ignoreEntries)
+		ok := len(ignoreEntries) > 0
+		// If the issue is ignored but we found no v1 ignore metadata, the
+		// key format didn't match either fallback. Log a warning so
+		// operators can detect key-format mismatches; without metadata we
+		// can't distinguish a temporary snooze from a permanent ignore, so
+		// the issue would be treated as permanently ignored (Cancelled).
+		if issue.Attributes.Ignored && !ok {
+			c.logger.Warn("ignored issue has no v1 ignore metadata; treating as permanent ignore",
+				slog.String("issue_id", issue.ID),
+				slog.String("issue_key", issueKey),
+				slog.String("project_id", projectID),
+			)
+		}
+
+		cluster := ""
+		clusterUnknown := false
+		if project.Origin == "kubernetes" {
+			var ok bool
+			cluster, ok = k8sClusterCache[projectID]
+			if !ok {
+				cluster, err = c.fetchProjectClusterWithRetry(ctx, projectID, clusterLookupAttempts)
+				if err != nil {
+					// Cluster is ticket enrichment, not sync-critical: log
+					// and continue rather than failing the whole run. The
+					// findings are marked cluster-unknown, which is not the
+					// same as "Snyk reports no cluster": the sync then
+					// writes no identity for them this run and keeps the
+					// cluster and identity a matched ticket already has.
+					c.logger.Warn("could not fetch kubernetes cluster for project; cluster treated as unknown this run",
+						slog.String("project_id", projectID),
+						slog.String("error", err.Error()),
+					)
+					cluster = ""
+					k8sClusterFailed[projectID] = struct{}{}
+				}
+				k8sClusterCache[projectID] = cluster
+			}
+			_, clusterUnknown = k8sClusterFailed[projectID]
+		}
+
+		finding := c.findingFromIssue(issue, projectID, project, cluster, orgSlug, issueKey, urlKey, createdAt, updatedAt, ignoreMeta)
+		finding.ProjectClusterUnknown = clusterUnknown
+
+		findings = append(findings, finding)
 	}
 
 	return model.SnykSnapshot{
@@ -411,6 +438,25 @@ func (c *Client) LoadSnapshot(ctx context.Context) (model.SnykSnapshot, error) {
 		InactiveProjectIDs:    inactiveProjectIDs,
 		ClusterLookupFailures: len(k8sClusterFailed),
 	}, nil
+}
+
+// isProjectIssue reports whether a REST issue belongs to a project: it names
+// one, and its scan item is a project (or of unstated type).
+func isProjectIssue(issue issueResource) bool {
+	if issue.Relationships.ScanItem.Data.ID == "" {
+		return false
+	}
+	scanType := issue.Relationships.ScanItem.Data.Type
+	return scanType == "" || scanType == "project"
+}
+
+// clock returns the current UTC time, from the injected clock when a test
+// set one.
+func (c *Client) clock() time.Time {
+	if c.now != nil {
+		return c.now().UTC()
+	}
+	return time.Now().UTC()
 }
 
 func (c *Client) ListFindings(ctx context.Context) ([]model.Finding, error) {
@@ -488,14 +534,184 @@ func (c *Client) findingFromIssue(
 	}
 }
 
-func (c *Client) fetchProjectIgnores(ctx context.Context, projectID string) (v1ProjectIgnores, error) {
+// projectIgnores is what one run knows about a project's v1 ignores: the
+// entries the API reported, the rows the cache remembered, and what the REST
+// issues of the project say about each ignore key. The retention decision at
+// the end of the snapshot load (retain) reads all three.
+type projectIgnores struct {
+	// api is what the v1 endpoint reported this run (nil when it could not
+	// be read); apiConfirmed is its key set.
+	api          v1ProjectIgnores
+	apiConfirmed map[string]struct{}
+	// cached is the rows the cache held at the start of the run.
+	cached map[string]cache.IgnoreMeta
+	// apiUnavailable is set when the v1 endpoint could not be read this run
+	// (every attempt failed or 404ed). The cached rows then stand in for the
+	// API, and none of them may be dropped for lack of confirmation: silence
+	// from a failed request says nothing about the ignore.
+	apiUnavailable bool
+	// merged is the union of api and cached, reconstructed as v1 entries.
+	// Until retain runs it holds every cached row; afterwards only the
+	// retained ones, and findings are built from it.
+	merged v1ProjectIgnores
+	// matches records, per ignore key, what the REST issues of the project
+	// that could carry the ignore report. Filled by recordIssue.
+	matches map[string]*ignoreKeyMatches
+}
+
+// ignoreKeyMatches summarises the REST issues of a project matching one
+// ignore key. Every key an issue could be filed under (its issue key, its
+// ID, its problem IDs) counts, regardless of the issue.Ignored gate that
+// decides which entries a finding consumes: this is about what Snyk asserts
+// for the ignore, not about which finding the ignore applies to.
+type ignoreKeyMatches struct {
+	// ignored counts matching issues that report ignored=true: Snyk still
+	// asserts the ignore for them, whatever the v1 endpoint returns.
+	ignored int
+	// open is set when a matching issue reports ignored=false and is not
+	// resolved: the ignore no longer applies to it, by expiry or revocation.
+	open bool
+}
+
+// recordIssue notes what a REST issue of the project reports for each ignore
+// key it could be filed under. Only keys the run knows an ignore for are
+// recorded.
+func (p *projectIgnores) recordIssue(issue issueResource) {
+	resolved := issueResolved(issue.Attributes)
+	for _, key := range ignoreKeysForIssue(issue.Attributes.Key, issue.ID, issue.Attributes.Problems) {
+		if _, known := p.merged[key]; !known {
+			continue
+		}
+		m := p.matches[key]
+		if m == nil {
+			m = &ignoreKeyMatches{}
+			p.matches[key] = m
+		}
+		switch {
+		case issue.Attributes.Ignored:
+			m.ignored++
+		case !resolved:
+			m.open = true
+		}
+	}
+}
+
+// retain decides, per ignore key, which rows the cache keeps after this run
+// and returns them, with the keys it drops. Snyk is authoritative, and the
+// cache is only the sync's memory of what Snyk reported:
+//
+//   - A key the v1 API returned this run is stored as the summary of the
+//     union of API and cached entries (maxExpiryIgnoreMeta: the latest
+//     created entry decides, a permanent ignore zeroes the expiry, the
+//     expiry is a high-water mark) with its confirmation time refreshed.
+//   - A key the API did not return keeps its previous confirmation time and
+//     is kept, unless revoked says Snyk has contradicted it.
+//
+// As before, a summary with no expiry and no disregard-if-fixable flag (a
+// plain permanent ignore) is not stored: an absent row plus issue.Ignored
+// already maps to a permanent ignore, so there is nothing to remember.
+func (p *projectIgnores) retain(now time.Time) (rows map[string]cache.IgnoreMeta, dropped []string) {
+	rows = make(map[string]cache.IgnoreMeta, len(p.merged))
+	for key, entries := range p.merged {
+		meta := maxExpiryIgnoreMeta(entries)
+		if meta.ExpiresAt.IsZero() && !meta.DisregardIfFixable {
+			continue
+		}
+		row := cache.IgnoreMeta{
+			IssueKey:           key,
+			ExpiresAt:          meta.ExpiresAt,
+			DisregardIfFixable: meta.DisregardIfFixable,
+			CreatedAt:          meta.CreatedAt,
+		}
+		row.UpdatedAt = now
+		if _, confirmed := p.apiConfirmed[key]; !confirmed {
+			confirmedAt := p.cached[key].UpdatedAt
+			if p.revoked(key, meta, confirmedAt, now) {
+				dropped = append(dropped, key)
+				continue
+			}
+			// Not refreshed, so the grace is measured from the last real
+			// confirmation. A row of unknown confirmation time (written
+			// before the column existed, or unparsable) is stamped now, so
+			// its grace clock starts this run rather than never.
+			if !confirmedAt.IsZero() {
+				row.UpdatedAt = confirmedAt
+			}
+		}
+		rows[key] = row
+	}
+	return rows, dropped
+}
+
+// revoked reports whether an ignore the v1 API did not return this run
+// should be forgotten. It is forgotten only when Snyk contradicts it: the API
+// was readable, no matching REST issue still reports ignored=true (Snyk
+// asserting the ignore wins over an un-ignored sibling under a rule key), a
+// matching open issue reports ignored=false, the snooze has not lapsed (an
+// expiry that has passed is the base of the due date and is kept for good),
+// it is not an ignore-until-fix (its end is the base of the due date too),
+// and the grace since the last confirmation has run out. A row whose
+// confirmation time is unknown is kept; its clock starts this run.
+func (p *projectIgnores) revoked(key string, meta ignoreMetadata, confirmedAt, now time.Time) bool {
+	if p.apiUnavailable {
+		return false
+	}
+	m := p.matches[key]
+	if m == nil || m.ignored > 0 || !m.open {
+		return false
+	}
+	if meta.DisregardIfFixable {
+		return false
+	}
+	if meta.ExpiresAt.IsZero() || !meta.ExpiresAt.After(now) {
+		return false
+	}
+	if confirmedAt.IsZero() {
+		return false
+	}
+	return now.Sub(confirmedAt) >= unconfirmedIgnoreGrace
+}
+
+// finalize rebuilds merged from the API entries and the retained rows, so
+// findings see exactly what the cache will remember.
+func (p *projectIgnores) finalize(rows map[string]cache.IgnoreMeta) {
+	p.merged = mergeIgnores(p.api, cacheIgnoresToV1(rows))
+}
+
+// commitProjectIgnores applies the retention decision for one project: it
+// logs the dropped keys, writes the retained rows to the cache, and narrows
+// the entries findings are built from to those rows.
+func (c *Client) commitProjectIgnores(ctx context.Context, projectID string, state *projectIgnores, now time.Time) {
+	rows, dropped := state.retain(now)
+	for _, key := range dropped {
+		c.logger.Info("dropping cached ignore the v1 API stopped returning: its finding is open and not ignored while the snooze has not expired, so Snyk revoked it",
+			slog.String("project_id", projectID),
+			slog.String("issue_key", key),
+			slog.Time("expires_at", state.cached[key].ExpiresAt),
+			slog.Time("last_confirmed_at", state.cached[key].UpdatedAt),
+		)
+	}
+	if c.cache != nil {
+		if err := c.cache.SaveIgnores(ctx, projectID, rows); err != nil {
+			c.logger.Warn("failed to cache v1 ignores",
+				"project_id", projectID,
+				"error", err,
+			)
+		}
+	}
+	state.finalize(rows)
+}
+
+// fetchProjectIgnores reads a project's v1 ignores and merges them with the
+// cached rows. It does not write the cache: which rows survive is decided
+// once every REST issue of the project has been seen (commitProjectIgnores).
+func (c *Client) fetchProjectIgnores(ctx context.Context, projectID string) (*projectIgnores, error) {
+	state := &projectIgnores{
+		apiConfirmed: make(map[string]struct{}),
+		cached:       make(map[string]cache.IgnoreMeta),
+		matches:      make(map[string]*ignoreKeyMatches),
+	}
 	var cached v1ProjectIgnores
-	// previousUpdatedAt records each cached issue key's existing updated_at
-	// so that, later, keys the live API doesn't confirm this run can keep
-	// their original updated_at when written back (see v1IgnoresToCache)
-	// instead of being refreshed to "now" every run, which would mean
-	// ignoreEntryTTL eviction never fires.
-	previousUpdatedAt := make(map[string]time.Time)
 	if c.cache != nil {
 		cachedMeta, err := c.cache.LoadIgnores(ctx, projectID)
 		if err != nil {
@@ -504,10 +720,8 @@ func (c *Client) fetchProjectIgnores(ctx context.Context, projectID string) (v1P
 				"error", err,
 			)
 		} else if len(cachedMeta) > 0 {
+			state.cached = cachedMeta
 			cached = cacheIgnoresToV1(cachedMeta)
-			for issueKey, meta := range cachedMeta {
-				previousUpdatedAt[issueKey] = meta.UpdatedAt
-			}
 		}
 	}
 
@@ -518,48 +732,41 @@ func (c *Client) fetchProjectIgnores(ctx context.Context, projectID string) (v1P
 	// mutable Linear state.
 	const maxAttempts = 3
 	apiIgnores, err := c.fetchProjectIgnoresWithRetry(ctx, projectID, maxAttempts)
-	if err != nil {
-		if len(cached) > 0 {
-			c.logger.Warn("v1 ignores API failed, falling back to cached ignores",
-				"project_id", projectID,
-				"error", err,
-			)
-			return cached, nil
+	switch {
+	case err == nil:
+		state.api = apiIgnores
+		for issueKey := range apiIgnores {
+			state.apiConfirmed[issueKey] = struct{}{}
 		}
+	case errors.Is(err, errIgnoresNotFound):
+		// Already warned by fetchProjectIgnoresWithRetry. Keep the existing
+		// non-fatal behavior: the cached rows (if any) stand in for the API.
+		state.apiUnavailable = true
+	case len(cached) > 0:
+		c.logger.Warn("v1 ignores API failed, falling back to cached ignores",
+			"project_id", projectID,
+			"error", err,
+		)
+		state.apiUnavailable = true
+	default:
 		return nil, err
 	}
 
-	merged := mergeIgnores(apiIgnores, cached)
+	state.merged = mergeIgnores(state.api, cached)
 
-	if c.cache != nil {
-		// apiConfirmed is the set of issue keys the live API actually
-		// reported this run. Everything else in merged survived solely via
-		// the cached side and must keep its previous updated_at on write-back.
-		apiConfirmed := make(map[string]struct{}, len(apiIgnores))
-		for issueKey := range apiIgnores {
-			apiConfirmed[issueKey] = struct{}{}
-		}
-		if err := c.cache.SaveIgnores(ctx, projectID, v1IgnoresToCache(merged, apiConfirmed, previousUpdatedAt)); err != nil {
-			c.logger.Warn("failed to cache v1 ignores",
-				"project_id", projectID,
-				"error", err,
-			)
-		}
-	}
-
-	if len(cached) == 0 && len(merged) > 0 {
+	if len(cached) == 0 && len(state.merged) > 0 {
 		c.logger.Info("seeded v1 ignores cache from API",
 			"project_id", projectID,
-			"count", len(merged),
+			"count", len(state.merged),
 		)
 	} else if len(cached) > 0 {
 		cachedMeta := maxExpiryIgnoreMeta(flattenIgnores(cached))
-		mergedMeta := maxExpiryIgnoreMeta(flattenIgnores(merged))
-		if len(merged) > len(cached) {
+		mergedMeta := maxExpiryIgnoreMeta(flattenIgnores(state.merged))
+		if len(state.merged) > len(cached) {
 			c.logger.Info("v1 ignores cache gained new keys from API",
 				"project_id", projectID,
 				"cached_count", len(cached),
-				"merged_count", len(merged),
+				"merged_count", len(state.merged),
 			)
 		}
 		if !mergedMeta.ExpiresAt.IsZero() && !mergedMeta.ExpiresAt.Equal(cachedMeta.ExpiresAt) {
@@ -571,7 +778,7 @@ func (c *Client) fetchProjectIgnores(ctx context.Context, projectID string) (v1P
 		}
 	}
 
-	return merged, nil
+	return state, nil
 }
 
 // v1ProjectDetail is the subset of the Snyk v1 API project resource
@@ -663,6 +870,10 @@ func flattenIgnores(ignores v1ProjectIgnores) []v1IgnoreEntry {
 	return out
 }
 
+// ignoresRetryBackoff is the delay before the first retry of the v1 ignores
+// request; it grows linearly per attempt. A variable so tests can shorten it.
+var ignoresRetryBackoff = time.Second
+
 func (c *Client) fetchProjectIgnoresWithRetry(ctx context.Context, projectID string, maxAttempts int) (v1ProjectIgnores, error) {
 	endpoint, err := c.v1Base.Parse(fmt.Sprintf("org/%s/project/%s/ignores", c.orgID, projectID))
 	if err != nil {
@@ -683,7 +894,7 @@ func (c *Client) fetchProjectIgnoresWithRetry(ctx context.Context, projectID str
 			select {
 			case <-ctx.Done():
 				return nil, ctx.Err()
-			case <-time.After(time.Duration(attempt) * time.Second):
+			case <-time.After(time.Duration(attempt) * ignoresRetryBackoff):
 			}
 		}
 
@@ -759,16 +970,18 @@ func (c *Client) fetchProjectIgnoresWithRetry(ctx context.Context, projectID str
 	if lastErr != nil {
 		if lastErrNotFound {
 			// Every attempt (or at least the last one) 404ed. Keep the
-			// existing non-fatal behavior: don't fail the run, just return
-			// whatever we accumulated (possibly empty) so the caller can
-			// fall back to/merge with the cache, and warn so operators can
-			// see that ignore metadata was unavailable from the API.
+			// existing non-fatal behavior: don't fail the run. Return
+			// whatever earlier attempts accumulated; when there is nothing,
+			// report errIgnoresNotFound so the caller falls back to the
+			// cache without treating the API's silence as a statement about
+			// the ignores. Warn so operators can see that ignore metadata
+			// was unavailable from the API.
 			c.logger.Warn("v1 ignores endpoint returned 404 after all retries; ignore metadata unavailable from the API this run",
 				"project_id", projectID,
 				"attempts", maxAttempts,
 			)
-			if apiIgnores == nil {
-				apiIgnores = v1ProjectIgnores{}
+			if len(apiIgnores) == 0 {
+				return nil, errIgnoresNotFound
 			}
 			return apiIgnores, nil
 		}
@@ -892,26 +1105,39 @@ func ignoreEntriesForIssue(projectIgnores v1ProjectIgnores, issueKey, issueID st
 	if len(projectIgnores) == 0 {
 		return nil
 	}
-	seenKey := make(map[string]struct{})
+	if !ignored {
+		problems = nil
+	}
 	var entries []v1IgnoreEntry
+	for _, key := range ignoreKeysForIssue(issueKey, issueID, problems) {
+		entries = append(entries, projectIgnores[key]...)
+	}
+	return entries
+}
+
+// ignoreKeysForIssue returns, deduplicated and without empties, every v1
+// ignore key a finding's records can be filed under: its issue key, its
+// issue ID, and its problem IDs. Callers that must respect the issue.Ignored
+// gate on rule keys pass no problems.
+func ignoreKeysForIssue(issueKey, issueID string, problems []problem) []string {
+	keys := make([]string, 0, 2+len(problems))
+	seen := make(map[string]struct{}, 2+len(problems))
 	add := func(key string) {
 		if key == "" {
 			return
 		}
-		if _, dup := seenKey[key]; dup {
+		if _, dup := seen[key]; dup {
 			return
 		}
-		seenKey[key] = struct{}{}
-		entries = append(entries, projectIgnores[key]...)
+		seen[key] = struct{}{}
+		keys = append(keys, key)
 	}
 	add(issueKey)
 	add(issueID)
-	if ignored {
-		for _, p := range problems {
-			add(p.ID)
-		}
+	for _, p := range problems {
+		add(p.ID)
 	}
-	return entries
+	return keys
 }
 
 // maxExpiryIgnoreMeta returns the maximum ignore expiry and the metadata of
@@ -973,50 +1199,6 @@ func maxExpiryIgnoreMeta(entries []v1IgnoreEntry) ignoreMetadata {
 	}
 
 	return meta
-}
-
-// v1IgnoresToCache converts merged v1 ignore entries into a cache-friendly
-// map keyed by issue key, ready for Store.SaveIgnores. Each key's entries are
-// summarized with maxExpiryIgnoreMeta here — over the full unioned entry set
-// mergeIgnores produced — so the value written to the cache is always the
-// POST-override summary (e.g. ExpiresAt correctly zeroed when the latest
-// entry is a permanent ignore), never a conflated max-expiry. That is what
-// stops a permanent ignore's zero expiry from being resurrected by a stale
-// cached snooze in a future merge.
-//
-// Only entries with an expiry or a disregard-if-fixable flag are kept — a
-// summary of ExpiresAt zero and DisregardIfFixable false (a plain permanent
-// ignore) is intentionally not cached, because an absent cache entry plus
-// issue.Ignored=true already maps to a permanent ignore, so there is nothing
-// worth persisting and nothing that could poison a future merge.
-//
-// apiConfirmedKeys is the set of issue keys the live API actually reported
-// this run. A key that is NOT in apiConfirmedKeys survived into ignores
-// solely via the cached side (the API didn't mention it this run), so its
-// cache.IgnoreMeta keeps the original updated_at from previousUpdatedAt
-// instead of being refreshed — otherwise every run would stamp "now" on
-// every entry and ignoreEntryTTL eviction would never fire. Confirmed keys
-// get UpdatedAt left at its zero value, so Store.SaveIgnores stamps them with
-// "now".
-func v1IgnoresToCache(ignores v1ProjectIgnores, apiConfirmedKeys map[string]struct{}, previousUpdatedAt map[string]time.Time) map[string]cache.IgnoreMeta {
-	out := make(map[string]cache.IgnoreMeta, len(ignores))
-	for issueKey, entries := range ignores {
-		meta := maxExpiryIgnoreMeta(entries)
-		if meta.ExpiresAt.IsZero() && !meta.DisregardIfFixable {
-			continue
-		}
-		entry := cache.IgnoreMeta{
-			IssueKey:           issueKey,
-			ExpiresAt:          meta.ExpiresAt,
-			DisregardIfFixable: meta.DisregardIfFixable,
-			CreatedAt:          meta.CreatedAt,
-		}
-		if _, confirmed := apiConfirmedKeys[issueKey]; !confirmed {
-			entry.UpdatedAt = previousUpdatedAt[issueKey]
-		}
-		out[issueKey] = entry
-	}
-	return out
 }
 
 // cacheIgnoresToV1 reconstructs the v1 ignore response shape from cached
@@ -1214,10 +1396,17 @@ func parseIssueTimestamp(raw string) time.Time {
 	return t
 }
 
+// issueResolved reports whether Snyk no longer reports the finding
+// (resolved/fixed/disappeared): its status says so, every coordinate is
+// resolved, or its resolution is a fix.
+func issueResolved(issue issueAttributes) bool {
+	status := strings.ToLower(issue.Status)
+	return status == "resolved" || status == "fixed" || coordinateResolved(issue.Coordinates) || strings.ToLower(issue.Resolution.Type) == "fixed"
+}
+
 func mapStatus(issue issueAttributes, ignoreExpiresAt time.Time, disregardIfFixable bool) model.FindingStatus {
 	resolutionType := strings.ToLower(issue.Resolution.Type)
 	resolutionDetails := strings.ToLower(issue.Resolution.Details)
-	status := strings.ToLower(issue.Status)
 
 	// A finding Snyk no longer reports (resolved/fixed/disappeared) is terminal,
 	// full stop — ignores only matter for findings that still exist. This check
@@ -1226,7 +1415,7 @@ func mapStatus(issue issueAttributes, ignoreExpiresAt time.Time, disregardIfFixa
 	// ignore branches win would map a vulnerability that is already gone to a
 	// non-terminal state, resurrecting it as a permanently-open (and often
 	// birth-overdue) ticket.
-	resolved := status == "resolved" || status == "fixed" || coordinateResolved(issue.Coordinates) || resolutionType == "fixed"
+	resolved := issueResolved(issue)
 
 	if issue.Ignored && !resolved {
 		// "Ignore until a fix is available" maps to FindingAwaitingFix so the

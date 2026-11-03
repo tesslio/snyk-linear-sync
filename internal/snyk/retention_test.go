@@ -1,0 +1,493 @@
+package snyk
+
+import (
+	"context"
+	"encoding/json"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	snyksdk "github.com/pavel-snyk/snyk-sdk-go/v2/snyk"
+
+	"github.com/tesslio/snyk-linear-sync/internal/cache"
+	"github.com/tesslio/snyk-linear-sync/internal/model"
+)
+
+// snykFixture is the state a fake Snyk API serves to LoadSnapshot. Tests
+// mutate it between runs to simulate Snyk changing its mind: the REST issue
+// flipping ignored=false, the v1 ignores endpoint forgetting an entry, or
+// failing outright.
+type snykFixture struct {
+	issues []issueResource
+	// v1 holds each project's v1 ignores response. A project absent from
+	// the map answers 404.
+	v1 map[string]v1ProjectIgnores
+	// v1Status, when non-zero, is answered for every v1 ignores request in
+	// place of the body (e.g. 500).
+	v1Status int
+}
+
+const (
+	fixtureOrg     = "org-1"
+	fixtureProject = "project-a"
+)
+
+// newSnapshotClient serves the fixture over httptest and returns a Client
+// whose REST, SDK and v1 calls all land on it, with the given cache and
+// clock. The projects list always holds fixtureProject as an active GitHub
+// project.
+func newSnapshotClient(t *testing.T, fx *snykFixture, store *cache.Store, now *time.Time) *Client {
+	t.Helper()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		path := r.URL.Path
+		switch {
+		case path == "/rest/orgs/"+fixtureOrg:
+			_, _ = io.WriteString(w, `{"data":{"attributes":{"slug":"org-a"}}}`)
+		case path == "/rest/orgs/"+fixtureOrg+"/projects":
+			_, _ = io.WriteString(w, `{"data":[{"id":"`+fixtureProject+`","type":"project","attributes":{"name":"owner/repo","origin":"github","status":"active","target_reference":"main"}}]}`)
+		case path == "/rest/orgs/"+fixtureOrg+"/issues":
+			if err := json.NewEncoder(w).Encode(issueListResponse{Data: fx.issues}); err != nil {
+				t.Errorf("encode issues: %v", err)
+			}
+		case strings.HasPrefix(path, "/v1/org/"+fixtureOrg+"/project/") && strings.HasSuffix(path, "/ignores"):
+			if fx.v1Status != 0 {
+				w.WriteHeader(fx.v1Status)
+				return
+			}
+			projectID := strings.TrimSuffix(strings.TrimPrefix(path, "/v1/org/"+fixtureOrg+"/project/"), "/ignores")
+			ignores, ok := fx.v1[projectID]
+			if !ok {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			if err := json.NewEncoder(w).Encode(ignores); err != nil {
+				t.Errorf("encode v1 ignores: %v", err)
+			}
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	restBase, err := url.Parse(server.URL + "/rest/")
+	if err != nil {
+		t.Fatalf("parse REST base: %v", err)
+	}
+	v1Base, err := url.Parse(server.URL + "/v1/")
+	if err != nil {
+		t.Fatalf("parse v1 base: %v", err)
+	}
+	sdk, err := snyksdk.NewClient("test-token", snyksdk.WithHTTPClient(server.Client()), snyksdk.WithRegion(snyksdk.Region{
+		Alias:       "test",
+		AppBaseURL:  server.URL,
+		RESTBaseURL: restBase.String(),
+		V1BaseURL:   v1Base.String(),
+	}))
+	if err != nil {
+		t.Fatalf("new SDK client: %v", err)
+	}
+
+	saved := ignoresRetryBackoff
+	ignoresRetryBackoff = 0
+	t.Cleanup(func() { ignoresRetryBackoff = saved })
+
+	return &Client{
+		orgID:      fixtureOrg,
+		httpClient: server.Client(),
+		restBase:   restBase,
+		v1Base:     v1Base,
+		sdk:        sdk,
+		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		cache:      store,
+		now:        func() time.Time { return *now },
+	}
+}
+
+func openIgnoresStore(t *testing.T) *cache.Store {
+	t.Helper()
+	store, err := cache.Open(filepath.Join(t.TempDir(), "cache.db"))
+	if err != nil {
+		t.Fatalf("cache.Open() error = %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	return store
+}
+
+// fixtureIssue is an open dependency issue of fixtureProject keyed SNYK-100
+// by default; the options adjust it.
+func fixtureIssue(id, key string, ignored bool) issueResource {
+	issue := issueResource{ID: id, Type: "issue"}
+	issue.Attributes.Key = key
+	issue.Attributes.Title = "Example vulnerability"
+	issue.Attributes.Type = "package_vulnerability"
+	issue.Attributes.EffectiveSeverity = "high"
+	issue.Attributes.Status = "open"
+	issue.Attributes.Ignored = ignored
+	issue.Attributes.CreatedAt = "2026-01-01T00:00:00Z"
+	issue.Attributes.Coordinates = []coordinate{{
+		State:           "open",
+		Representations: []representation{{Dependency: dependencyRepresentation{PackageName: "example-pkg", PackageVersion: "1.0.0"}}},
+	}}
+	issue.Relationships.ScanItem.Data.ID = fixtureProject
+	issue.Relationships.ScanItem.Data.Type = "project"
+	return issue
+}
+
+func resolvedIssue(issue issueResource) issueResource {
+	issue.Attributes.Status = "resolved"
+	for i := range issue.Attributes.Coordinates {
+		issue.Attributes.Coordinates[i].State = "resolved"
+	}
+	return issue
+}
+
+func snooze(created, expires time.Time) v1IgnoreEntry {
+	entry := v1IgnoreEntry{Created: created.Format(time.RFC3339)}
+	if !expires.IsZero() {
+		entry.Expires = expires.Format(time.RFC3339)
+	}
+	return entry
+}
+
+func loadOne(t *testing.T, c *Client) model.Finding {
+	t.Helper()
+	snapshot, err := c.LoadSnapshot(context.Background())
+	if err != nil {
+		t.Fatalf("LoadSnapshot() error = %v", err)
+	}
+	if len(snapshot.Findings) != 1 {
+		t.Fatalf("findings = %d, want 1", len(snapshot.Findings))
+	}
+	return snapshot.Findings[0]
+}
+
+func cachedRow(t *testing.T, store *cache.Store, key string) (cache.IgnoreMeta, bool) {
+	t.Helper()
+	rows, err := store.LoadIgnores(context.Background(), fixtureProject)
+	if err != nil {
+		t.Fatalf("LoadIgnores() error = %v", err)
+	}
+	row, ok := rows[key]
+	return row, ok
+}
+
+var t0 = time.Date(2026, time.March, 1, 12, 0, 0, 0, time.UTC)
+
+// TestLoadSnapshotKeepsExpiredSnoozeAfterV1ForgetsIt is the incident shape
+// in neutral terms: a timed ignore expires, Snyk flips the REST issue to
+// ignored=false, and some time later the v1 ignores endpoint stops returning
+// the expired record. The cached expiry is the base of the ticket's due date
+// and must survive indefinitely, not for the seven days the old TTL gave it.
+func TestLoadSnapshotKeepsExpiredSnoozeAfterV1ForgetsIt(t *testing.T) {
+	store := openIgnoresStore(t)
+	expires := t0.Add(5 * 24 * time.Hour)
+	fx := &snykFixture{
+		issues: []issueResource{fixtureIssue("issue-1", "SNYK-100", true)},
+		v1:     map[string]v1ProjectIgnores{fixtureProject: {"SNYK-100": {snooze(t0.Add(-24*time.Hour), expires)}}},
+	}
+	now := t0
+	c := newSnapshotClient(t, fx, store, &now)
+
+	finding := loadOne(t, c)
+	if finding.Status != model.FindingOpen || !finding.IgnoreExpiresAt.Equal(expires) {
+		t.Fatalf("run 1: status %q expiry %v, want open with expiry %v", finding.Status, finding.IgnoreExpiresAt, expires)
+	}
+
+	// The snooze lapses, Snyk un-ignores the issue and v1 forgets the record.
+	fx.issues[0].Attributes.Ignored = false
+	fx.v1[fixtureProject] = v1ProjectIgnores{}
+	for _, days := range []int{8, 30, 120} {
+		now = t0.Add(time.Duration(days) * 24 * time.Hour)
+		finding = loadOne(t, c)
+		if finding.Status != model.FindingOpen {
+			t.Fatalf("day %d: status = %q, want open", days, finding.Status)
+		}
+		if !finding.IgnoreExpiresAt.Equal(expires) {
+			t.Fatalf("day %d: IgnoreExpiresAt = %v, want %v kept from the cache", days, finding.IgnoreExpiresAt, expires)
+		}
+		row, ok := cachedRow(t, store, "SNYK-100")
+		if !ok || !row.ExpiresAt.Equal(expires) {
+			t.Fatalf("day %d: cached row = %+v (present %v), want expiry %v", days, row, ok, expires)
+		}
+	}
+}
+
+// TestLoadSnapshotKeepsExpiredSnoozeWhileSnykStillIgnores covers the expired
+// snooze Snyk has not yet flipped: with the cached expiry the finding stays
+// open (not the "no metadata, permanent ignore" path), whatever v1 returns.
+func TestLoadSnapshotKeepsExpiredSnoozeWhileSnykStillIgnores(t *testing.T) {
+	store := openIgnoresStore(t)
+	expires := t0.Add(5 * 24 * time.Hour)
+	fx := &snykFixture{
+		issues: []issueResource{fixtureIssue("issue-1", "SNYK-100", true)},
+		v1:     map[string]v1ProjectIgnores{fixtureProject: {"SNYK-100": {snooze(t0.Add(-24*time.Hour), expires)}}},
+	}
+	now := t0
+	c := newSnapshotClient(t, fx, store, &now)
+	loadOne(t, c)
+
+	fx.v1[fixtureProject] = v1ProjectIgnores{}
+	now = t0.Add(30 * 24 * time.Hour)
+	finding := loadOne(t, c)
+	if finding.Status != model.FindingOpen {
+		t.Fatalf("status = %q, want open (expired snooze still asserted by Snyk is not a permanent ignore)", finding.Status)
+	}
+	if !finding.IgnoreExpiresAt.Equal(expires) {
+		t.Fatalf("IgnoreExpiresAt = %v, want %v", finding.IgnoreExpiresAt, expires)
+	}
+	if _, ok := cachedRow(t, store, "SNYK-100"); !ok {
+		t.Fatal("cached row dropped while Snyk still reports the issue ignored")
+	}
+}
+
+// TestLoadSnapshotKeepsActiveSnoozeSnykStillAsserts: v1 is silent about an
+// active snooze but the REST issue is still ignored. Snyk asserts the ignore,
+// so the row is kept past the grace period and never aged.
+func TestLoadSnapshotKeepsActiveSnoozeSnykStillAsserts(t *testing.T) {
+	store := openIgnoresStore(t)
+	expires := t0.Add(60 * 24 * time.Hour)
+	fx := &snykFixture{
+		issues: []issueResource{fixtureIssue("issue-1", "SNYK-100", true)},
+		v1:     map[string]v1ProjectIgnores{fixtureProject: {"SNYK-100": {snooze(t0.Add(-24*time.Hour), expires)}}},
+	}
+	now := t0
+	c := newSnapshotClient(t, fx, store, &now)
+	loadOne(t, c)
+
+	fx.v1[fixtureProject] = v1ProjectIgnores{}
+	for _, days := range []int{8, 40} {
+		now = t0.Add(time.Duration(days) * 24 * time.Hour)
+		finding := loadOne(t, c)
+		if finding.Status != model.FindingOpen || !finding.IgnoreExpiresAt.Equal(expires) {
+			t.Fatalf("day %d: status %q expiry %v, want open with %v", days, finding.Status, finding.IgnoreExpiresAt, expires)
+		}
+		if _, ok := cachedRow(t, store, "SNYK-100"); !ok {
+			t.Fatalf("day %d: cached row dropped while Snyk still reports the issue ignored", days)
+		}
+	}
+}
+
+// TestLoadSnapshotDropsRevokedActiveSnoozeAfterGrace: v1 stops returning an
+// active snooze and the REST issue is open and not ignored. That is a
+// revocation, but partial v1 responses happen, so the row is kept for the
+// grace period and dropped once it has run out.
+func TestLoadSnapshotDropsRevokedActiveSnoozeAfterGrace(t *testing.T) {
+	store := openIgnoresStore(t)
+	expires := t0.Add(60 * 24 * time.Hour)
+	fx := &snykFixture{
+		issues: []issueResource{fixtureIssue("issue-1", "SNYK-100", true)},
+		v1:     map[string]v1ProjectIgnores{fixtureProject: {"SNYK-100": {snooze(t0.Add(-24*time.Hour), expires)}}},
+	}
+	now := t0
+	c := newSnapshotClient(t, fx, store, &now)
+	loadOne(t, c)
+
+	fx.issues[0].Attributes.Ignored = false
+	fx.v1[fixtureProject] = v1ProjectIgnores{}
+
+	now = t0.Add(3 * 24 * time.Hour)
+	finding := loadOne(t, c)
+	if !finding.IgnoreExpiresAt.Equal(expires) {
+		t.Fatalf("day 3: IgnoreExpiresAt = %v, want %v (within grace)", finding.IgnoreExpiresAt, expires)
+	}
+	if _, ok := cachedRow(t, store, "SNYK-100"); !ok {
+		t.Fatal("day 3: cached row dropped within the grace period")
+	}
+
+	now = t0.Add(8 * 24 * time.Hour)
+	finding = loadOne(t, c)
+	if !finding.IgnoreExpiresAt.IsZero() {
+		t.Fatalf("day 8: IgnoreExpiresAt = %v, want zero (revoked snooze dropped)", finding.IgnoreExpiresAt)
+	}
+	if finding.Status != model.FindingOpen {
+		t.Fatalf("day 8: status = %q, want open", finding.Status)
+	}
+	if _, ok := cachedRow(t, store, "SNYK-100"); ok {
+		t.Fatal("day 8: cached row still present after the grace period")
+	}
+}
+
+// TestLoadSnapshotResolvedFindingKeepsCachedSnooze: a resolved finding is
+// terminal whatever the cache says, and the row stays as inert memory.
+func TestLoadSnapshotResolvedFindingKeepsCachedSnooze(t *testing.T) {
+	store := openIgnoresStore(t)
+	expires := t0.Add(5 * 24 * time.Hour)
+	fx := &snykFixture{
+		issues: []issueResource{fixtureIssue("issue-1", "SNYK-100", true)},
+		v1:     map[string]v1ProjectIgnores{fixtureProject: {"SNYK-100": {snooze(t0.Add(-24*time.Hour), expires)}}},
+	}
+	now := t0
+	c := newSnapshotClient(t, fx, store, &now)
+	loadOne(t, c)
+
+	fx.issues[0] = resolvedIssue(fixtureIssue("issue-1", "SNYK-100", false))
+	fx.v1[fixtureProject] = v1ProjectIgnores{}
+	now = t0.Add(30 * 24 * time.Hour)
+	finding := loadOne(t, c)
+	if finding.Status != model.FindingFixed {
+		t.Fatalf("status = %q, want fixed", finding.Status)
+	}
+	if _, ok := cachedRow(t, store, "SNYK-100"); !ok {
+		t.Fatal("cached row dropped for a resolved finding; it is inert and should stay")
+	}
+}
+
+// TestLoadSnapshotRuleKeyedRowKeptWhileOneSiblingIgnored: a snooze filed
+// under a rule key applies to several findings. One sibling still ignored
+// means Snyk still asserts the ignore, so the open, un-ignored sibling does
+// not get the row dropped, and (as before) does not consume it either.
+func TestLoadSnapshotRuleKeyedRowKeptWhileOneSiblingIgnored(t *testing.T) {
+	store := openIgnoresStore(t)
+	expires := t0.Add(60 * 24 * time.Hour)
+	ignored := fixtureIssue("issue-1", "", true)
+	ignored.Attributes.Problems = []problem{{ID: "RULE-1"}}
+	open := fixtureIssue("issue-2", "", false)
+	open.Attributes.Problems = []problem{{ID: "RULE-1"}}
+	fx := &snykFixture{
+		issues: []issueResource{ignored, open},
+		v1:     map[string]v1ProjectIgnores{fixtureProject: {"RULE-1": {snooze(t0.Add(-24*time.Hour), expires)}}},
+	}
+	now := t0
+	c := newSnapshotClient(t, fx, store, &now)
+	if _, err := c.LoadSnapshot(context.Background()); err != nil {
+		t.Fatalf("LoadSnapshot() error = %v", err)
+	}
+
+	fx.v1[fixtureProject] = v1ProjectIgnores{}
+	now = t0.Add(10 * 24 * time.Hour)
+	snapshot, err := c.LoadSnapshot(context.Background())
+	if err != nil {
+		t.Fatalf("LoadSnapshot() error = %v", err)
+	}
+	if _, ok := cachedRow(t, store, "RULE-1"); !ok {
+		t.Fatal("rule-keyed row dropped while a sibling finding is still ignored")
+	}
+	for _, finding := range snapshot.Findings {
+		switch finding.SnykIssueID {
+		case "issue-1":
+			if !finding.IgnoreExpiresAt.Equal(expires) {
+				t.Fatalf("ignored sibling IgnoreExpiresAt = %v, want %v", finding.IgnoreExpiresAt, expires)
+			}
+		case "issue-2":
+			if !finding.IgnoreExpiresAt.IsZero() {
+				t.Fatalf("un-ignored sibling IgnoreExpiresAt = %v, want zero (rule-key gate)", finding.IgnoreExpiresAt)
+			}
+		}
+	}
+}
+
+// TestLoadSnapshotNewerPermanentIgnoreReplacesCachedSnooze: a later v1 entry
+// without expiry means the user now ignores the finding permanently; the
+// cached snooze must not resurrect an expiry.
+func TestLoadSnapshotNewerPermanentIgnoreReplacesCachedSnooze(t *testing.T) {
+	store := openIgnoresStore(t)
+	fx := &snykFixture{
+		issues: []issueResource{fixtureIssue("issue-1", "SNYK-100", true)},
+		v1:     map[string]v1ProjectIgnores{fixtureProject: {"SNYK-100": {snooze(t0.Add(-24*time.Hour), t0.Add(30*24*time.Hour))}}},
+	}
+	now := t0
+	c := newSnapshotClient(t, fx, store, &now)
+	loadOne(t, c)
+
+	fx.v1[fixtureProject] = v1ProjectIgnores{"SNYK-100": {snooze(t0.Add(24*time.Hour), time.Time{})}}
+	now = t0.Add(2 * 24 * time.Hour)
+	finding := loadOne(t, c)
+	if finding.Status != model.FindingIgnored {
+		t.Fatalf("status = %q, want ignored (permanent)", finding.Status)
+	}
+	if !finding.IgnoreExpiresAt.IsZero() {
+		t.Fatalf("IgnoreExpiresAt = %v, want zero", finding.IgnoreExpiresAt)
+	}
+	if row, ok := cachedRow(t, store, "SNYK-100"); ok && !row.ExpiresAt.IsZero() {
+		t.Fatalf("cache still holds the superseded snooze expiry %v", row.ExpiresAt)
+	}
+
+	// And it stays permanent once v1 forgets the whole history.
+	fx.v1[fixtureProject] = v1ProjectIgnores{}
+	now = t0.Add(20 * 24 * time.Hour)
+	finding = loadOne(t, c)
+	if finding.Status != model.FindingIgnored || !finding.IgnoreExpiresAt.IsZero() {
+		t.Fatalf("after v1 forgets: status %q expiry %v, want ignored with zero expiry", finding.Status, finding.IgnoreExpiresAt)
+	}
+}
+
+// TestLoadSnapshotReIgnoreAdvancesExpiryHighWaterMark: a nightly re-ignore
+// with a later created and expiry moves the expiry forward in both the
+// finding and the cache.
+func TestLoadSnapshotReIgnoreAdvancesExpiryHighWaterMark(t *testing.T) {
+	store := openIgnoresStore(t)
+	first := t0.Add(30 * 24 * time.Hour)
+	second := t0.Add(60 * 24 * time.Hour)
+	fx := &snykFixture{
+		issues: []issueResource{fixtureIssue("issue-1", "SNYK-100", true)},
+		v1:     map[string]v1ProjectIgnores{fixtureProject: {"SNYK-100": {snooze(t0.Add(-24*time.Hour), first)}}},
+	}
+	now := t0
+	c := newSnapshotClient(t, fx, store, &now)
+	loadOne(t, c)
+
+	fx.v1[fixtureProject] = v1ProjectIgnores{"SNYK-100": {snooze(t0.Add(24*time.Hour), second)}}
+	now = t0.Add(2 * 24 * time.Hour)
+	finding := loadOne(t, c)
+	if !finding.IgnoreExpiresAt.Equal(second) {
+		t.Fatalf("IgnoreExpiresAt = %v, want %v", finding.IgnoreExpiresAt, second)
+	}
+	row, ok := cachedRow(t, store, "SNYK-100")
+	if !ok || !row.ExpiresAt.Equal(second) {
+		t.Fatalf("cached row = %+v (present %v), want expiry %v", row, ok, second)
+	}
+}
+
+// TestLoadSnapshotV1NotFoundKeepsEveryCachedRow: when the v1 endpoint 404s
+// after every retry, the cached rows stand in for it and none is aged into a
+// drop, even past the grace period with the issue open and not ignored.
+func TestLoadSnapshotV1NotFoundKeepsEveryCachedRow(t *testing.T) {
+	for _, status := range []int{http.StatusNotFound, http.StatusInternalServerError} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			store := openIgnoresStore(t)
+			active := t0.Add(60 * 24 * time.Hour)
+			lapsed := t0.Add(2 * 24 * time.Hour)
+			fx := &snykFixture{
+				issues: []issueResource{fixtureIssue("issue-1", "SNYK-100", true), fixtureIssue("issue-2", "SNYK-101", true)},
+				v1: map[string]v1ProjectIgnores{fixtureProject: {
+					"SNYK-100": {snooze(t0.Add(-24*time.Hour), active)},
+					"SNYK-101": {snooze(t0.Add(-24*time.Hour), lapsed)},
+				}},
+			}
+			now := t0
+			c := newSnapshotClient(t, fx, store, &now)
+			if _, err := c.LoadSnapshot(context.Background()); err != nil {
+				t.Fatalf("LoadSnapshot() error = %v", err)
+			}
+
+			fx.issues[0].Attributes.Ignored = false
+			fx.issues[1].Attributes.Ignored = false
+			fx.v1Status = status
+			now = t0.Add(10 * 24 * time.Hour)
+			snapshot, err := c.LoadSnapshot(context.Background())
+			if err != nil {
+				t.Fatalf("LoadSnapshot() with v1 failing: error = %v, want nil (cached rows stand in)", err)
+			}
+			want := map[string]time.Time{"issue-1": active, "issue-2": lapsed}
+			for _, finding := range snapshot.Findings {
+				if !finding.IgnoreExpiresAt.Equal(want[finding.SnykIssueID]) {
+					t.Fatalf("%s IgnoreExpiresAt = %v, want %v", finding.SnykIssueID, finding.IgnoreExpiresAt, want[finding.SnykIssueID])
+				}
+			}
+			for _, key := range []string{"SNYK-100", "SNYK-101"} {
+				if _, ok := cachedRow(t, store, key); !ok {
+					t.Fatalf("cached row %s dropped on a failed v1 fetch", key)
+				}
+			}
+		})
+	}
+}
