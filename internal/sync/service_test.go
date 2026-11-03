@@ -4024,7 +4024,7 @@ func TestRunAwaitingFixToOpenRecalculatesDueDateFromFixAvailability(t *testing.T
 	// Due date should be calculated from today + 30 days (high severity SLA),
 	// NOT from 2026-01-01 + 30 days (which would give 2026-01-31, a meaningless
 	// past date for an issue that was blocked for months).
-	expectedDueDate := time.Now().AddDate(0, 0, 30)
+	expectedDueDate := time.Now().UTC().AddDate(0, 0, 30)
 	expectedStr := time.Date(expectedDueDate.Year(), expectedDueDate.Month(), expectedDueDate.Day(), 0, 0, 0, 0, time.UTC).Format(time.DateOnly)
 	if updated.DueDate != expectedStr {
 		t.Fatalf("updated due date = %q, want %q (SLA from fix availability, not from months-old created_at)", updated.DueDate, expectedStr)
