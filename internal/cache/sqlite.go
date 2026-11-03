@@ -3,6 +3,7 @@ package cache
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -42,6 +43,20 @@ type IgnoreMeta struct {
 	// Snyk still reports the ignore, and for rows without the
 	// disregard-if-fixable flag.
 	UnignoredAt time.Time
+	// ObservedIssues remembers which REST issue IDs were actually ignored.
+	// Each observation retains its own metadata and first observed end.
+	// Rule keys alone cannot establish a historical association to a sibling.
+	ObservedIssues map[string]IgnoreObservation
+}
+
+// IgnoreObservation is the effective ignore seen for one REST finding.
+// Rule-key summaries may change for a sibling; its historical expiry and end
+// must not replace the SLA memory of a finding that is already actionable.
+type IgnoreObservation struct {
+	ExpiresAt          time.Time
+	CreatedAt          time.Time
+	DisregardIfFixable bool
+	EndedAt            time.Time
 }
 
 type Snapshot struct {
@@ -327,6 +342,11 @@ func (s *Store) migrateSnykIgnoresCache(ctx context.Context) error {
 			return fmt.Errorf("add unignored_at column: %w", err)
 		}
 	}
+	if !columns["observed_issues"] {
+		if _, err := s.db.ExecContext(ctx, "ALTER TABLE snyk_ignores ADD COLUMN observed_issues TEXT"); err != nil {
+			return fmt.Errorf("add observed_issues column: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -441,7 +461,7 @@ func (s *Store) LoadIgnores(ctx context.Context, projectID string) (map[string]I
 	out := make(map[string]IgnoreMeta)
 
 	query, args, err := s.builder.
-		Select("issue_key", "expires_at", "disregard_if_fixable", "created_at", "updated_at", "unignored_at").
+		Select("issue_key", "expires_at", "disregard_if_fixable", "created_at", "updated_at", "unignored_at", "observed_issues").
 		From("snyk_ignores").
 		Where(sq.Eq{"project_id": projectID}).
 		ToSql()
@@ -458,12 +478,18 @@ func (s *Store) LoadIgnores(ctx context.Context, projectID string) (map[string]I
 	for rows.Next() {
 		var issueKey string
 		var expiresAtRaw, createdAtRaw, updatedAtRaw string
-		var unignoredAtRaw sql.NullString
+		var unignoredAtRaw, observedRaw sql.NullString
 		var disregardIfFixable int
-		if err := rows.Scan(&issueKey, &expiresAtRaw, &disregardIfFixable, &createdAtRaw, &updatedAtRaw, &unignoredAtRaw); err != nil {
+		if err := rows.Scan(&issueKey, &expiresAtRaw, &disregardIfFixable, &createdAtRaw, &updatedAtRaw, &unignoredAtRaw, &observedRaw); err != nil {
 			return nil, fmt.Errorf("scan cache ignore row: %w", err)
 		}
 
+		var observed map[string]IgnoreObservation
+		if observedRaw.String != "" {
+			if err := json.Unmarshal([]byte(observedRaw.String), &observed); err != nil {
+				return nil, fmt.Errorf("decode cached ignore associations: %w", err)
+			}
+		}
 		out[issueKey] = IgnoreMeta{
 			IssueKey:           issueKey,
 			DisregardIfFixable: disregardIfFixable != 0,
@@ -471,6 +497,7 @@ func (s *Store) LoadIgnores(ctx context.Context, projectID string) (map[string]I
 			CreatedAt:          parseTimestamp(createdAtRaw),
 			UpdatedAt:          parseTimestamp(updatedAtRaw),
 			UnignoredAt:        parseTimestamp(unignoredAtRaw.String),
+			ObservedIssues:     observed,
 		}
 	}
 
@@ -504,23 +531,28 @@ func (s *Store) SaveIgnores(ctx context.Context, projectID string, ignores map[s
 		return fmt.Errorf("clear cache ignores: %w", err)
 	}
 
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := time.Now().UTC().Format(time.RFC3339Nano)
 	for issueKey, meta := range ignores {
 		expiresAtRaw := ""
 		if !meta.ExpiresAt.IsZero() {
-			expiresAtRaw = meta.ExpiresAt.UTC().Format(time.RFC3339)
+			expiresAtRaw = meta.ExpiresAt.UTC().Format(time.RFC3339Nano)
 		}
 		createdAtRaw := ""
 		if !meta.CreatedAt.IsZero() {
-			createdAtRaw = meta.CreatedAt.UTC().Format(time.RFC3339)
+			createdAtRaw = meta.CreatedAt.UTC().Format(time.RFC3339Nano)
 		}
 		updatedAtRaw := now
 		if !meta.UpdatedAt.IsZero() {
-			updatedAtRaw = meta.UpdatedAt.UTC().Format(time.RFC3339)
+			updatedAtRaw = meta.UpdatedAt.UTC().Format(time.RFC3339Nano)
 		}
 		unignoredAtRaw := ""
 		if !meta.UnignoredAt.IsZero() {
-			unignoredAtRaw = meta.UnignoredAt.UTC().Format(time.RFC3339)
+			unignoredAtRaw = meta.UnignoredAt.UTC().Format(time.RFC3339Nano)
+		}
+		var observedRaw []byte
+		observedRaw, err = json.Marshal(meta.ObservedIssues)
+		if err != nil {
+			return fmt.Errorf("encode ignore associations: %w", err)
 		}
 		var disregard int64
 		if meta.DisregardIfFixable {
@@ -529,8 +561,8 @@ func (s *Store) SaveIgnores(ctx context.Context, projectID string, ignores map[s
 
 		query, args, err = s.builder.
 			Insert("snyk_ignores").
-			Columns("project_id", "issue_key", "expires_at", "disregard_if_fixable", "created_at", "updated_at", "unignored_at").
-			Values(projectID, issueKey, expiresAtRaw, disregard, createdAtRaw, updatedAtRaw, unignoredAtRaw).
+			Columns("project_id", "issue_key", "expires_at", "disregard_if_fixable", "created_at", "updated_at", "unignored_at", "observed_issues").
+			Values(projectID, issueKey, expiresAtRaw, disregard, createdAtRaw, updatedAtRaw, unignoredAtRaw, string(observedRaw)).
 			ToSql()
 		if err != nil {
 			return fmt.Errorf("build insert cache ignore row: %w", err)

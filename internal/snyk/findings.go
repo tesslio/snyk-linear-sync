@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net/http"
 	"net/url"
 	"slices"
@@ -239,6 +240,11 @@ const unconfirmedIgnoreGrace = 7 * 24 * time.Hour
 var errIgnoresNotFound = errors.New("v1 ignores endpoint returned 404 after all retries")
 
 func (c *Client) LoadSnapshot(ctx context.Context) (model.SnykSnapshot, error) {
+	if c.cache != nil {
+		if _, err := cache.PrepareIgnoreMemory(ctx, c.cache); err != nil {
+			return model.SnykSnapshot{}, fmt.Errorf("prepare ignore memory: %w", err)
+		}
+	}
 	orgSlug, err := c.orgSlug(ctx)
 	if err != nil {
 		return model.SnykSnapshot{}, err
@@ -363,32 +369,22 @@ func (c *Client) LoadSnapshot(ctx context.Context) (model.SnykSnapshot, error) {
 		}
 		updatedAt := parseIssueTimestamp(issue.Attributes.UpdatedAt)
 
-		// Snyk files a finding's ignore records under different top-level
-		// keys depending on project type: the issue-key hash, the issue
-		// UUID, or (for config/IaC findings) the Snyk rule ID. A single
-		// finding can have records under more than one of these at once —
-		// e.g. a stale, expired temporary-ignore under its issue-key hash
-		// alongside a *permanent* wont-fix filed under its rule ID. Snyk's
-		// issue.Ignored flag already reflects all of them; the v1 records
-		// only tell us whether that ignore is a timed snooze or permanent.
-		// So we summarise the union of every candidate record (rule keys
-		// gated on issue.Ignored — see ignoreEntriesForIssue), not just the
-		// first that matches — otherwise the expired snooze masks the
-		// permanent ignore and mapStatus treats a permanently-ignored
-		// finding as open, minting a fresh birth-overdue ticket every run.
-		//
-		// Pass issue.Attributes.Key rather than the coalesced issueKey:
-		// when Attributes.Key is empty, issueKey falls back to
-		// firstProblemID, and feeding that in unconditionally would smuggle
-		// a rule/problem key past the issue.Ignored gate. Ignored findings
-		// lose nothing — the problems loop inside ignoreEntriesForIssue
-		// already covers every problem ID, and issue.ID is always added.
+		// Issue keys and UUIDs identify this finding. Rule keys may cover
+		// siblings, so current rule metadata requires REST ignored=true;
+		// historical rule metadata requires a persisted per-finding observation.
+		// Always use the raw issue key, not a coalesced problem/rule fallback.
 		projectIgnoreState := ignoresByProject[projectID]
-		ignoreKeys := ignoreKeysForIssue(issue.Attributes.Key, issue.ID, gatedProblems(issue.Attributes.Problems, issue.Attributes.Ignored))
-		ignoreEntries := ignoreEntriesForKeys(projectIgnoreState.merged, ignoreKeys)
+		ignoreKeys := projectIgnoreState.keysForFinding(issue)
+		ignoreEntries := projectIgnoreState.entriesForFinding(issue, ignoreKeys)
 		ignoreMeta := maxExpiryIgnoreMeta(ignoreEntries)
 		if ignoreMeta.DisregardIfFixable {
-			ignoreMeta.EndedAt = projectIgnoreState.endedAt(ignoreKeys)
+			ignoreMeta.EndedAt = projectIgnoreState.endedAt(ignoreKeys, issue)
+		}
+		// Snyk can reuse an issue ID after resolution. An ignore created before
+		// that resolution belongs to the old occurrence, not this actionable one.
+		if !issue.Attributes.Ignored && !issueResolved(issue.Attributes) &&
+			ignorePredatesResolvedOccurrence(ignoreMeta, issue.Attributes.Coordinates) {
+			ignoreMeta = ignoreMetadata{}
 		}
 		ok := len(ignoreEntries) > 0
 		// If the issue is ignored but we found no v1 ignore metadata, the
@@ -582,6 +578,8 @@ type ignoreKeyMatches struct {
 	// open is set when a matching issue reports ignored=false and is not
 	// resolved: the ignore no longer applies to it, by expiry or revocation.
 	open bool
+	// issues keeps per-finding evidence; rule matches can include unrelated siblings.
+	issues map[string]issueResource
 }
 
 // recordIssue notes what a REST issue of the project reports for each ignore
@@ -595,9 +593,10 @@ func (p *projectIgnores) recordIssue(issue issueResource) {
 		}
 		m := p.matches[key]
 		if m == nil {
-			m = &ignoreKeyMatches{}
+			m = &ignoreKeyMatches{issues: make(map[string]issueResource)}
 			p.matches[key] = m
 		}
+		m.issues[issue.ID] = issue
 		m.total++
 		switch {
 		case issue.Attributes.Ignored:
@@ -624,15 +623,12 @@ func (p *projectIgnores) recordIssue(issue issueResource) {
 // then on.
 //
 // As before, a summary with no expiry and no disregard-if-fixable flag (a
-// plain permanent ignore) is not stored: an absent row plus issue.Ignored
-// already maps to a permanent ignore, so there is nothing to remember.
+// plain permanent ignore) is not stored unless it still carries durable
+// observations of an older ignore for another finding.
 func (p *projectIgnores) retain(now time.Time) (rows map[string]cache.IgnoreMeta, dropped []string) {
 	rows = make(map[string]cache.IgnoreMeta, len(p.merged))
 	for key, entries := range p.merged {
 		meta := maxExpiryIgnoreMeta(entries)
-		if meta.ExpiresAt.IsZero() && !meta.DisregardIfFixable {
-			continue
-		}
 		row := cache.IgnoreMeta{
 			IssueKey:           key,
 			ExpiresAt:          meta.ExpiresAt,
@@ -641,11 +637,40 @@ func (p *projectIgnores) retain(now time.Time) (rows map[string]cache.IgnoreMeta
 		}
 		row.UpdatedAt = now
 		row.UnignoredAt = p.unignoredAt(key, meta, now)
+		row.ObservedIssues = make(map[string]cache.IgnoreObservation)
+		maps.Copy(row.ObservedIssues, p.cached[key].ObservedIssues)
+		if m := p.matches[key]; m != nil {
+			for id, issue := range m.issues {
+				if issue.Attributes.Ignored {
+					if p.canObserveIgnore(key, issue, meta) {
+						row.ObservedIssues[id] = cache.IgnoreObservation{ExpiresAt: meta.ExpiresAt, CreatedAt: meta.CreatedAt, DisregardIfFixable: meta.DisregardIfFixable}
+					}
+				} else if observed, seen := row.ObservedIssues[id]; seen && observed.EndedAt.IsZero() {
+					observed.EndedAt = now
+					row.ObservedIssues[id] = observed
+				}
+			}
+		}
+		if meta.ExpiresAt.IsZero() && !meta.DisregardIfFixable && !hasObservedIgnoreHistory(row.ObservedIssues, now) {
+			continue
+		}
 		if _, confirmed := p.apiConfirmed[key]; !confirmed {
 			confirmedAt := p.cached[key].UpdatedAt
 			if p.revoked(key, meta, confirmedAt, now) {
-				dropped = append(dropped, key)
-				continue
+				// Revoking a newer rule snooze must not discard a sibling's older,
+				// durable deadline. Remove the revoked observations and summary only.
+				for id, observed := range row.ObservedIssues {
+					if !observed.DisregardIfFixable && observed.ExpiresAt.After(now) {
+						delete(row.ObservedIssues, id)
+					}
+				}
+				if !hasObservedIgnoreHistory(row.ObservedIssues, now) {
+					dropped = append(dropped, key)
+					continue
+				}
+				row.ExpiresAt = time.Time{}
+				row.DisregardIfFixable = false
+				row.UnignoredAt = time.Time{}
 			}
 			// Not refreshed, so the grace is measured from the last real
 			// confirmation. A row of unknown confirmation time (written
@@ -658,6 +683,37 @@ func (p *projectIgnores) retain(now time.Time) (rows map[string]cache.IgnoreMeta
 		rows[key] = row
 	}
 	return rows, dropped
+}
+
+// canObserveIgnore avoids attributing a sibling's old rule ignore to a finding
+// whose own direct ignore explains REST ignored=true. Cached-only rule data
+// can maintain an established association, but cannot establish a new one.
+func (p *projectIgnores) canObserveIgnore(key string, issue issueResource, meta ignoreMetadata) bool {
+	if key == issue.ID || key == issue.Attributes.Key {
+		return true
+	}
+	if _, confirmed := p.apiConfirmed[key]; !confirmed {
+		if _, observed := p.cached[key].ObservedIssues[issue.ID]; !observed {
+			return false
+		}
+	}
+	direct := ignoreEntriesForKeys(p.merged, ignoreKeysForIssue(issue.Attributes.Key, issue.ID, nil))
+	if len(direct) == 0 {
+		return true
+	}
+	directMeta := maxExpiryIgnoreMeta(direct)
+	return !directMeta.CreatedAt.IsZero() && meta.CreatedAt.After(directMeta.CreatedAt)
+}
+
+// hasObservedIgnoreHistory identifies observations whose expiry or end is a
+// durable due-date base even when the key's current summary is superseded.
+func hasObservedIgnoreHistory(observed map[string]cache.IgnoreObservation, now time.Time) bool {
+	for _, entry := range observed {
+		if entry.DisregardIfFixable || (!entry.ExpiresAt.IsZero() && !entry.ExpiresAt.After(now)) {
+			return true
+		}
+	}
+	return false
 }
 
 // revoked reports whether an ignore the v1 API did not return this run
@@ -703,6 +759,16 @@ func (p *projectIgnores) unignoredAt(key string, meta ignoreMetadata, now time.T
 		return time.Time{}
 	}
 	previous := p.cached[key].UnignoredAt
+	// A newer ignore may have both started and ended between snapshots.
+	// Its actual end is unknown; start from the first observation, not the
+	// previous lifecycle's end.
+	cachedCreated := p.cached[key].CreatedAt
+	// Older cache versions discarded fractional seconds. A live timestamp in
+	// that same second is not evidence of a new ignore lifecycle.
+	sameLegacySecond := cachedCreated.Nanosecond() == 0 && meta.CreatedAt.Truncate(time.Second).Equal(cachedCreated)
+	if meta.CreatedAt.After(cachedCreated) && !sameLegacySecond {
+		previous = time.Time{}
+	}
 	m := p.matches[key]
 	switch {
 	case m == nil || m.total == 0:
@@ -724,14 +790,67 @@ func (p *projectIgnores) finalize(rows map[string]cache.IgnoreMeta) {
 	p.merged = mergeIgnores(p.api, cacheIgnoresToV1(rows))
 }
 
-// endedAt returns the latest unignored_at stamp among the rows of the given
-// keys, the time the finding's ignore-until-fix-available ignore stopped
-// applying, or zero when none is stamped.
-func (p *projectIgnores) endedAt(keys []string) time.Time {
+// ignorePredatesResolvedOccurrence requires a known post-ignore resolution
+// for every coordinate. One resolved sibling must not erase the ignore memory
+// of a coordinate that has remained continuously open.
+func ignorePredatesResolvedOccurrence(meta ignoreMetadata, coordinates []coordinate) bool {
+	if meta.CreatedAt.IsZero() || len(coordinates) == 0 {
+		return false
+	}
+	for _, coord := range coordinates {
+		resolvedAt, err := parseTime(coord.LastResolvedAt)
+		if err != nil || !resolvedAt.After(meta.CreatedAt) {
+			return false
+		}
+	}
+	return true
+}
+
+// keysForFinding uses rule history only for findings observed ignored under
+// that key. Unignored siblings with no such evidence keep creation-based SLAs.
+// Legacy rule rows without associations cannot reconstruct historical scope.
+func (p *projectIgnores) keysForFinding(issue issueResource) []string {
+	keys := ignoreKeysForIssue(issue.Attributes.Key, issue.ID, gatedProblems(issue.Attributes.Problems, issue.Attributes.Ignored))
+	if !issue.Attributes.Ignored {
+		for _, key := range ignoreKeysForIssue("", "", issue.Attributes.Problems) {
+			if _, seen := p.rows[key].ObservedIssues[issue.ID]; seen && !slices.Contains(keys, key) {
+				keys = append(keys, key)
+			}
+		}
+	}
+	return keys
+}
+
+// entriesForFinding reads historical rule metadata from the observed finding,
+// since a newer rule ignore may cover only a different resource path.
+func (p *projectIgnores) entriesForFinding(issue issueResource, keys []string) []v1IgnoreEntry {
+	var entries []v1IgnoreEntry
+	for _, key := range keys {
+		if !issue.Attributes.Ignored && key != issue.ID && key != issue.Attributes.Key {
+			observed := p.rows[key].ObservedIssues[issue.ID]
+			entries = append(entries, cacheIgnoresToV1(map[string]cache.IgnoreMeta{key: {
+				ExpiresAt: observed.ExpiresAt, CreatedAt: observed.CreatedAt, DisregardIfFixable: observed.DisregardIfFixable,
+			}})[key]...)
+		} else {
+			entries = append(entries, p.merged[key]...)
+		}
+	}
+	return entries
+}
+
+// endedAt returns the latest observed end for this finding. Rule-key history
+// uses the finding observation; direct keys can also use the row-level stamp.
+func (p *projectIgnores) endedAt(keys []string, issue issueResource) time.Time {
 	var latest time.Time
 	for _, key := range keys {
-		if row, ok := p.rows[key]; ok && row.UnignoredAt.After(latest) {
-			latest = row.UnignoredAt
+		if row, ok := p.rows[key]; ok {
+			end := row.UnignoredAt
+			if observed, seen := row.ObservedIssues[issue.ID]; seen && key != issue.ID && key != issue.Attributes.Key {
+				end = observed.EndedAt
+			}
+			if end.After(latest) {
+				latest = end
+			}
 		}
 	}
 	return latest
@@ -1281,10 +1400,10 @@ func cacheIgnoresToV1(cached map[string]cache.IgnoreMeta) v1ProjectIgnores {
 			DisregardIfFixable: meta.DisregardIfFixable,
 		}
 		if !meta.ExpiresAt.IsZero() {
-			entry.Expires = meta.ExpiresAt.UTC().Format(time.RFC3339)
+			entry.Expires = meta.ExpiresAt.UTC().Format(time.RFC3339Nano)
 		}
 		if !meta.CreatedAt.IsZero() {
-			entry.Created = meta.CreatedAt.UTC().Format(time.RFC3339)
+			entry.Created = meta.CreatedAt.UTC().Format(time.RFC3339Nano)
 		}
 		out[issueKey] = []v1IgnoreEntry{entry}
 	}

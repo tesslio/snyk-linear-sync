@@ -3,6 +3,7 @@ package snyk
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -151,9 +152,9 @@ func resolvedIssue(issue issueResource) issueResource {
 }
 
 func snooze(created, expires time.Time) v1IgnoreEntry {
-	entry := v1IgnoreEntry{Created: created.Format(time.RFC3339)}
+	entry := v1IgnoreEntry{Created: created.Format(time.RFC3339Nano)}
 	if !expires.IsZero() {
-		entry.Expires = expires.Format(time.RFC3339)
+		entry.Expires = expires.Format(time.RFC3339Nano)
 	}
 	return entry
 }
@@ -586,5 +587,260 @@ func TestLoadSnapshotDisregardIgnoreLapsedByExpiryKeepsExpiry(t *testing.T) {
 		if !finding.DisregardIfFixable || !finding.IgnoreExpiresAt.Equal(expires) || !finding.IgnoreEndedAt.Equal(lapsedSeen) {
 			t.Fatalf("day %d: disregard %v expiry %v ended %v, want disregard, expiry %v, ended %v", days, finding.DisregardIfFixable, finding.IgnoreExpiresAt, finding.IgnoreEndedAt, expires, lapsedSeen)
 		}
+	}
+}
+
+// Rule history must survive a transition without leaking to a never-ignored
+// sibling. Repeated loads exercise the persisted associations.
+func TestLoadSnapshotRuleHistoryScopedAcrossTransition(t *testing.T) {
+	for _, untilFix := range []bool{false, true} {
+		t.Run(fmt.Sprint("until-fix-", untilFix), func(t *testing.T) {
+			store := openIgnoresStore(t)
+			expiry := t0.Add(2 * 24 * time.Hour)
+			entry := snooze(t0.Add(-24*time.Hour), expiry)
+			if untilFix {
+				entry = disregardEntry(t0.Add(-24*time.Hour), time.Time{})
+			}
+			a, b := fixtureIssue("issue-1", "", true), fixtureIssue("issue-2", "", false)
+			a.Attributes.Problems = []problem{{ID: "RULE-1"}}
+			b.Attributes.Problems = []problem{{ID: "RULE-1"}}
+			fx := &snykFixture{issues: []issueResource{a, b}, v1: map[string]v1ProjectIgnores{fixtureProject: {"RULE-1": {entry}}}}
+			now := t0
+			c := newSnapshotClient(t, fx, store, &now)
+			if _, err := c.LoadSnapshot(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			fx.issues[0].Attributes.Ignored = false
+			fx.v1[fixtureProject] = v1ProjectIgnores{}
+			now = t0.Add(10 * 24 * time.Hour)
+			end := now
+			for range 2 {
+				snapshot, err := c.LoadSnapshot(context.Background())
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, f := range snapshot.Findings {
+					if f.SnykIssueID == "issue-1" {
+						if untilFix {
+							if !f.DisregardIfFixable || !f.IgnoreEndedAt.Equal(end) {
+								t.Fatalf("lost rule end: %+v", f)
+							}
+						} else if !f.IgnoreExpiresAt.Equal(expiry) {
+							t.Fatalf("lost rule expiry: %+v", f)
+						}
+					} else if !f.IgnoreExpiresAt.IsZero() || !f.IgnoreEndedAt.IsZero() || f.DisregardIfFixable {
+						t.Fatalf("never-ignored sibling inherited history: %+v", f)
+					}
+				}
+				now = now.Add(30 * 24 * time.Hour)
+			}
+		})
+	}
+}
+
+func TestLoadSnapshotNewIgnoreLiftedBetweenRuns(t *testing.T) {
+	store := openIgnoresStore(t)
+	first := t0.Add(-24 * time.Hour)
+	oldEnd := t0.Add(10 * 24 * time.Hour)
+	if err := store.SaveIgnores(context.Background(), fixtureProject, map[string]cache.IgnoreMeta{
+		"SNYK-100": {CreatedAt: first, DisregardIfFixable: true, UnignoredAt: oldEnd},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	newer := t0.Add(20 * 24 * time.Hour)
+	fx := &snykFixture{issues: []issueResource{fixtureIssue("issue-1", "SNYK-100", false)}, v1: map[string]v1ProjectIgnores{fixtureProject: {"SNYK-100": {disregardEntry(newer, time.Time{})}}}}
+	now := t0.Add(25 * 24 * time.Hour)
+	c := newSnapshotClient(t, fx, store, &now)
+	f := loadOne(t, c)
+	if !f.IgnoreEndedAt.Equal(now) {
+		t.Fatalf("end = %v, want first observation %v", f.IgnoreEndedAt, now)
+	}
+	now = now.Add(24 * time.Hour)
+	if next := loadOne(t, c); !next.IgnoreEndedAt.Equal(f.IgnoreEndedAt) {
+		t.Fatalf("unstable end: %v", next.IgnoreEndedAt)
+	}
+}
+
+func TestLoadSnapshotReusedIssueDoesNotInheritOldIgnore(t *testing.T) {
+	for _, untilFix := range []bool{false, true} {
+		t.Run(fmt.Sprint(untilFix), func(t *testing.T) {
+			store := openIgnoresStore(t)
+			entry := snooze(t0.Add(-24*time.Hour), t0.Add(2*24*time.Hour))
+			if untilFix {
+				entry.DisregardIfFixable = true
+			}
+			fx := &snykFixture{issues: []issueResource{fixtureIssue("issue-1", "SNYK-100", true)}, v1: map[string]v1ProjectIgnores{fixtureProject: {"SNYK-100": {entry}}}}
+			now := t0
+			c := newSnapshotClient(t, fx, store, &now)
+			loadOne(t, c)
+			fx.issues[0].Attributes.Ignored = false
+			now = t0.Add(5 * 24 * time.Hour)
+			same := loadOne(t, c)
+			if same.IgnoreExpiresAt.IsZero() {
+				t.Fatal("continuous occurrence lost expiry")
+			}
+			fx.issues[0].Attributes.Coordinates[0].LastResolvedAt = t0.Add(10 * 24 * time.Hour).Format(time.RFC3339)
+			fx.v1[fixtureProject] = v1ProjectIgnores{}
+			now = t0.Add(20 * 24 * time.Hour)
+			f := loadOne(t, c)
+			if !f.IgnoreExpiresAt.IsZero() || !f.IgnoreEndedAt.IsZero() || f.DisregardIfFixable {
+				t.Fatalf("new occurrence inherited history: %+v", f)
+			}
+		})
+	}
+}
+
+func TestLoadSnapshotRemembersColdStartBeforeSeeding(t *testing.T) {
+	store := openIgnoresStore(t)
+	fx := &snykFixture{issues: []issueResource{fixtureIssue("issue-1", "SNYK-100", true)}, v1: map[string]v1ProjectIgnores{fixtureProject: {"SNYK-100": {snooze(t0, t0.Add(24*time.Hour))}}}}
+	now := t0
+	c := newSnapshotClient(t, fx, store, &now)
+	// A diagnostic load can seed the cache before Service.Run ever sees it.
+	loadOne(t, c)
+	present, err := store.HasIgnoreRows(context.Background())
+	if err != nil || !present {
+		t.Fatalf("seeded rows: %v, %v", present, err)
+	}
+	pending, err := cache.PrepareIgnoreMemory(context.Background(), store)
+	if err != nil || !pending {
+		t.Fatalf("lost cold-start evidence: %v, %v", pending, err)
+	}
+}
+
+func TestLoadSnapshotNewRuleIgnoreDoesNotRewriteSiblingHistory(t *testing.T) {
+	for _, permanent := range []bool{false, true} {
+		t.Run(fmt.Sprint("permanent-", permanent), func(t *testing.T) {
+			store := openIgnoresStore(t)
+			a, b := fixtureIssue("issue-1", "", true), fixtureIssue("issue-2", "", false)
+			a.Attributes.Problems = []problem{{ID: "RULE-1"}}
+			b.Attributes.Problems = []problem{{ID: "RULE-1"}}
+			fx := &snykFixture{issues: []issueResource{a, b}, v1: map[string]v1ProjectIgnores{fixtureProject: {"RULE-1": {disregardEntry(t0, time.Time{})}}}}
+			now := t0
+			c := newSnapshotClient(t, fx, store, &now)
+			if _, err := c.LoadSnapshot(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			fx.issues[0].Attributes.Ignored = false
+			now = t0.Add(10 * 24 * time.Hour)
+			end := now
+			if _, err := c.LoadSnapshot(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			// A later path-scoped ignore covers B, while A remains actionable.
+			fx.issues[1].Attributes.Ignored = true
+			expiry := t0.Add(90 * 24 * time.Hour)
+			if permanent {
+				expiry = time.Time{}
+			}
+			fx.v1[fixtureProject] = v1ProjectIgnores{"RULE-1": {snooze(t0.Add(20*24*time.Hour), expiry)}}
+			now = t0.Add(25 * 24 * time.Hour)
+			for run := range 2 {
+				snapshot, err := c.LoadSnapshot(context.Background())
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, f := range snapshot.Findings {
+					if f.SnykIssueID == "issue-1" && (!f.DisregardIfFixable || !f.IgnoreEndedAt.Equal(end) || !f.IgnoreExpiresAt.IsZero()) {
+						t.Fatalf("sibling rewrote A's history: %+v", f)
+					}
+					if run == 1 && f.SnykIssueID == "issue-2" && (!f.IgnoreExpiresAt.IsZero() || f.DisregardIfFixable) {
+						t.Fatalf("revoked sibling retained history: %+v", f)
+					}
+				}
+				// Snyk revokes B's newer ignore and stops returning its entry.
+				fx.issues[1].Attributes.Ignored = false
+				fx.v1[fixtureProject] = v1ProjectIgnores{}
+				now = now.Add(10 * 24 * time.Hour)
+			}
+		})
+	}
+}
+
+func TestIgnoreMemorySurvivesPartialCoordinateResolution(t *testing.T) {
+	meta := ignoreMetadata{CreatedAt: t0, ExpiresAt: t0.Add(2 * 24 * time.Hour)}
+	coordinates := []coordinate{{LastResolvedAt: t0.Add(24 * time.Hour).Format(time.RFC3339)}, {State: "open"}}
+	if ignorePredatesResolvedOccurrence(meta, coordinates) {
+		t.Fatal("one resolved coordinate erased a continuously open occurrence's memory")
+	}
+	coordinates[1].LastResolvedAt = "unparseable"
+	if ignorePredatesResolvedOccurrence(meta, coordinates) {
+		t.Fatal("unparseable resolution erased history")
+	}
+}
+
+func TestLoadSnapshotDirectIgnoreDoesNotAcquireSiblingRuleHistory(t *testing.T) {
+	for _, liveRule := range []bool{false, true} {
+		t.Run(fmt.Sprint("live-rule-", liveRule), func(t *testing.T) {
+			store := openIgnoresStore(t)
+			a, b := fixtureIssue("issue-1", "", false), fixtureIssue("issue-2", "", true)
+			a.Attributes.Problems = []problem{{ID: "RULE-1"}}
+			b.Attributes.Problems = []problem{{ID: "RULE-1"}}
+			expiry := t0.Add(2 * 24 * time.Hour)
+			fx := &snykFixture{issues: []issueResource{a, b}, v1: map[string]v1ProjectIgnores{fixtureProject: {"RULE-1": {snooze(t0, expiry)}}}}
+			now := t0
+			c := newSnapshotClient(t, fx, store, &now)
+			if _, err := c.LoadSnapshot(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			// Rule snooze on B expires. A receives an independent permanent UUID ignore.
+			now = t0.Add(10 * 24 * time.Hour)
+			fx.issues[0].Attributes.Ignored = true
+			fx.issues[1].Attributes.Ignored = false
+			fx.v1[fixtureProject] = v1ProjectIgnores{"issue-1": {snooze(now, time.Time{})}}
+			if liveRule {
+				fx.v1[fixtureProject]["RULE-1"] = []v1IgnoreEntry{snooze(t0, expiry)}
+			}
+			if _, err := c.LoadSnapshot(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			// Lift only A's permanent ignore. A never had a timed or until-fix ignore.
+			now = t0.Add(20 * 24 * time.Hour)
+			fx.issues[0].Attributes.Ignored = false
+			fx.v1[fixtureProject] = v1ProjectIgnores{}
+			snap, err := c.LoadSnapshot(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, f := range snap.Findings {
+				if f.SnykIssueID == "issue-1" && !f.IgnoreExpiresAt.IsZero() {
+					t.Fatalf("A inherited B-only expiry %s", f.IgnoreExpiresAt)
+				}
+			}
+
+		})
+	}
+}
+
+// The same live creation timestamp must not repeatedly reset the ignore end
+// merely because older cache versions discarded fractional seconds.
+func TestLoadSnapshotFractionalIgnoreCreationKeepsObservedEnd(t *testing.T) {
+	for _, legacy := range []bool{false, true} {
+		t.Run(fmt.Sprint("legacy-seconds-", legacy), func(t *testing.T) {
+			store := openIgnoresStore(t)
+			created := t0.Add(123 * time.Millisecond)
+			cachedCreated := created
+			if legacy {
+				cachedCreated = cachedCreated.Truncate(time.Second)
+			}
+			oldEnd := t0.Add(10 * 24 * time.Hour)
+			if err := store.SaveIgnores(context.Background(), fixtureProject, map[string]cache.IgnoreMeta{
+				"SNYK-100": {CreatedAt: cachedCreated, DisregardIfFixable: true, UnignoredAt: oldEnd},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			fx := &snykFixture{issues: []issueResource{fixtureIssue("issue-1", "SNYK-100", false)}, v1: map[string]v1ProjectIgnores{fixtureProject: {"SNYK-100": {disregardEntry(created, time.Time{})}}}}
+			now := t0.Add(20 * 24 * time.Hour)
+			c := newSnapshotClient(t, fx, store, &now)
+			for range 2 {
+				if f := loadOne(t, c); !f.IgnoreEndedAt.Equal(oldEnd) {
+					t.Fatalf("same ignore reset its observed end: %v, want %v", f.IgnoreEndedAt, oldEnd)
+				}
+				row, ok := cachedRow(t, store, "SNYK-100")
+				if !ok || !row.CreatedAt.Equal(created) {
+					t.Fatalf("creation precision lost: %+v", row)
+				}
+				now = now.Add(24 * time.Hour)
+			}
+		})
 	}
 }

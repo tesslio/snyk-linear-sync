@@ -3,6 +3,7 @@ package sync
 import (
 	"bytes"
 	"context"
+	"errors"
 	"log/slog"
 	"strings"
 	"testing"
@@ -303,5 +304,91 @@ func TestRunColdStartGuardNeedsOpenDatedTickets(t *testing.T) {
 	}
 	if result.HeldDueDates != 0 {
 		t.Fatalf("HeldDueDates = %d, want 0", result.HeldDueDates)
+	}
+}
+
+type snapshotLoaderFunc func(context.Context) (model.SnykSnapshot, error)
+
+func (f snapshotLoaderFunc) LoadSnapshot(ctx context.Context) (model.SnykSnapshot, error) {
+	return f(ctx)
+}
+
+type failingSnapshotLinear struct {
+	*fakeLinear
+	seeded <-chan struct{}
+}
+
+func (l failingSnapshotLinear) LoadSnapshot(context.Context) ([]model.ExistingIssue, error) {
+	<-l.seeded
+	return nil, errors.New("fixture snapshot failure")
+}
+
+func TestRunColdStartSurvivesFailedLoads(t *testing.T) {
+	for _, failing := range []string{"linear", "snyk-after-commit"} {
+		t.Run(failing, func(t *testing.T) {
+			cfg := minimalCfg()
+			finding := fixArrivedFinding()
+			finding.DisregardIfFixable = false
+			finding.IgnoreEndedAt = time.Time{}
+			existing := storedIssue("existing-1", "SEC-1", "Todo", desiredIssue(cfg, finding))
+			existing.DueDate = "2026-06-30"
+			store := &fakeCache{}
+			seeded := make(chan struct{})
+			snyk := snapshotLoaderFunc(func(context.Context) (model.SnykSnapshot, error) {
+				store.ignoreRows = true // the Snyk loader independently committed rows
+				close(seeded)
+				if failing == "snyk-after-commit" {
+					return model.SnykSnapshot{}, errors.New("fixture post-commit failure")
+				}
+				return model.SnykSnapshot{Findings: []model.Finding{finding}}, nil
+			})
+			var linear LinearClient = &fakeLinear{snapshot: []model.ExistingIssue{existing}}
+			if failing == "linear" {
+				linear = failingSnapshotLinear{fakeLinear: &fakeLinear{}, seeded: seeded}
+			}
+			if _, err := New(cfg, discardLogger(), snyk, linear, store).Run(context.Background()); err == nil {
+				t.Fatal("want failed load")
+			}
+			if !store.ignoreRows {
+				t.Fatal("fixture did not seed ignores")
+			}
+			retryLinear := &fakeLinear{snapshot: []model.ExistingIssue{existing}}
+			retrySnyk := fakeSnyk{snapshot: model.SnykSnapshot{Findings: []model.Finding{finding}, ProjectIDs: map[string]struct{}{"project-a": {}}}}
+			result, err := New(cfg, discardLogger(), retrySnyk, retryLinear, store).Run(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.HeldDueDates != 1 || len(retryLinear.updated) != 0 {
+				t.Fatalf("retry lost protection: held %d updates %+v", result.HeldDueDates, retryLinear.updated)
+			}
+		})
+	}
+}
+
+func TestRunClearColdStartWithNoIgnoresStaysReleased(t *testing.T) {
+	cfg := minimalCfg()
+	cfg.Cache.ClearIgnoresColdStart = true
+	finding := fixArrivedFinding()
+	finding.DisregardIfFixable = false
+	finding.IgnoreEndedAt = time.Time{}
+	existing := storedIssue("existing-1", "SEC-1", "Todo", desiredIssue(cfg, finding))
+	existing.DueDate = "2026-06-30"
+	store := &fakeCache{meta: map[string]string{ignoresColdStartMetaKey: "2026-01-01T00:00:00Z"}}
+	snyk := fakeSnyk{snapshot: model.SnykSnapshot{Findings: []model.Finding{finding}, ProjectIDs: map[string]struct{}{"project-a": {}}}}
+	for run := range 2 {
+		linear := &fakeLinear{snapshot: []model.ExistingIssue{existing}}
+		result, err := New(cfg, discardLogger(), snyk, linear, store).Run(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Supply the original later date again on the normal run, proving this
+		// is a durable release even when another ticket still needs correction.
+		if result.HeldDueDates != 0 || len(linear.updated) != 1 || linear.updated[0].DueDate != "2026-01-31" {
+			t.Fatalf("run %d: held %d updates %+v", run, result.HeldDueDates, linear.updated)
+		}
+		if _, ok := store.meta[ignoresColdStartMetaKey]; ok {
+			t.Fatal("marker recreated")
+		}
+		cfg.Cache.ClearIgnoresColdStart = false
 	}
 }

@@ -452,6 +452,8 @@ Snyk's v1 ignores endpoint stops returning an expired ignore after a while, but 
 
 A v1 request that fails or 404s after its retries falls back to the cached rows and never drops one. Rows written by older versions are kept too.
 
+Rule-keyed ignores may cover only some findings. The cache records each finding observed ignored under a rule, with its own expiry and first observed end, so that history remains available after the finding becomes actionable without changing a never-ignored sibling's SLA. Superseding or revoking a newer rule ignore preserves older expired-snooze or until-fix observations belonging to other findings. Cached-only rule metadata cannot establish a new finding association, and a newer direct-key ignore prevents attributing an older rule ignore to that finding. Legacy rule rows without these observations cannot reconstruct which findings were ignored. A newer direct-key ignore starts a new lifecycle; if it is already lifted when first seen, that observation starts its SLA. An open, unignored occurrence does not inherit an ignore that predates a known resolution of every coordinate.
+
 ### Cold-start guard
 
 A run that starts with an empty ignore memory (a new or lost cache file) while Linear already holds open tickets with due dates cannot tell an earlier due date that is a real change from one that only reflects an expiry it no longer remembers. Such a run keeps the current due date of any matched open ticket whose desired date is earlier, logs a warning with the count (`held_due_dates` in the summary), and leaves an `ignores_cold_start_at` marker in the cache so later runs keep holding too. Later due dates still apply. Once the ignore memory is trusted again, release the held dates with:
@@ -460,7 +462,9 @@ A run that starts with an empty ignore memory (a new or lost cache file) while L
 go run ./cmd/snyk-linear-sync --env-file .env --clear-ignores-cold-start
 ```
 
-Deleting the `ignores_cold_start_at` row from the cache's `sync_meta` table has the same effect. A fresh deployment with no open dated tickets never engages the guard.
+The cache records a pending empty start under the `ignores_memory_state` key in `sync_meta` before any snapshot loader can seed rows, including diagnostic loads. Failed or interrupted loads keep that evidence for the next run. A successful load with no open dated tickets marks the memory trusted without engaging the guard.
+
+The clear flag records that the memory is trusted and removes the cold-start marker. This release persists even when there are no cacheable ignores, so the next normal run stays released. Deleting only `ignores_cold_start_at` does not release pending memory; use the flag.
 
 ## Configuration
 

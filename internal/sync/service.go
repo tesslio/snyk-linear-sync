@@ -75,7 +75,8 @@ type coldStartGuard struct {
 	// cache was empty at run start while Linear holds managed open tickets
 	// with due dates (the marker is then written).
 	active bool
-	// tableEmpty records that the ignore cache held no row at run start.
+	// tableEmpty records an untrusted empty start, including a previous load
+	// that seeded rows before failing.
 	tableEmpty bool
 	// since is the marker's value: when the guard engaged.
 	since string
@@ -236,6 +237,12 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 			slog.String("marker", ignoresColdStartMetaKey),
 			slog.String("since", guard.since),
 		)
+	}
+
+	if guard.tableEmpty && !guard.active {
+		if err := s.cache.SetMeta(ctx, cache.IgnoreMemoryStateKey, cache.IgnoreMemoryTrusted); err != nil {
+			return RunResult{}, err
+		}
 	}
 
 	// Stored fingerprints are canonicalized before any comparison: Linear's
@@ -2135,13 +2142,17 @@ func isConfiguredBacklogState(existingStateName, configuredBacklog string) bool 
 
 // ignoresColdStartGuard reads the guard's state at the start of a run:
 // clears the marker when asked, then reports the marker or, without one,
-// whether the ignore cache is empty.
+// whether the memory began empty and still needs reconciliation.
 func (s *Service) ignoresColdStartGuard(ctx context.Context) (coldStartGuard, error) {
 	var guard coldStartGuard
 	if s.cache == nil {
 		return guard, nil
 	}
 	if s.cfg.Cache.ClearIgnoresColdStart {
+		// Trust persists even if Snyk has no cacheable ignores, or loading fails.
+		if err := s.cache.SetMeta(ctx, cache.IgnoreMemoryStateKey, cache.IgnoreMemoryTrusted); err != nil {
+			return guard, err
+		}
 		if err := s.cache.DeleteMeta(ctx, ignoresColdStartMetaKey); err != nil {
 			return guard, err
 		}
@@ -2158,11 +2169,11 @@ func (s *Service) ignoresColdStartGuard(ctx context.Context) (coldStartGuard, er
 		guard.since = since
 		return guard, nil
 	}
-	present, err := s.cache.HasIgnoreRows(ctx)
+	pending, err := cache.PrepareIgnoreMemory(ctx, s.cache)
 	if err != nil {
 		return guard, err
 	}
-	guard.tableEmpty = !present
+	guard.tableEmpty = pending
 	return guard, nil
 }
 

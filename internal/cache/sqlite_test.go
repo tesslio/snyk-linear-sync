@@ -179,3 +179,33 @@ func TestIgnoreRowsPresenceAndMeta(t *testing.T) {
 		t.Fatalf("DeleteMeta() of an absent key error = %v, want nil", err)
 	}
 }
+
+func TestIgnoreAssociationsSurviveReopen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cache.db")
+	ctx := context.Background()
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	end := time.Date(2026, time.March, 1, 0, 0, 0, 0, time.UTC)
+	if err := store.SaveIgnores(ctx, "project-a", map[string]IgnoreMeta{"RULE-1": {
+		ObservedIssues: map[string]IgnoreObservation{"issue-1": {EndedAt: end}, "issue-2": {}},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	rows, err := store.LoadIgnores(ctx, "project-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := rows["RULE-1"].ObservedIssues; len(got) != 2 || !got["issue-1"].EndedAt.Equal(end) || !got["issue-2"].EndedAt.IsZero() {
+		t.Fatalf("associations = %v", got)
+	}
+}
