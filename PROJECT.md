@@ -303,7 +303,14 @@ It uses:
 - concurrent Snyk and Linear snapshot loading
 - worker-based reconciliation
 - batched Linear mutations
-- rate-limit backoff
+- rate-limit backoff -- a rate-limit error that arrives as a per-alias GraphQL
+  error joined onto a response whose other aliases decoded is not re-sent:
+  those aliases already took effect, and re-sending the batch would duplicate
+  them. Only an operation that decoded nothing is retried, and reads (which
+  decode into structs and cannot duplicate anything) keep the full retry.
+  `gqlclient` decodes the response body before returning any GraphQL error, so
+  a create or comment batch that returns an error alongside decoded aliases
+  reports only the failed aliases for retry instead of failing the whole batch.
 - SQLite caching
 
 The cache is critical for steady-state performance. A healthy steady-state run should do little or no work when nothing has changed.
