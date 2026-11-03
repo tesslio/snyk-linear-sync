@@ -392,3 +392,23 @@ func TestRunClearColdStartWithNoIgnoresStaysReleased(t *testing.T) {
 		cfg.Cache.ClearIgnoresColdStart = false
 	}
 }
+
+func TestRunIgnoreMemoryFailureDoesNotReconcileLinear(t *testing.T) {
+	cfg := minimalCfg()
+	finding := fixArrivedFinding()
+	awaiting := finding
+	awaiting.Status = model.FindingAwaitingFix
+	awaiting.IgnoreEndedAt = time.Time{}
+	existing := storedIssue("existing-1", "SEC-1", "Backlog", desiredIssue(cfg, awaiting))
+	linear := &fakeLinear{snapshot: []model.ExistingIssue{existing}}
+	wantErr := errors.New("fixture ignore-memory persistence failure")
+	snyk := snapshotLoaderFunc(func(context.Context) (model.SnykSnapshot, error) {
+		return model.SnykSnapshot{}, wantErr
+	})
+	if _, err := New(cfg, discardLogger(), snyk, linear, &fakeCache{ignoreRows: true}).Run(context.Background()); !errors.Is(err, wantErr) {
+		t.Fatalf("Run error = %v, want ignore-memory failure", err)
+	}
+	if len(linear.created) != 0 || len(linear.updated) != 0 || len(linear.comments) != 0 {
+		t.Fatalf("failed load mutated Linear: creates %d updates %d comments %d", len(linear.created), len(linear.updated), len(linear.comments))
+	}
+}

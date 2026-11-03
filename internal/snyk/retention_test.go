@@ -2,6 +2,7 @@ package snyk
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -842,5 +843,112 @@ func TestLoadSnapshotFractionalIgnoreCreationKeepsObservedEnd(t *testing.T) {
 				now = now.Add(24 * time.Hour)
 			}
 		})
+	}
+}
+
+// Keep the real SQLite transaction boundary while injecting storage faults.
+func faultableIgnoresStore(t *testing.T) (*cache.Store, *sql.DB) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "cache.db")
+	store, err := cache.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	return store, db
+}
+
+func TestLoadSnapshotIgnoreMemoryWriteFailureAborts(t *testing.T) {
+	store, db := faultableIgnoresStore(t)
+	fx := &snykFixture{
+		issues: []issueResource{fixtureIssue("issue-1", "SNYK-100", true)},
+		v1: map[string]v1ProjectIgnores{fixtureProject: {
+			"SNYK-100": {disregardEntry(t0.Add(-24*time.Hour), time.Time{})},
+		}},
+	}
+	now := t0
+	c := newSnapshotClient(t, fx, store, &now)
+	loadOne(t, c)
+
+	// The ignore ends, but its first observed end cannot be committed.
+	fx.issues[0].Attributes.Ignored = false
+	fx.v1[fixtureProject] = v1ProjectIgnores{}
+	if _, err := db.Exec(`CREATE TRIGGER fail_ignore_write BEFORE INSERT ON snyk_ignores BEGIN SELECT RAISE(ABORT, 'fixture ignore write failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	for _, days := range []int{10, 11} {
+		now = t0.Add(time.Duration(days) * 24 * time.Hour)
+		snapshot, err := c.LoadSnapshot(context.Background())
+		if err == nil || !strings.Contains(err.Error(), "persist ignore memory") {
+			t.Fatalf("day %d: error = %v, want persistence failure", days, err)
+		}
+		if len(snapshot.Findings) != 0 {
+			t.Fatalf("day %d: published %d findings with an unpersisted SLA base", days, len(snapshot.Findings))
+		}
+		row, ok := cachedRow(t, store, "SNYK-100")
+		if !ok || !row.DisregardIfFixable || !row.UnignoredAt.IsZero() {
+			t.Fatalf("day %d: failed write changed prior memory: %+v", days, row)
+		}
+	}
+
+	if _, err := db.Exec(`DROP TRIGGER fail_ignore_write`); err != nil {
+		t.Fatal(err)
+	}
+	now = t0.Add(12 * 24 * time.Hour)
+	persisted := loadOne(t, c)
+	if !persisted.IgnoreEndedAt.Equal(now) {
+		t.Fatalf("recovery end = %v, want first durable observation %v", persisted.IgnoreEndedAt, now)
+	}
+	row, ok := cachedRow(t, store, "SNYK-100")
+	if !ok || !row.UnignoredAt.Equal(persisted.IgnoreEndedAt) {
+		t.Fatalf("recovery published an unpersisted end: %+v", row)
+	}
+	now = t0.Add(30 * 24 * time.Hour)
+	if next := loadOne(t, c); !next.IgnoreEndedAt.Equal(persisted.IgnoreEndedAt) {
+		t.Fatalf("later run moved the persisted SLA base from %v to %v", persisted.IgnoreEndedAt, next.IgnoreEndedAt)
+	}
+}
+
+func TestLoadSnapshotIgnoreMemoryReadFailureAborts(t *testing.T) {
+	store, db := faultableIgnoresStore(t)
+	fx := &snykFixture{
+		issues: []issueResource{fixtureIssue("issue-1", "SNYK-100", true)},
+		v1: map[string]v1ProjectIgnores{fixtureProject: {
+			"SNYK-100": {disregardEntry(t0.Add(-24*time.Hour), time.Time{})},
+		}},
+	}
+	now := t0
+	c := newSnapshotClient(t, fx, store, &now)
+	loadOne(t, c)
+	fx.issues[0].Attributes.Ignored = false
+	fx.v1[fixtureProject] = v1ProjectIgnores{}
+
+	// Only ignore-row reads fail; the metadata preparation can still succeed.
+	if _, err := db.Exec(`ALTER TABLE snyk_ignores RENAME TO unavailable_ignores`); err != nil {
+		t.Fatal(err)
+	}
+	now = t0.Add(10 * 24 * time.Hour)
+	snapshot, err := c.LoadSnapshot(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "load cached ignore memory") {
+		t.Fatalf("error = %v, want ignore-memory read failure", err)
+	}
+	if len(snapshot.Findings) != 0 {
+		t.Fatalf("published %d findings without durable ignore history", len(snapshot.Findings))
+	}
+	if _, err := db.Exec(`ALTER TABLE unavailable_ignores RENAME TO snyk_ignores`); err != nil {
+		t.Fatal(err)
+	}
+	row, ok := cachedRow(t, store, "SNYK-100")
+	if !ok || !row.DisregardIfFixable || !row.UnignoredAt.IsZero() {
+		t.Fatalf("failed read changed prior memory: %+v", row)
+	}
+	now = t0.Add(11 * 24 * time.Hour)
+	if recovered := loadOne(t, c); !recovered.IgnoreEndedAt.Equal(now) {
+		t.Fatalf("recovery end = %v, want %v", recovered.IgnoreEndedAt, now)
 	}
 }

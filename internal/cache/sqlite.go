@@ -186,11 +186,8 @@ func (s *Store) Save(ctx context.Context, snapshot Snapshot) error {
 	if err != nil {
 		return fmt.Errorf("begin cache transaction: %w", err)
 	}
-	defer func() {
-		if err != nil {
-			_ = tx.Rollback()
-		}
-	}()
+	// Rollback also runs on shadowed error paths; after Commit it is a no-op.
+	defer func() { _ = tx.Rollback() }()
 
 	query, args, err := s.builder.
 		Insert("sync_meta").
@@ -514,11 +511,8 @@ func (s *Store) SaveIgnores(ctx context.Context, projectID string, ignores map[s
 	if err != nil {
 		return fmt.Errorf("begin cache ignores transaction: %w", err)
 	}
-	defer func() {
-		if err != nil {
-			_ = tx.Rollback()
-		}
-	}()
+	// Rollback also runs on shadowed error paths; after Commit it is a no-op.
+	defer func() { _ = tx.Rollback() }()
 
 	query, args, err := s.builder.
 		Delete("snyk_ignores").

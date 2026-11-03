@@ -330,7 +330,9 @@ func (c *Client) LoadSnapshot(ctx context.Context) (model.SnykSnapshot, error) {
 
 	now := c.clock()
 	for projectID, state := range ignoresByProject {
-		c.commitProjectIgnores(ctx, projectID, state, now)
+		if err := c.commitProjectIgnores(ctx, projectID, state, now); err != nil {
+			return model.SnykSnapshot{}, err
+		}
 	}
 
 	// k8sClusterCache holds the cluster name for kubernetes-origin projects,
@@ -858,9 +860,15 @@ func (p *projectIgnores) endedAt(keys []string, issue issueResource) time.Time {
 
 // commitProjectIgnores applies the retention decision for one project: it
 // logs the dropped keys, writes the retained rows to the cache, and narrows
-// the entries findings are built from to those rows.
-func (c *Client) commitProjectIgnores(ctx context.Context, projectID string, state *projectIgnores, now time.Time) {
+// the entries findings are built from to those rows. Persistence must succeed
+// before a finding exposes a new SLA base to Linear reconciliation.
+func (c *Client) commitProjectIgnores(ctx context.Context, projectID string, state *projectIgnores, now time.Time) error {
 	rows, dropped := state.retain(now)
+	if c.cache != nil {
+		if err := c.cache.SaveIgnores(ctx, projectID, rows); err != nil {
+			return fmt.Errorf("persist ignore memory for project %s: %w", projectID, err)
+		}
+	}
 	for _, key := range dropped {
 		c.logger.Info("dropping cached ignore the v1 API stopped returning: its finding is open and not ignored while the snooze has not expired, so Snyk revoked it",
 			slog.String("project_id", projectID),
@@ -869,15 +877,8 @@ func (c *Client) commitProjectIgnores(ctx context.Context, projectID string, sta
 			slog.Time("last_confirmed_at", state.cached[key].UpdatedAt),
 		)
 	}
-	if c.cache != nil {
-		if err := c.cache.SaveIgnores(ctx, projectID, rows); err != nil {
-			c.logger.Warn("failed to cache v1 ignores",
-				"project_id", projectID,
-				"error", err,
-			)
-		}
-	}
 	state.finalize(rows)
+	return nil
 }
 
 // fetchProjectIgnores reads a project's v1 ignores and merges them with the
@@ -893,10 +894,9 @@ func (c *Client) fetchProjectIgnores(ctx context.Context, projectID string) (*pr
 	if c.cache != nil {
 		cachedMeta, err := c.cache.LoadIgnores(ctx, projectID)
 		if err != nil {
-			c.logger.Warn("failed to load cached v1 ignores",
-				"project_id", projectID,
-				"error", err,
-			)
+			// API fallback cannot reconstruct forgotten history, and saving
+			// that partial view could overwrite the unread durable memory.
+			return nil, fmt.Errorf("load cached ignore memory for project %s: %w", projectID, err)
 		} else if len(cachedMeta) > 0 {
 			state.cached = cachedMeta
 			cached = cacheIgnoresToV1(cachedMeta)

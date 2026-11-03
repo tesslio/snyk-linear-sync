@@ -209,3 +209,45 @@ func TestIgnoreAssociationsSurviveReopen(t *testing.T) {
 		t.Fatalf("associations = %v", got)
 	}
 }
+
+func TestSaveIgnoresRollsBackFailedReplacement(t *testing.T) {
+	store := openTestStore(t)
+	store.db.SetMaxOpenConns(1)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	originalExpiry := time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)
+	if err := store.SaveIgnores(ctx, "project-a", map[string]IgnoreMeta{
+		"SNYK-100": {ExpiresAt: originalExpiry},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `CREATE TRIGGER fail_ignore_write BEFORE INSERT ON snyk_ignores BEGIN SELECT RAISE(ABORT, 'fixture ignore write failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveIgnores(ctx, "project-a", map[string]IgnoreMeta{
+		"SNYK-200": {ExpiresAt: originalExpiry.Add(24 * time.Hour)},
+	}); err == nil {
+		t.Fatal("want failed replacement")
+	}
+	// The failed transaction must release this same connection immediately,
+	// and its preceding DELETE must not erase the old row.
+	rows, err := store.LoadIgnores(ctx, "project-a")
+	if err != nil {
+		t.Fatalf("read after failed replacement: %v", err)
+	}
+	if len(rows) != 1 || !rows["SNYK-100"].ExpiresAt.Equal(originalExpiry) {
+		t.Fatalf("failed replacement changed prior rows: %+v", rows)
+	}
+	if _, err := store.db.ExecContext(ctx, `DROP TRIGGER fail_ignore_write`); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveIgnores(ctx, "project-a", map[string]IgnoreMeta{
+		"SNYK-200": {ExpiresAt: originalExpiry.Add(24 * time.Hour)},
+	}); err != nil {
+		t.Fatalf("retry after removing fault: %v", err)
+	}
+	rows, err = store.LoadIgnores(ctx, "project-a")
+	if err != nil || len(rows) != 1 || rows["SNYK-200"].ExpiresAt.IsZero() {
+		t.Fatalf("retry rows = %+v error = %v", rows, err)
+	}
+}

@@ -1099,7 +1099,9 @@ func TestFetchProjectIgnoresPreservesUpdatedAtForUnconfirmedKeys(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fetchProjectIgnores() error = %v", err)
 	}
-	c.commitProjectIgnores(ctx, projectID, state, c.clock())
+	if err := c.commitProjectIgnores(ctx, projectID, state, c.clock()); err != nil {
+		t.Fatalf("commitProjectIgnores() error = %v", err)
+	}
 
 	loaded, err := store.LoadIgnores(ctx, projectID)
 	if err != nil {
