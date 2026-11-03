@@ -1,7 +1,9 @@
 package sync
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -186,5 +188,120 @@ func TestRunAwaitingFixLabelOffDueDateComesFromIgnoreEnd(t *testing.T) {
 	}
 	if updated.State != model.StateBacklog || !updated.PreserveState {
 		t.Fatalf("state %q preserve %v, want Backlog preserved for a ticket without the marker", updated.State, updated.PreserveState)
+	}
+}
+
+// TestRunColdStartGuardHoldsEarlierDueDates: on a run that starts with an
+// empty ignore cache while Linear holds open tickets with due dates, an
+// earlier desired due date is not written (it may only reflect an ignore
+// expiry the sync has no memory of), a warning names the count, and a marker
+// keeps the guard holding on later runs, even once the cache has rows. A
+// later desired date still applies. Clearing the marker releases the guard.
+func TestRunColdStartGuardHoldsEarlierDueDates(t *testing.T) {
+	cfg := minimalCfg()
+	finding := fixArrivedFinding()
+	finding.DisregardIfFixable = false
+	finding.IgnoreEndedAt = time.Time{}
+	// Desired: created_at + 30 = 2026-01-31. The ticket was written with a
+	// later date by an earlier deployment that still remembered a snooze.
+	existing := storedIssue("existing-1", "SEC-1", "Todo", desiredIssue(cfg, finding))
+	existing.DueDate = "2026-06-30"
+
+	store := &fakeCache{}
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+
+	run := func(name string, f model.Finding, snapshot []model.ExistingIssue) (RunResult, *fakeLinear) {
+		t.Helper()
+		logs.Reset()
+		store.snapshot = store.saved
+		snyk := fakeSnyk{snapshot: model.SnykSnapshot{Findings: []model.Finding{f}, ProjectIDs: map[string]struct{}{"project-a": {}}}}
+		linear := &fakeLinear{snapshot: snapshot}
+		result, err := New(cfg, logger, snyk, linear, store).Run(context.Background())
+		if err != nil {
+			t.Fatalf("%s: Run() error = %v", name, err)
+		}
+		return result, linear
+	}
+
+	// Run 1: empty ignore cache, open dated ticket: the guard engages.
+	result, linear := run("cold start", finding, []model.ExistingIssue{existing})
+	if len(linear.updated) != 0 {
+		t.Fatalf("cold start: updated %+v, want nothing (the earlier date is held)", linear.updated)
+	}
+	if result.HeldDueDates != 1 {
+		t.Fatalf("cold start: HeldDueDates = %d, want 1", result.HeldDueDates)
+	}
+	if !strings.Contains(logs.String(), "level=WARN") || !strings.Contains(logs.String(), "held_due_dates=1") {
+		t.Fatalf("cold start: want a warning naming the held count, got:\n%s", logs.String())
+	}
+	since, ok := store.meta[ignoresColdStartMetaKey]
+	if !ok || since == "" {
+		t.Fatalf("cold start: marker %q not set in cache meta: %v", ignoresColdStartMetaKey, store.meta)
+	}
+
+	// Run 2: the ignore cache has rows now, but the marker still holds.
+	store.ignoreRows = true
+	result, linear = run("marker holds", finding, []model.ExistingIssue{existing})
+	if len(linear.updated) != 0 || result.HeldDueDates != 1 {
+		t.Fatalf("marker holds: updated %+v held %d, want nothing updated and 1 held", linear.updated, result.HeldDueDates)
+	}
+
+	// Run 3: a later desired date is a real change and is written.
+	later := finding
+	later.IgnoreExpiresAt = time.Date(2026, time.September, 1, 0, 0, 0, 0, time.UTC)
+	result, linear = run("later date", later, []model.ExistingIssue{existing})
+	if len(linear.updated) != 1 || linear.updated[0].DueDate != "2026-10-01" {
+		t.Fatalf("later date: updated %+v, want one update to 2026-10-01", linear.updated)
+	}
+	if result.HeldDueDates != 0 {
+		t.Fatalf("later date: HeldDueDates = %d, want 0", result.HeldDueDates)
+	}
+
+	// Run 4: the operator clears the marker; the earlier date is written.
+	cfg.Cache.ClearIgnoresColdStart = true
+	result, linear = run("cleared", finding, []model.ExistingIssue{existing})
+	if _, ok := store.meta[ignoresColdStartMetaKey]; ok {
+		t.Fatalf("cleared: marker still set: %v", store.meta)
+	}
+	if len(linear.updated) != 1 || linear.updated[0].DueDate != "2026-01-31" {
+		t.Fatalf("cleared: updated %+v, want one update to 2026-01-31", linear.updated)
+	}
+	if result.HeldDueDates != 0 || strings.Contains(logs.String(), "cold-start guard is holding") {
+		t.Fatalf("cleared: HeldDueDates = %d, logs:\n%s", result.HeldDueDates, logs.String())
+	}
+
+	// Run 5: the guard stays released (rows present, no marker) and the
+	// ticket, now carrying the earlier date, is at steady state.
+	cfg.Cache.ClearIgnoresColdStart = false
+	written := storedIssue("existing-1", "SEC-1", "Todo", linear.updated[0])
+	if result, linear = run("released", finding, []model.ExistingIssue{written}); len(linear.updated) != 0 || result.HeldDueDates != 0 {
+		t.Fatalf("released: updated %+v held %d, want steady state", linear.updated, result.HeldDueDates)
+	}
+	if _, ok := store.meta[ignoresColdStartMetaKey]; ok {
+		t.Fatalf("released: marker re-set: %v", store.meta)
+	}
+}
+
+// TestRunColdStartGuardNeedsOpenDatedTickets: an empty ignore cache on a
+// fresh deployment with nothing open and dated in Linear has nothing to
+// protect, so no marker is left behind.
+func TestRunColdStartGuardNeedsOpenDatedTickets(t *testing.T) {
+	cfg := minimalCfg()
+	finding := fixArrivedFinding()
+	done := storedIssue("existing-1", "SEC-1", "Done", desiredIssue(cfg, finding))
+	done.DueDate = "2026-06-30"
+	store := &fakeCache{}
+	snyk := fakeSnyk{snapshot: model.SnykSnapshot{Findings: []model.Finding{finding}, ProjectIDs: map[string]struct{}{"project-a": {}}}}
+	linear := &fakeLinear{snapshot: []model.ExistingIssue{done}}
+	result, err := New(cfg, discardLogger(), snyk, linear, store).Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if _, ok := store.meta[ignoresColdStartMetaKey]; ok {
+		t.Fatalf("marker set with only a closed dated ticket: %v", store.meta)
+	}
+	if result.HeldDueDates != 0 {
+		t.Fatalf("HeldDueDates = %d, want 0", result.HeldDueDates)
 	}
 }

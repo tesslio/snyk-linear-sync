@@ -49,6 +49,38 @@ type LinearClient interface {
 type CacheStore interface {
 	Load(ctx context.Context) (cache.Snapshot, error)
 	Save(ctx context.Context, snapshot cache.Snapshot) error
+	// HasIgnoreRows reports whether the Snyk loader's ignore cache holds
+	// any row; GetMeta, SetMeta and DeleteMeta access the sync_meta table.
+	// The cold-start guard uses all four.
+	HasIgnoreRows(ctx context.Context) (bool, error)
+	GetMeta(ctx context.Context, key string) (string, bool, error)
+	SetMeta(ctx context.Context, key, value string) error
+	DeleteMeta(ctx context.Context, key string) error
+}
+
+// ignoresColdStartMetaKey is the sync_meta key the cold-start guard sets
+// when it engages. Its value is the RFC3339 time it engaged. The guard
+// holds until an operator clears the key (--clear-ignores-cold-start).
+const ignoresColdStartMetaKey = "ignores_cold_start_at"
+
+// coldStartGuard protects due dates against an empty ignore cache. The
+// Snyk loader's cache is the only memory of an expired ignore once Snyk
+// stops returning it, so on a run that starts with no cached ignores (a new
+// or lost cache file) an earlier due date the sync computes for an existing
+// ticket may only reflect that forgotten expiry, not a real change. While
+// the guard holds, a matched open ticket keeps its due date when the desired
+// one is earlier; later dates still apply.
+type coldStartGuard struct {
+	// active is set when the marker is in the cache, or when the ignore
+	// cache was empty at run start while Linear holds managed open tickets
+	// with due dates (the marker is then written).
+	active bool
+	// tableEmpty records that the ignore cache held no row at run start.
+	tableEmpty bool
+	// since is the marker's value: when the guard engaged.
+	since string
+	// held counts the due dates kept this run.
+	held int64
 }
 
 type Service struct {
@@ -107,7 +139,11 @@ type RunResult struct {
 	// DeferredCreates counts findings whose ticket creation was held back
 	// for the run because their cluster lookup failed while a recent rebind
 	// candidate might be theirs (see plausibleRebindCandidate).
-	DeferredCreates     int64
+	DeferredCreates int64
+	// HeldDueDates counts matched open tickets whose earlier desired due
+	// date was not written because the ignore-cache cold-start guard holds
+	// (see coldStartGuard). Zero when the guard is not engaged.
+	HeldDueDates        int64
 	PlannedCreates      int64
 	PlannedUpdates      int64
 	PlannedResolves     int64
@@ -157,6 +193,11 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 		}
 	}
 
+	guard, err := s.ignoresColdStartGuard(ctx)
+	if err != nil {
+		return RunResult{}, err
+	}
+
 	s.logger.Info("loading Snyk findings and Linear snapshot")
 	loadGroup, loadCtx := errgroup.WithContext(ctx)
 	loadGroup.Go(func() error {
@@ -180,6 +221,22 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 		slog.Int("findings", len(findings)),
 		slog.Int("existing_issues", len(existingIssues)),
 	)
+
+	if !guard.active && guard.tableEmpty && hasOpenTicketWithDueDate(existingIssues, s.cfg.Linear.States) {
+		// The sync has no memory of expired ignores while Linear already
+		// holds tickets whose due dates may have been based on one. Engage
+		// the guard and remember it: later runs have a populated cache but
+		// still no memory of what Snyk has already forgotten.
+		guard.active = true
+		guard.since = time.Now().UTC().Format(time.RFC3339)
+		if err := s.cache.SetMeta(ctx, ignoresColdStartMetaKey, guard.since); err != nil {
+			return RunResult{}, err
+		}
+		s.logger.Warn("ignore cache is empty while Linear holds open tickets with due dates; earlier due dates are held back until the cold-start marker is cleared (run with --clear-ignores-cold-start once the cache is trusted)",
+			slog.String("marker", ignoresColdStartMetaKey),
+			slog.String("since", guard.since),
+		)
+	}
 
 	// Stored fingerprints are canonicalized before any comparison: Linear's
 	// editor rewrites markdown-equivalent sequences in stored descriptions
@@ -458,6 +515,16 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 			// which the Snyk loader remembers in its ignore cache, so every
 			// run computes the same date (see issueDueDate). The marker
 			// only drives the move out of Backlog above.
+
+			// Cold-start guard: with no memory of expired ignores, an earlier
+			// due date may only mean a forgotten expiry. Keep the ticket's
+			// date; a later date is a real change and still applies.
+			if guard.active && guard.holds(existing, desired, s.cfg.Linear.States) {
+				desired.DueDate = existing.DueDate
+				desired.DueDateBase = existing.DueDate
+				desired.DueDateReason = "kept existing due date: the ignore cache started empty, so an earlier date may only reflect a forgotten ignore expiry"
+				guard.held++
+			}
 		}
 
 		if desired.Reopen {
@@ -490,6 +557,13 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 	result.Rebound = rebound
 	result.Reopened = reopened
 	result.DeferredCreates = int64(len(deferredFingerprints))
+	result.HeldDueDates = guard.held
+	if guard.active {
+		s.logger.Warn("ignore-cache cold-start guard is holding earlier due dates; clear it with --clear-ignores-cold-start once the ignore cache is trusted",
+			slog.String("since", guard.since),
+			slog.Int64("held_due_dates", guard.held),
+		)
+	}
 	var queuedJobs int64
 
 	g, workerCtx := errgroup.WithContext(runCtx)
@@ -2057,6 +2131,66 @@ func githubLineAnchor(finding model.Finding) string {
 // for common variants like "Canceled" → "Cancelled").
 func isConfiguredBacklogState(existingStateName, configuredBacklog string) bool {
 	return model.NormalizeWorkflowStateName(existingStateName) == model.NormalizeWorkflowStateName(configuredBacklog)
+}
+
+// ignoresColdStartGuard reads the guard's state at the start of a run:
+// clears the marker when asked, then reports the marker or, without one,
+// whether the ignore cache is empty.
+func (s *Service) ignoresColdStartGuard(ctx context.Context) (coldStartGuard, error) {
+	var guard coldStartGuard
+	if s.cache == nil {
+		return guard, nil
+	}
+	if s.cfg.Cache.ClearIgnoresColdStart {
+		if err := s.cache.DeleteMeta(ctx, ignoresColdStartMetaKey); err != nil {
+			return guard, err
+		}
+		s.logger.Info("cleared the ignore-cache cold-start marker; earlier due dates are written again",
+			slog.String("marker", ignoresColdStartMetaKey),
+		)
+	}
+	since, ok, err := s.cache.GetMeta(ctx, ignoresColdStartMetaKey)
+	if err != nil {
+		return guard, err
+	}
+	if ok {
+		guard.active = true
+		guard.since = since
+		return guard, nil
+	}
+	present, err := s.cache.HasIgnoreRows(ctx)
+	if err != nil {
+		return guard, err
+	}
+	guard.tableEmpty = !present
+	return guard, nil
+}
+
+// holds reports whether the guard keeps the existing ticket's due date: the
+// ticket is open and dated, and the desired date is earlier. Dates compare
+// as YYYY-MM-DD strings.
+func (g coldStartGuard) holds(existing model.ExistingIssue, desired model.DesiredIssue, states config.StateConfig) bool {
+	if existing.DueDate == "" || desired.DueDate == "" || existing.ArchivedAt != nil {
+		return false
+	}
+	if !isNonTerminalLinearState(existing, states) {
+		return false
+	}
+	return desired.DueDate < existing.DueDate
+}
+
+// hasOpenTicketWithDueDate reports whether any managed, non-archived open
+// ticket in the snapshot carries a due date.
+func hasOpenTicketWithDueDate(issues []model.ExistingIssue, states config.StateConfig) bool {
+	for _, issue := range issues {
+		if issue.Fingerprint == "" || issue.DueDate == "" || issue.ArchivedAt != nil {
+			continue
+		}
+		if isNonTerminalLinearState(issue, states) {
+			return true
+		}
+	}
+	return false
 }
 
 // wasAwaitingFix reports whether the existing Linear issue was previously in

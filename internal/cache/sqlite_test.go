@@ -130,3 +130,52 @@ func TestSaveIgnoresStampsUnknownConfirmationTime(t *testing.T) {
 		t.Fatalf("UpdatedAt = %v, want stamped at save time (after %v)", got, before)
 	}
 }
+
+// TestIgnoreRowsPresenceAndMeta covers the helpers the cold-start guard
+// relies on: whether the ignore cache holds any row, and the sync_meta
+// marker round trip.
+func TestIgnoreRowsPresenceAndMeta(t *testing.T) {
+	store := openTestStore(t)
+	ctx := context.Background()
+
+	present, err := store.HasIgnoreRows(ctx)
+	if err != nil || present {
+		t.Fatalf("HasIgnoreRows() on an empty cache = %v, %v; want false, nil", present, err)
+	}
+	if err := store.SaveIgnores(ctx, "project-a", map[string]IgnoreMeta{
+		"SNYK-100": {IssueKey: "SNYK-100", ExpiresAt: time.Now().UTC().Add(24 * time.Hour)},
+	}); err != nil {
+		t.Fatalf("SaveIgnores() error = %v", err)
+	}
+	present, err = store.HasIgnoreRows(ctx)
+	if err != nil || !present {
+		t.Fatalf("HasIgnoreRows() after a save = %v, %v; want true, nil", present, err)
+	}
+
+	if _, ok, err := store.GetMeta(ctx, "ignores_cold_start_at"); err != nil || ok {
+		t.Fatalf("GetMeta() before set = ok %v, err %v; want absent", ok, err)
+	}
+	if err := store.SetMeta(ctx, "ignores_cold_start_at", "2026-03-01T12:00:00Z"); err != nil {
+		t.Fatalf("SetMeta() error = %v", err)
+	}
+	value, ok, err := store.GetMeta(ctx, "ignores_cold_start_at")
+	if err != nil || !ok || value != "2026-03-01T12:00:00Z" {
+		t.Fatalf("GetMeta() = %q, %v, %v; want the stored value", value, ok, err)
+	}
+	// The sync snapshot save must not disturb other meta keys.
+	if err := store.Save(ctx, Snapshot{SchemaSignature: "sig", SnykHashes: map[string]string{}, LinearHashes: map[string]string{}}); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+	if _, ok, _ := store.GetMeta(ctx, "ignores_cold_start_at"); !ok {
+		t.Fatal("marker lost on snapshot save")
+	}
+	if err := store.DeleteMeta(ctx, "ignores_cold_start_at"); err != nil {
+		t.Fatalf("DeleteMeta() error = %v", err)
+	}
+	if _, ok, _ := store.GetMeta(ctx, "ignores_cold_start_at"); ok {
+		t.Fatal("marker still present after delete")
+	}
+	if err := store.DeleteMeta(ctx, "ignores_cold_start_at"); err != nil {
+		t.Fatalf("DeleteMeta() of an absent key error = %v, want nil", err)
+	}
+}

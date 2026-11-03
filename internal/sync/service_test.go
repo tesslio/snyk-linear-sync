@@ -58,6 +58,10 @@ type fakeLinear struct {
 type fakeCache struct {
 	snapshot cache.Snapshot
 	saved    cache.Snapshot
+	// ignoreRows stands in for the Snyk loader's ignore cache being
+	// non-empty; meta is the sync_meta table.
+	ignoreRows bool
+	meta       map[string]string
 }
 
 func (f *fakeLinear) LoadSnapshot(context.Context) ([]model.ExistingIssue, error) {
@@ -117,6 +121,28 @@ func (f *fakeCache) Load(context.Context) (cache.Snapshot, error) {
 
 func (f *fakeCache) Save(_ context.Context, snapshot cache.Snapshot) error {
 	f.saved = snapshot
+	return nil
+}
+
+func (f *fakeCache) HasIgnoreRows(context.Context) (bool, error) {
+	return f.ignoreRows, nil
+}
+
+func (f *fakeCache) GetMeta(_ context.Context, key string) (string, bool, error) {
+	value, ok := f.meta[key]
+	return value, ok, nil
+}
+
+func (f *fakeCache) SetMeta(_ context.Context, key, value string) error {
+	if f.meta == nil {
+		f.meta = map[string]string{}
+	}
+	f.meta[key] = value
+	return nil
+}
+
+func (f *fakeCache) DeleteMeta(_ context.Context, key string) error {
+	delete(f.meta, key)
 	return nil
 }
 

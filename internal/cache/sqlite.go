@@ -3,6 +3,7 @@ package cache
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -325,6 +326,85 @@ func (s *Store) migrateSnykIgnoresCache(ctx context.Context) error {
 		if _, err := s.db.ExecContext(ctx, "ALTER TABLE snyk_ignores ADD COLUMN unignored_at TEXT"); err != nil {
 			return fmt.Errorf("add unignored_at column: %w", err)
 		}
+	}
+	return nil
+}
+
+// HasIgnoreRows reports whether the cache holds any v1 ignore row for any
+// project. The sync reads it at the start of a run: an empty table means
+// the sync has no memory of expired ignores, so an earlier due date it
+// computes may only reflect that gap (see the cold-start guard).
+func (s *Store) HasIgnoreRows(ctx context.Context) (bool, error) {
+	query, args, err := s.builder.
+		Select("1").
+		From("snyk_ignores").
+		Limit(1).
+		ToSql()
+	if err != nil {
+		return false, fmt.Errorf("build cache ignores presence query: %w", err)
+	}
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return false, fmt.Errorf("check cache ignores presence: %w", err)
+	}
+	defer rows.Close()
+	present := rows.Next()
+	if err := rows.Err(); err != nil {
+		return false, fmt.Errorf("check cache ignores presence: %w", err)
+	}
+	return present, nil
+}
+
+// GetMeta returns the value stored under a sync_meta key, and whether the
+// key exists.
+func (s *Store) GetMeta(ctx context.Context, key string) (string, bool, error) {
+	query, args, err := s.builder.
+		Select("value").
+		From("sync_meta").
+		Where(sq.Eq{"key": key}).
+		ToSql()
+	if err != nil {
+		return "", false, fmt.Errorf("build cache meta query: %w", err)
+	}
+	var value string
+	switch err := s.db.QueryRowContext(ctx, query, args...).Scan(&value); {
+	case err == nil:
+		return value, true, nil
+	case errors.Is(err, sql.ErrNoRows):
+		return "", false, nil
+	default:
+		return "", false, fmt.Errorf("load cache meta %q: %w", key, err)
+	}
+}
+
+// SetMeta stores a value under a sync_meta key, replacing any existing one.
+func (s *Store) SetMeta(ctx context.Context, key, value string) error {
+	query, args, err := s.builder.
+		Insert("sync_meta").
+		Columns("key", "value").
+		Values(key, value).
+		Suffix("ON CONFLICT(key) DO UPDATE SET value = excluded.value").
+		ToSql()
+	if err != nil {
+		return fmt.Errorf("build cache meta upsert: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, query, args...); err != nil {
+		return fmt.Errorf("save cache meta %q: %w", key, err)
+	}
+	return nil
+}
+
+// DeleteMeta removes a sync_meta key. Removing an absent key is not an error.
+func (s *Store) DeleteMeta(ctx context.Context, key string) error {
+	query, args, err := s.builder.
+		Delete("sync_meta").
+		Where(sq.Eq{"key": key}).
+		ToSql()
+	if err != nil {
+		return fmt.Errorf("build cache meta delete: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, query, args...); err != nil {
+		return fmt.Errorf("delete cache meta %q: %w", key, err)
 	}
 	return nil
 }
