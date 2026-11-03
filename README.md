@@ -476,6 +476,29 @@ Optional:
 See [.env.example](/workspace/.env.example).
 
 
+## Exit Status
+
+The sync exits non-zero when a state-changing Linear operation was left
+permanently unapplied, so a scheduler or CI job notices the drift instead of
+seeing a successful run that quietly dropped work.
+
+"Permanently" is the key word. Batch mutations are retried per entry, and only
+the outcome after that retry counts:
+
+- a batch that fails and whose retry lands is a **successful** run — the
+  operation applied, it just took two calls
+- a create, update, resolve or duplicate-cancellation whose retry also failed
+  is counted in `failed_ops` and **fails** the run
+
+Ambiguous batch creates are the exception to "the outcome after that retry":
+if the reconciliation lookup that decides what landed fails too, the whole
+batch is counted in `failed_ops` without a retry — there is no safe way to
+tell which entries landed, so every one is treated as unapplied and left for
+the next run (see [Current Behavior](#current-behavior)).
+
+The count appears in the `sync complete` summary log either way, and that
+summary is emitted before the exit status is decided.
+
 ## Logs
 
 - Console logs show startup, load progress, work progress, cache refresh, and final summary.
