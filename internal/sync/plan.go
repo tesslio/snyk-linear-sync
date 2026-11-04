@@ -162,7 +162,7 @@ type planCollector struct {
 }
 
 func newPlanCollector(cfg config.Config, snapshot model.SnykSnapshot, existing []model.ExistingIssue, cached cache.Snapshot, cacheEnabled bool) (*planCollector, error) {
-	if cfg.PlanJSON == "" {
+	if cfg.PlanJSON == "" && cfg.ReviewedPlanJSON == "" {
 		return nil, nil
 	}
 	// Explicit allowlist: never marshal Config, which contains credentials.

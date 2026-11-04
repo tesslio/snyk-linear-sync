@@ -2086,3 +2086,34 @@ func TestUpdateIssuesMovesReopenToRestoredState(t *testing.T) {
 		t.Fatalf("stateId = %v, want the restored state s-todo rather than the configured Triage", input0["stateId"])
 	}
 }
+
+func TestHistoryRejectsIncompleteAndRepeatedPagination(t *testing.T) {
+	cases := map[string]map[string]string{
+		"null-issue":        {"": `{"data":{"issue":null}}`},
+		"null-history":      {"": `{"data":{"issue":{"history":null}}}`},
+		"null-page-info":    {"": `{"data":{"issue":{"history":{"nodes":[],"pageInfo":null}}}}`},
+		"missing-next-page": {"": `{"data":{"issue":{"history":{"nodes":[],"pageInfo":{"endCursor":null}}}}}`},
+		"missing-nodes":     {"": `{"data":{"issue":{"history":{"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}`},
+		"null-cursor":       {"": `{"data":{"issue":{"history":{"nodes":[],"pageInfo":{"hasNextPage":true,"endCursor":null}}}}}`},
+		"empty-cursor":      {"": historyPage(true, "")},
+		"repeated-cursor":   {"": historyPage(true, "again"), "again": historyPage(true, "again")},
+	}
+	for name, pages := range cases {
+		t.Run(name, func(t *testing.T) {
+			var requests []map[string]any
+			client := historyClient(t, map[string]map[string]string{"issue-1": pages}, &requests)
+			if _, err := client.LastOpenStates(t.Context(), []string{"issue-1"}); err == nil {
+				t.Fatal("incomplete history reported as successful")
+			}
+		})
+	}
+}
+
+func TestHistoryAcceptsCompleteEmptyHistory(t *testing.T) {
+	var requests []map[string]any
+	client := historyClient(t, map[string]map[string]string{"issue-1": {"": historyPage(false, "")}}, &requests)
+	states, err := client.LastOpenStates(t.Context(), []string{"issue-1"})
+	if err != nil || len(states) != 0 {
+		t.Fatalf("complete no-state history=%v, %v", states, err)
+	}
+}

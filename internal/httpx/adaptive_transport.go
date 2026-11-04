@@ -73,7 +73,7 @@ func (t *AdaptiveTransport) RoundTrip(req *http.Request) (*http.Response, error)
 			return resp, nil
 		}
 
-		if !canRetry(req) || attempt >= 4 {
+		if RetriesDisabled(req.Context()) || !canRetry(req) || attempt >= 4 {
 			return resp, nil
 		}
 
