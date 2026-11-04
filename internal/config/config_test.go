@@ -299,3 +299,23 @@ func setRequiredEnv(t *testing.T) {
 	t.Setenv("LINEAR_API_KEY", "linear-key")
 	t.Setenv("LINEAR_TEAM_ID", "team-id")
 }
+
+func TestLoadPlanJSONRequiresDryRunAndPrivatePath(t *testing.T) {
+	t.Setenv("SNYK_CLIENT_ID", "client-id")
+	t.Setenv("SNYK_CLIENT_SECRET", "client-secret")
+	t.Setenv("SNYK_ORG_ID", "org-id")
+	t.Setenv("LINEAR_API_KEY", "linear-key")
+	t.Setenv("LINEAR_TEAM_ID", "team-id")
+	for _, args := range [][]string{{"--plan-json", "plan.json"}, {"--dry-run", "--plan-json", "-"}} {
+		if _, err := Load(args); err == nil {
+			t.Fatalf("Load(%v) allowed unsafe export", args)
+		}
+	}
+	cfg, err := Load([]string{"--dry-run", "--plan-json", " private-plan.json "})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.PlanJSON != "private-plan.json" || !cfg.DryRun {
+		t.Fatalf("plan config %+v", cfg)
+	}
+}

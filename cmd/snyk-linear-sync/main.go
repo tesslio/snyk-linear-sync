@@ -58,6 +58,12 @@ func run(cfg config.Config, logger *slog.Logger) error {
 		return err
 	}
 
+	if cfg.PlanJSON != "" {
+		if err := syncsvc.WritePlanJSON(cfg.PlanJSON, result.Plan); err != nil {
+			return err
+		}
+	}
+
 	logger.Info("sync complete",
 		slog.Bool("dry_run", cfg.DryRun),
 		slog.Int("findings", result.Findings),
