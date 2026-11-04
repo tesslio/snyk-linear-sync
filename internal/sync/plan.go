@@ -195,9 +195,17 @@ func newPlanCollector(cfg config.Config, snapshot model.SnykSnapshot, existing [
 	}
 	indexes := make(map[string]int, len(existing))
 	for i, issue := range existing {
-		if _, ok := indexes[issue.ID]; !ok {
-			indexes[issue.ID] = i + 1
+		// A repeated API row can produce more than one reconciliation action
+		// for the same ID. Do not invent per-row provenance or claim retention
+		// for a row whose action was attributed elsewhere. Fail export closed;
+		// the ordinary sync path is unchanged when export is disabled.
+		if issue.ID == "" {
+			return nil, fmt.Errorf("dry-run plan requires a Linear issue ID at snapshot index %d", i+1)
 		}
+		if first, ok := indexes[issue.ID]; ok {
+			return nil, fmt.Errorf("dry-run plan cannot attribute repeated Linear issue IDs at snapshot indexes %d and %d", first, i+1)
+		}
+		indexes[issue.ID] = i + 1
 	}
 	return &planCollector{
 		plan: &ReconciliationPlan{Version: 1, LocalCacheMayChange: true, Inputs: inputs, Records: []PlanRecord{}, ReopenHistoryStatus: "not_needed"},
@@ -362,9 +370,6 @@ func (p *planCollector) finish(result RunResult, guard coldStartGuard) (*Reconci
 				reason = "no-managed-fingerprint"
 			}
 			p.add("retain", reason, issue.Fingerprint, &issue, nil)
-			// Index, not ID, is the coverage key, including repeated snapshot rows.
-			p.plan.Records[len(p.plan.Records)-1].ExistingIndex = i + 1
-			p.coveredExisting[i+1] = true
 		}
 	}
 	slices.SortFunc(p.plan.Records, func(a, b PlanRecord) int {

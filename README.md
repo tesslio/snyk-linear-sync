@@ -85,6 +85,9 @@ retained by the reopen guard. One-based snapshot indexes account for coverage;
 a matched finding and ticket share a record. Repeated source fingerprints that
 were overwritten during reconciliation have an explicit superseded record.
 Mutation counts are checked against the normal dry-run counters.
+Snapshots with missing or repeated Linear issue IDs fail export without producing
+a complete plan: ambiguous rows cannot be assigned trustworthy per-row decisions.
+This validation is export-only and does not change the ordinary sync path.
 
 Records include old, calculated and proposed/planned due dates, the raw SLA
 deadline before sticky-date/cold-start overrides, source timestamps, reasons and

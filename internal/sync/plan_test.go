@@ -462,3 +462,41 @@ func TestPlanCoverageInvariantRejectsMissingDecision(t *testing.T) {
 		t.Fatal("missing latest decision marked complete")
 	}
 }
+
+func TestPlanRejectsAmbiguousLinearSnapshotBeforePlanning(t *testing.T) {
+	cfg := planCfg()
+	finding := planFixtureFinding("issue-1")
+	issue := storedIssue("ticket-1", "SNYK-100", "Todo", desiredIssue(cfg, finding))
+	for _, scenario := range []string{"repeated-identical-row", "repeated-different-row", "missing-id"} {
+		t.Run(scenario, func(t *testing.T) {
+			issues := []model.ExistingIssue{issue, issue}
+			if scenario == "repeated-different-row" {
+				issues[1].StateName = "In Progress"
+				issues[1].Title = "A different snapshot row"
+			}
+			if scenario == "missing-id" {
+				issues = issues[:1]
+				issues[0].ID = ""
+			}
+			snyk := &planSnyk{snapshot: planSnapshot(finding)}
+			linear := &planLinear{fakeLinear: fakeLinear{snapshot: issues}}
+			store := &fakeCache{ignoreRows: true}
+			result, err := New(cfg, discardLogger(), snyk, linear, store).Run(context.Background())
+			if err == nil || result.Plan != nil {
+				t.Fatalf("ambiguous snapshot returned plan: %+v, %v", result.Plan, err)
+			}
+			if len(linear.created)+len(linear.updated)+len(linear.comments) != 0 || store.saved.SnykHashes != nil {
+				t.Fatal("ambiguous export performed writes")
+			}
+			if snyk.calls != 1 || linear.calls != 1 {
+				t.Fatal("snapshot reloaded")
+			}
+			// The new validation is opt-in and must not alter stock dry-run behavior.
+			plain := cfg
+			plain.PlanJSON = ""
+			if _, err := New(plain, discardLogger(), fakeSnyk{snapshot: planSnapshot(finding)}, &fakeLinear{snapshot: issues}, nil).Run(context.Background()); err != nil {
+				t.Fatalf("ordinary dry run changed: %v", err)
+			}
+		})
+	}
+}

@@ -374,7 +374,10 @@ Coverage includes every initial finding and ticket, with a matched pair in one
 record and explicit records for superseded source fingerprints, deferred creates,
 archived/unchanged/cache-suppressed tickets, terminal duplicates and rejected
 reopens. One-based input indexes allow coverage checks. Selected mutation totals
-must match the existing dry-run counters. Each mutation is `not_attempted`, never
+must match the existing dry-run counters. Export rejects missing or repeated
+Linear issue IDs rather than claiming untrustworthy per-row decision provenance;
+this validation does not change the ordinary sync path. Each mutation is
+`not_attempted`, never
 reported as successful; no Linear writes or sync-hash saves are performed.
 Read-only reopen history requests remain part of planning, and lookup errors are
 reported without exporting their potentially sensitive error text.
