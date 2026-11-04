@@ -201,6 +201,70 @@ ordinary unguarded mode retains its existing behavior; these options do not make
 all live runs guarded. Successful guarded live runs do not export a dry-run plan
 as an execution receipt.
 
+
+### Replay-safe plans and observation checkpoints
+
+`--replay-safe` opts plan export and reviewed execution into version 2. It
+requires complete validated fresh Snyk reads, including readable ignore metadata
+and known cluster context, then canonicalizes source and ticket ordering before
+both matching and hashing. Unavailable required reads, malformed or repeated
+pages, ambiguous source fingerprints, and missing required context fail closed.
+Legitimate retained historical ignore memory remains an explicit input. This
+validates received response completeness, not an atomic server snapshot.
+
+Version 2 sorts semantic sets without removing duplicate entries or changing raw
+values. It also makes buffered job production deterministic and chooses the final
+canonical duplicate before coarse migration. These changes can select different
+matches from version 1. Generate and review a **new** version-2 plan; never convert
+an accepted version-1 artifact. Versions must match the selected mode. Ordinary
+version-1 behavior and its order-sensitive comparison remain available unchanged.
+
+A preview can discover a first-observed ignore ending that is not present in the
+source database. Repeating from that unmodified database observes a different
+wall-clock time. To prepare deterministic observation input separately, use:
+
+```sh
+mkdir -m 700 private-observation
+go run ./cmd/snyk-linear-sync --env-file .env \
+  --observation-checkpoint private-observation/candidate.db \
+  --observation-source-sha256 <accepted-source-file-sha256>
+```
+
+`CACHE_DB_FILE` names the existing trusted source. The command requires the exact
+source digest and an immutable `LINEAR_TEAM_ID` for settings binding, but does not
+require a Linear API key or construct a Linear client. It creates a new private
+DB and a matching `.json` receipt, refuses overwrites and SQLite sidecars, and runs
+only the strict Snyk loader. It preserves reconciliation hashes, schema and prior
+cold-start metadata. Seeding an untrusted empty source preserves `pending` rather
+than making the cache trusted. Failed or incomplete preparation discards its new
+candidate. The original source is not opened for writing.
+
+The completed receipt binds source/output hashes, protected logical state,
+version-2 settings digest and read provenance. `started_at` is a conservative
+freshness-age origin; `completed_at` is not the time of every stored observation.
+The receipt is not authentication or an execution authorization. Separately bind
+its exact bytes, checkpoint bytes, tool revision/build and complete plan to an
+independent review. Keep the source under an external single-writer lease; local
+before/after digest checks cannot prevent a later concurrent write. Use trusted
+source bytes and a private owned output directory. Schema inspection verifies
+preservation and rejects extra objects, not every possible malicious schema.
+
+Generate a version-2 preview with `--dry-run --plan-json <new-file> --replay-safe`
+from a disposable copy of the completed checkpoint. Execute with both reviewed
+plan flags and `--replay-safe` from a different untouched copy. Never substitute
+a normal preview's mutated database. A new lifecycle, source content change,
+revocation-grace/expiry boundary or guard change still invalidates the exact plan.
+No global clock is frozen. Choose an explicit maximum review age and reject stale
+or future receipts in the consuming workflow.
+
+This upstream interface does not implement artifact distribution, trusted receipt
+acceptance, cache-generation locking, or workflow activation. A consumer must
+provide those and validate representative read-only API responses first. Unknown
+cluster context intentionally blocks strict mode. Version 2 is still a
+reconciliation preflight, not frozen final payloads, server-side compare-and-swap,
+rollback, or a per-ticket execution receipt. Existing no-retry behavior after
+partial or uncertain mutations remains essential.
+
 ## Validation
 
 Run these before every commit, in order. Each step catches a different class

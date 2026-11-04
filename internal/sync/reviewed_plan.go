@@ -16,7 +16,7 @@ import (
 const maxReviewedPlanBytes = 64 << 20
 
 // readReviewedPlan binds one immutable read to an independently accepted digest.
-// A v1 plan commits to reconciliation decisions, not resolved API payloads.
+// A v1 or v2 plan commits to reconciliation decisions, not resolved API payloads.
 func readReviewedPlan(path, expectedSHA256 string) (*ReconciliationPlan, error) {
 	expected, err := hex.DecodeString(expectedSHA256)
 	if err != nil || len(expected) != sha256.Size {
@@ -139,7 +139,7 @@ func reviewedJSONValue(dec *json.Decoder, typ reflect.Type) error {
 
 func validateReviewedPlan(p *ReconciliationPlan) error {
 	invalid := errors.New("reviewed plan is incomplete or inconsistent")
-	if p == nil || p.Version != 1 || !p.Complete || p.LinearWritesAttempted || p.Records == nil {
+	if p == nil || (p.Version != 1 && p.Version != 2) || !p.Complete || p.LinearWritesAttempted || p.Records == nil {
 		return invalid
 	}
 	if p.ReopenHistoryStatus != "complete" && p.ReopenHistoryStatus != "not_needed" {

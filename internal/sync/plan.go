@@ -34,7 +34,8 @@ type ReconciliationPlan struct {
 }
 
 type PlanInputs struct {
-	// Snapshot hashes preserve input slice order, which can affect matching.
+	// Snapshot hashes bind full input values. V1 preserves source order; v2
+	// uses canonical semantic-set order before both matching and hashing.
 	SnykSHA256       string `json:"snyk_sha256"`
 	LinearSHA256     string `json:"linear_sha256"`
 	SettingsSHA256   string `json:"settings_sha256"`
@@ -161,10 +162,12 @@ type planCollector struct {
 	retainedReasons map[string]string
 }
 
-func newPlanCollector(cfg config.Config, snapshot model.SnykSnapshot, existing []model.ExistingIssue, cached cache.Snapshot, cacheEnabled bool) (*planCollector, error) {
-	if cfg.PlanJSON == "" && cfg.ReviewedPlanJSON == "" {
-		return nil, nil
-	}
+// PlanSettingsSHA256 binds the reconciliation settings shared by plans and
+// observation receipts. Its allowlist and field order preserve the v1 encoding;
+// v2 only canonicalizes semantic sets. Credentials and operation-specific
+// checkpoint/export paths are never included.
+func PlanSettingsSHA256(cfg config.Config) (string, error) {
+	cfg = replayConfig(cfg)
 	// Explicit allowlist: never marshal Config, which contains credentials.
 	settings := struct {
 		Region, Organization, Team                              string
@@ -179,14 +182,33 @@ func newPlanCollector(cfg config.Config, snapshot model.SnykSnapshot, existing [
 		cfg.Source, cfg.Linear.States, cfg.Linear.Labels, cfg.Linear.Due,
 		cfg.Linear.ArchiveLookbackDays, cfg.Linear.CommentsEnabled, cfg.Linear.UnsubscribeActor,
 		cfg.Cache.BypassCache, cfg.Cache.ClearIgnoresColdStart}
+	return planDigest(settings)
+}
+
+func newPlanCollector(cfg config.Config, snapshot model.SnykSnapshot, existing []model.ExistingIssue, cached cache.Snapshot, cacheEnabled bool) (*planCollector, error) {
+	if cfg.PlanJSON == "" && cfg.ReviewedPlanJSON == "" {
+		return nil, nil
+	}
+	if cfg.ReplaySafe {
+		var err error
+		snapshot, existing, err = canonicalReplayInputs(snapshot, existing)
+		if err != nil {
+			return nil, err
+		}
+		cfg = replayConfig(cfg)
+	}
 	inputs := PlanInputs{SyncCacheEnabled: cacheEnabled}
 	var err error
+	inputs.SettingsSHA256, err = PlanSettingsSHA256(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("fingerprint dry-run settings: %w", err)
+	}
 	for _, item := range []struct {
 		value any
 		dest  *string
 	}{
 		{snapshot, &inputs.SnykSHA256}, {existing, &inputs.LinearSHA256},
-		{settings, &inputs.SettingsSHA256}, {cached, &inputs.SyncCacheSHA256},
+		{cached, &inputs.SyncCacheSHA256},
 	} {
 		*item.dest, err = planDigest(item.value)
 		if err != nil {
@@ -208,7 +230,7 @@ func newPlanCollector(cfg config.Config, snapshot model.SnykSnapshot, existing [
 		indexes[issue.ID] = i + 1
 	}
 	return &planCollector{
-		plan: &ReconciliationPlan{Version: 1, LocalCacheMayChange: true, Inputs: inputs, Records: []PlanRecord{}, ReopenHistoryStatus: "not_needed"},
+		plan: &ReconciliationPlan{Version: replayPlanVersion(cfg), LocalCacheMayChange: true, Inputs: inputs, Records: []PlanRecord{}, ReopenHistoryStatus: "not_needed"},
 		cfg:  cfg, findings: snapshot.Findings, existing: existing, existingIndexes: indexes,
 		contexts: map[string]planFinding{}, coveredFindings: map[int]bool{}, coveredExisting: map[int]bool{}, retainedReasons: map[string]string{},
 	}, nil

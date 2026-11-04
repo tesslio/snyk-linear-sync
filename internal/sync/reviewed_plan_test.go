@@ -105,7 +105,7 @@ func TestReadReviewedPlanFileBoundaries(t *testing.T) {
 }
 func TestVerifyReviewedPlanRejectsInvalid(t *testing.T) {
 	cases := map[string]func(*ReconciliationPlan){
-		"version":                func(p *ReconciliationPlan) { p.Version++ },
+		"version":                func(p *ReconciliationPlan) { p.Version = 3 },
 		"incomplete":             func(p *ReconciliationPlan) { p.Complete = false },
 		"writes":                 func(p *ReconciliationPlan) { p.LinearWritesAttempted = true },
 		"partial history":        func(p *ReconciliationPlan) { p.ReopenHistoryStatus = "partial_or_failed" },
