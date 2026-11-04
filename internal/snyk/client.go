@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"reflect"
 	"strings"
 	"time"
 
@@ -164,10 +165,11 @@ func requireJSONObject(raw json.RawMessage) (map[string]json.RawMessage, error) 
 }
 
 func validateFreshJSON(body []byte, into any) error {
-	// Reject duplicate keys anywhere: encoding/json otherwise silently chooses
-	// the last value, making completeness and identity checks ambiguous.
+	// Reject duplicate keys anywhere, including case aliases for typed fields:
+	// encoding/json otherwise silently merges or replaces values, making
+	// completeness and identity checks ambiguous. Map keys remain case-sensitive.
 	dec := json.NewDecoder(bytes.NewReader(body))
-	if err := uniqueJSONValue(dec); err != nil {
+	if err := uniqueJSONValue(dec, reflect.TypeOf(into)); err != nil {
 		return fmt.Errorf("invalid fresh Snyk response: %w", err)
 	}
 	if _, err := dec.Token(); err != io.EOF {
@@ -242,7 +244,10 @@ func validateFreshJSON(body []byte, into any) error {
 	return nil
 }
 
-func uniqueJSONValue(dec *json.Decoder) error {
+func uniqueJSONValue(dec *json.Decoder, typ reflect.Type) error {
+	for typ != nil && typ.Kind() == reflect.Pointer {
+		typ = typ.Elem()
+	}
 	tok, err := dec.Token()
 	if err != nil {
 		return err
@@ -254,6 +259,7 @@ func uniqueJSONValue(dec *json.Decoder) error {
 	switch delimiter {
 	case '{':
 		seen := map[string]bool{}
+		seenFields := map[string]bool{}
 		for dec.More() {
 			key, err := dec.Token()
 			if err != nil {
@@ -264,13 +270,24 @@ func uniqueJSONValue(dec *json.Decoder) error {
 				return fmt.Errorf("duplicate or invalid JSON object key")
 			}
 			seen[name] = true
-			if err := uniqueJSONValue(dec); err != nil {
+			field, valueType := freshJSONField(typ, name)
+			if field != "" {
+				if seenFields[field] {
+					return fmt.Errorf("duplicate JSON field alias %q", name)
+				}
+				seenFields[field] = true
+			}
+			if err := uniqueJSONValue(dec, valueType); err != nil {
 				return err
 			}
 		}
 	case '[':
+		var valueType reflect.Type
+		if typ != nil && (typ.Kind() == reflect.Slice || typ.Kind() == reflect.Array) {
+			valueType = typ.Elem()
+		}
 		for dec.More() {
-			if err := uniqueJSONValue(dec); err != nil {
+			if err := uniqueJSONValue(dec, valueType); err != nil {
 				return err
 			}
 		}
@@ -279,6 +296,43 @@ func uniqueJSONValue(dec *json.Decoder) error {
 	}
 	_, err = dec.Token()
 	return err
+}
+
+// freshJSONField follows encoding/json's exact-then-case-insensitive matching
+// for the explicit, non-embedded fields in the strict source response types.
+// Unknown fields and map keys are not aliases; their spelling is significant.
+// Custom v1 ignore entries are checked separately once their shape is known.
+func freshJSONField(typ reflect.Type, key string) (string, reflect.Type) {
+	if typ == nil {
+		return "", nil
+	}
+	if typ.Kind() == reflect.Map {
+		return "", typ.Elem()
+	}
+	if typ.Kind() != reflect.Struct {
+		return "", nil
+	}
+	var foldedName string
+	var foldedType reflect.Type
+	for field := range typ.Fields() {
+		if !field.IsExported() {
+			continue
+		}
+		name, _, _ := strings.Cut(field.Tag.Get("json"), ",")
+		if name == "-" {
+			continue
+		}
+		if name == "" {
+			name = field.Name
+		}
+		if name == key {
+			return name, field.Type
+		}
+		if foldedName == "" && strings.EqualFold(name, key) {
+			foldedName, foldedType = name, field.Type
+		}
+	}
+	return foldedName, foldedType
 }
 
 // ValidateFreshSnapshot is the fail-closed provenance gate for replay callers.

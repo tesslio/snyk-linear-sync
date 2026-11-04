@@ -13,6 +13,8 @@ import (
 	"testing"
 	"time"
 
+	snyksdk "github.com/pavel-snyk/snyk-sdk-go/v2/snyk"
+
 	"github.com/tesslio/snyk-linear-sync/internal/cache"
 )
 
@@ -22,7 +24,13 @@ func freshFixtureClient(t *testing.T, handler http.HandlerFunc) *Client {
 	t.Cleanup(server.Close)
 	rest, _ := url.Parse(server.URL + "/rest/")
 	v1, _ := url.Parse(server.URL + "/v1/")
-	return &Client{orgID: "org-a", httpClient: server.Client(), restBase: rest, v1Base: v1, requireFresh: true, logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	sdk, err := snyksdk.NewClient("test-token", snyksdk.WithHTTPClient(server.Client()), snyksdk.WithRegion(snyksdk.Region{
+		Alias: "test", AppBaseURL: server.URL, RESTBaseURL: rest.String(), V1BaseURL: v1.String(),
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &Client{orgID: "org-a", httpClient: server.Client(), restBase: rest, v1Base: v1, sdk: sdk, requireFresh: true, logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
 }
 
 const freshProjectRow = `{"id":"project-a","attributes":{"name":"owner/repo","origin":"github","status":"active"}}`
@@ -287,5 +295,72 @@ func TestFreshClusterRequiresKnownContext(t *testing.T) {
 		if _, err := c.fetchProjectCluster(context.Background(), "project-a"); err != nil {
 			t.Fatalf("explicit cluster: %v", err)
 		}
+	}
+}
+
+func TestFreshSnapshotReadsOnlyProjectIgnores(t *testing.T) {
+	saved := ignoresRetryBackoff
+	ignoresRetryBackoff = 0
+	t.Cleanup(func() { ignoresRetryBackoff = saved })
+	nonProjectIssue := strings.ReplaceAll(strings.Replace(freshIssueRow, `"id":"issue-1"`, `"id":"issue-2"`, 1), `"id":"project-a","type":"project"`, `"id":"target-a","type":"cloud_resource"`)
+	for _, tc := range []struct {
+		name           string
+		strict         bool
+		rows           []string
+		failProject    bool
+		wantErr        bool
+		wantFindings   int
+		wantIgnoreRead bool
+		wantTargetRead bool
+	}{
+		{name: "strict excluded type", strict: true, rows: []string{nonProjectIssue}},
+		{name: "strict mixed types", strict: true, rows: []string{nonProjectIssue, freshIssueRow}, wantFindings: 1, wantIgnoreRead: true},
+		{name: "strict required ignores fail closed", strict: true, rows: []string{nonProjectIssue, freshIssueRow}, failProject: true, wantErr: true, wantIgnoreRead: true},
+		{name: "ordinary excluded type keeps legacy reads", rows: []string{nonProjectIssue}, wantTargetRead: true},
+		{name: "ordinary unstated type remains a project", rows: []string{strings.Replace(freshIssueRow, `"type":"project"`, `"type":""`, 1)}, wantFindings: 1, wantIgnoreRead: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ignoreRead, targetRead := false, false
+			c := freshFixtureClient(t, func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/rest/orgs/org-a":
+					fmt.Fprint(w, `{"data":{"attributes":{"slug":"org-a"}}}`)
+				case "/rest/orgs/org-a/projects":
+					fmt.Fprintf(w, `{"data":[%s],"links":{}}`, freshProjectRow)
+				case "/rest/orgs/org-a/issues":
+					fmt.Fprintf(w, `{"data":[%s],"links":{}}`, strings.Join(tc.rows, ","))
+				case "/v1/org/org-a/project/project-a/ignores":
+					ignoreRead = true
+					if tc.failProject {
+						http.NotFound(w, r)
+					} else {
+						fmt.Fprint(w, `{}`)
+					}
+				case "/v1/org/org-a/project/target-a/ignores":
+					targetRead = true
+					http.NotFound(w, r)
+				default:
+					t.Errorf("unexpected request: %s", r.URL)
+					http.NotFound(w, r)
+				}
+			})
+			c.requireFresh = tc.strict
+			snapshot, err := c.LoadSnapshot(context.Background())
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("LoadSnapshot error = %v, want error %t", err, tc.wantErr)
+			}
+			if len(snapshot.Findings) != tc.wantFindings || ignoreRead != tc.wantIgnoreRead || targetRead != tc.wantTargetRead {
+				t.Fatalf("findings=%d, project read=%t, excluded target read=%t", len(snapshot.Findings), ignoreRead, targetRead)
+			}
+			if tc.strict {
+				reads, err := c.FreshSourceReads()
+				if (err != nil) != tc.wantErr {
+					t.Fatalf("fresh provenance error = %v, want error %t", err, tc.wantErr)
+				}
+				if !tc.wantErr && reads.IgnoreProjects != tc.wantFindings {
+					t.Fatalf("fresh ignore project count = %d, want %d", reads.IgnoreProjects, tc.wantFindings)
+				}
+			}
+		})
 	}
 }

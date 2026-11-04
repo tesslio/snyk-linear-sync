@@ -188,13 +188,13 @@ type v1IgnoreEntry struct {
 	DisregardIfFixable bool   `json:"disregardIfFixable"`
 }
 
+// v1IgnoreFields shares the decoded field schema without the custom unmarshaller.
+// Strict validation uses it for either flat or path-wrapped ignore details.
+type v1IgnoreFields v1IgnoreEntry
+
 func (e *v1IgnoreEntry) UnmarshalJSON(data []byte) error {
 	// Try nested format first: {"*": {...}} or {"path": {...}}
-	var nested map[string]struct {
-		Created            string `json:"created"`
-		Expires            string `json:"expires"`
-		DisregardIfFixable bool   `json:"disregardIfFixable"`
-	}
+	var nested map[string]v1IgnoreFields
 	if err := json.Unmarshal(data, &nested); err == nil && len(nested) > 0 {
 		for _, details := range nested {
 			e.Created = details.Created
@@ -205,11 +205,7 @@ func (e *v1IgnoreEntry) UnmarshalJSON(data []byte) error {
 	}
 
 	// Try flat format: {...}
-	var flat struct {
-		Created            string `json:"created"`
-		Expires            string `json:"expires"`
-		DisregardIfFixable bool   `json:"disregardIfFixable"`
-	}
+	var flat v1IgnoreFields
 	if err := json.Unmarshal(data, &flat); err == nil {
 		e.Created = flat.Created
 		e.Expires = flat.Expires
@@ -310,10 +306,13 @@ func (c *Client) LoadSnapshot(ctx context.Context) (model.SnykSnapshot, error) {
 					return model.SnykSnapshot{}, fmt.Errorf("duplicate Snyk issue id")
 				}
 				seenIssues[issue.ID] = true
-				if isProjectIssue(issue) {
-					if _, ok := projectDetails[issue.Relationships.ScanItem.Data.ID]; !ok {
-						return model.SnykSnapshot{}, fmt.Errorf("Snyk issue references absent project")
-					}
+				// Excluded scan-item types have no project-scoped metadata to
+				// validate. Do not turn their IDs into bogus v1 project reads.
+				if !isProjectIssue(issue) {
+					continue
+				}
+				if _, ok := projectDetails[issue.Relationships.ScanItem.Data.ID]; !ok {
+					return model.SnykSnapshot{}, fmt.Errorf("Snyk issue references absent project")
 				}
 			}
 			projectID := issue.Relationships.ScanItem.Data.ID
@@ -2199,6 +2198,7 @@ func validateFreshIgnores(body []byte) error {
 			return fmt.Errorf("invalid Snyk ignore container")
 		}
 		for _, entry := range entries {
+			details := entry
 			obj, err := requireJSONObject(entry)
 			if err != nil {
 				return err
@@ -2210,11 +2210,15 @@ func validateFreshIgnores(body []byte) error {
 					return fmt.Errorf("ambiguous Snyk ignore paths")
 				}
 				for _, raw := range obj {
+					details = raw
 					obj, err = requireJSONObject(raw)
 					if err != nil {
 						return err
 					}
 				}
+			}
+			if err := validateFreshJSON(details, (*v1IgnoreFields)(nil)); err != nil {
+				return err
 			}
 			var created string
 			if err := json.Unmarshal(obj["created"], &created); err != nil {
@@ -2223,7 +2227,7 @@ func validateFreshIgnores(body []byte) error {
 			if _, err := parseIssueCreatedAt(created); err != nil {
 				return err
 			}
-			if expires, ok := obj["expires"]; ok && string(expires) != "null" {
+			if expires, ok := freshIgnoreField(obj, "expires"); ok && string(expires) != "null" {
 				var value string
 				if err := json.Unmarshal(expires, &value); err != nil {
 					return err
@@ -2234,7 +2238,7 @@ func validateFreshIgnores(body []byte) error {
 					}
 				}
 			}
-			if flag, ok := obj["disregardIfFixable"]; ok {
+			if flag, ok := freshIgnoreField(obj, "disregardIfFixable"); ok {
 				var value bool
 				if string(flag) == "null" {
 					return fmt.Errorf("null Snyk ignore flag")
@@ -2246,4 +2250,15 @@ func validateFreshIgnores(body []byte) error {
 		}
 	}
 	return nil
+}
+
+// Fresh ignore details have already been checked for aliases. Match optional
+// fields as the custom decoder does, so alternate casing cannot evade validation.
+func freshIgnoreField(obj map[string]json.RawMessage, name string) (json.RawMessage, bool) {
+	for key, value := range obj {
+		if strings.EqualFold(key, name) {
+			return value, true
+		}
+	}
+	return nil, false
 }

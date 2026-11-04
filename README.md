@@ -206,9 +206,12 @@ as an execution receipt.
 
 `--replay-safe` opts plan export and reviewed execution into version 2. It
 requires complete validated fresh Snyk reads, including readable ignore metadata
-and known cluster context, then canonicalizes source and ticket ordering before
-both matching and hashing. Unavailable required reads, malformed or repeated
-pages, ambiguous source fingerprints, and missing required context fail closed.
+for project scan items and known cluster context for included findings, then
+canonicalizes source and ticket ordering before both matching and hashing.
+Excluded non-project scan items do not require project-only metadata reads. Unavailable required reads,
+malformed or repeated pages, ambiguous JSON field aliases or source fingerprints,
+and missing required context fail closed. Case-distinct map identities remain
+separate rather than being folded together.
 Legitimate retained historical ignore memory remains an explicit input. This
 validates received response completeness, not an atomic server snapshot.
 
@@ -234,10 +237,18 @@ go run ./cmd/snyk-linear-sync --env-file .env \
 source digest and an immutable `LINEAR_TEAM_ID` for settings binding, but does not
 require a Linear API key or construct a Linear client. It creates a new private
 DB and a matching `.json` receipt, refuses overwrites and SQLite sidecars, and runs
-only the strict Snyk loader. It preserves reconciliation hashes, schema and prior
-cold-start metadata. Seeding an untrusted empty source preserves `pending` rather
+only the strict Snyk loader. It preserves reconciliation hashes and prior
+cold-start metadata. The sole permitted schema changes add missing nullable
+`unignored_at` and `observed_issues` columns to supported six- or seven-column
+legacy ignore tables; all other schema changes are rejected. The receipt binds
+the resulting schema. Seeding an untrusted empty source preserves `pending` rather
 than making the cache trusted. Failed or incomplete preparation discards its new
-candidate. The original source is not opened for writing.
+candidate. The original source is not opened for writing. Source paths are
+operator-selected; reads open only a single leaf inside an opened parent directory
+and reject symlinks, sidecars, and replacement during the read. Both relative and
+absolute checkpoint paths address the same file during SQLite inspection.
+Output paths containing `?` are rejected before creation because SQLite interprets
+that character as DSN query syntax rather than part of the filename.
 
 The completed receipt binds source/output hashes, protected logical state,
 version-2 settings digest and read provenance. `started_at` is a conservative

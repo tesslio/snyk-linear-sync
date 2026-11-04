@@ -68,7 +68,16 @@ func prepareObservationCheckpoint(ctx context.Context, cfg config.Config, loader
 	if checkpointDigest(source) != cfg.ObservationSourceSHA256 {
 		return errors.New("observation source digest mismatch")
 	}
-	output := cfg.ObservationCheckpoint
+	// cache.Open consumes a SQLite DSN. Use an absolute filesystem path so
+	// a relative "file:" name cannot become a URI, and reject query syntax
+	// which the driver would strip from the actual filename before opening.
+	output, err := filepath.Abs(cfg.ObservationCheckpoint)
+	if err != nil {
+		return err
+	}
+	if strings.Contains(output, "?") {
+		return errors.New("observation checkpoint output must not contain SQLite query syntax")
+	}
 	if err := privateCheckpointParent(output); err != nil {
 		return err
 	}
@@ -201,9 +210,14 @@ func prepareObservationCheckpoint(ctx context.Context, cfg config.Config, loader
 		_ = os.Remove(receiptPath)
 		return err
 	}
-	dir, err := os.Open(filepath.Dir(output))
+	directory, err := os.OpenRoot(filepath.Dir(output))
 	if err == nil {
-		err = errors.Join(dir.Sync(), dir.Close())
+		var dir *os.File
+		dir, err = directory.Open(".")
+		if err == nil {
+			err = errors.Join(dir.Sync(), dir.Close())
+		}
+		err = errors.Join(err, directory.Close())
 	}
 	if err != nil {
 		_ = os.Remove(receiptPath)
@@ -252,43 +266,80 @@ func privateCheckpointParent(path string) error {
 	}
 	return nil
 }
+
+// The operator selects the source path, but the leaf must never escape its
+// opened parent directory, including if a symlink changes during the read.
 func readCheckpointFile(path string) ([]byte, error) {
-	if err := noCheckpointSymlinks(path); err != nil {
-		return nil, err
-	}
-	if err := noCheckpointSidecars(path); err != nil {
-		return nil, err
-	}
-	info, err := os.Stat(path)
-	if err != nil || !info.Mode().IsRegular() || info.Size() > maxCheckpointBytes {
-		return nil, errors.New("checkpoint must be a regular bounded file")
-	}
-	file, err := os.Open(path)
+	absolute, err := filepath.Abs(path)
 	if err != nil {
 		return nil, err
+	}
+	if err := noCheckpointSymlinks(absolute); err != nil {
+		return nil, err
+	}
+	root, err := os.OpenRoot(filepath.Dir(absolute))
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close()
+	data, opened, err := readCheckpointRoot(root, filepath.Base(absolute))
+	if err != nil {
+		return nil, err
+	}
+	if err := noCheckpointSymlinks(absolute); err != nil {
+		return nil, err
+	}
+	after, err := os.Lstat(absolute)
+	if err != nil || !os.SameFile(opened, after) || after.Size() != int64(len(data)) || !after.ModTime().Equal(opened.ModTime()) {
+		return nil, errors.New("checkpoint path changed during read")
+	}
+	return data, nil
+}
+
+func readCheckpointRoot(root *os.Root, name string) ([]byte, os.FileInfo, error) {
+	if !filepath.IsLocal(name) || filepath.Base(name) != name {
+		return nil, nil, errors.New("checkpoint must name one file within its parent")
+	}
+	checkSidecars := func() error {
+		for _, suffix := range []string{"-wal", "-shm", "-journal"} {
+			if _, err := root.Lstat(name + suffix); !os.IsNotExist(err) {
+				return errors.New("SQLite sidecar exists or is inaccessible")
+			}
+		}
+		return nil
+	}
+	if err := checkSidecars(); err != nil {
+		return nil, nil, err
+	}
+	info, err := root.Lstat(name)
+	if err != nil || !info.Mode().IsRegular() || info.Size() > maxCheckpointBytes {
+		return nil, nil, errors.New("checkpoint must be a regular bounded non-symlink file")
+	}
+	file, err := root.Open(name)
+	if err != nil {
+		return nil, nil, err
 	}
 	opened, err := file.Stat()
 	if err != nil || !opened.Mode().IsRegular() || !os.SameFile(info, opened) || opened.Size() > maxCheckpointBytes {
 		_ = file.Close()
-		return nil, errors.New("checkpoint replaced before read")
+		return nil, nil, errors.New("checkpoint replaced before read")
 	}
 	data, readErr := io.ReadAll(io.LimitReader(file, maxCheckpointBytes+1))
 	finished, statErr := file.Stat()
 	if err = errors.Join(readErr, statErr, file.Close()); err != nil || len(data) > maxCheckpointBytes {
-		return nil, errors.New("cannot read bounded checkpoint")
+		return nil, nil, errors.New("cannot read bounded checkpoint")
 	}
 	if !os.SameFile(opened, finished) || opened.Size() != finished.Size() || !opened.ModTime().Equal(finished.ModTime()) {
-		return nil, errors.New("checkpoint changed through read descriptor")
+		return nil, nil, errors.New("checkpoint changed through read descriptor")
 	}
-
-	after, err := os.Stat(path)
-	if err != nil || !os.SameFile(info, after) || after.Size() != int64(len(data)) || !after.ModTime().Equal(info.ModTime()) {
-		return nil, errors.New("checkpoint changed during read")
+	after, err := root.Lstat(name)
+	if err != nil || !after.Mode().IsRegular() || !os.SameFile(info, after) || after.Size() != int64(len(data)) || !after.ModTime().Equal(info.ModTime()) {
+		return nil, nil, errors.New("checkpoint changed during rooted read")
 	}
-	if err := noCheckpointSidecars(path); err != nil {
-		return nil, err
+	if err := checkSidecars(); err != nil {
+		return nil, nil, err
 	}
-	return data, nil
+	return data, opened, nil
 }
 func removeCheckpoint(path string) error {
 	var errs []error
@@ -301,7 +352,11 @@ func removeCheckpoint(path string) error {
 }
 func inspectCheckpoint(ctx context.Context, path string) (protectedCheckpointState, error) {
 	state := protectedCheckpointState{Schema: map[string]string{}}
-	u := url.URL{Scheme: "file", Path: path}
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return state, err
+	}
+	u := url.URL{Scheme: "file", Path: absolute}
 	q := url.Values{"mode": {"ro"}, "immutable": {"1"}}
 	u.RawQuery = q.Encode()
 	db, err := sql.Open("sqlite", u.String())

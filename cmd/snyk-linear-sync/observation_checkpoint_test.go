@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -373,6 +374,191 @@ func TestObservationCheckpointRejectsOtherSchemaChangesDuringUpgrade(t *testing.
 				if _, err := os.Stat(p); !os.IsNotExist(err) {
 					t.Fatal("failed migration left output")
 				}
+			}
+		})
+	}
+}
+
+func TestObservationCheckpointRelativePaths(t *testing.T) {
+	for _, output := range []string{"candidate.db", "private-observation/candidate.db", "private-observation/candidate #.db", "file:candidate.db", ":memory:", "candidate%3F.db", "candidate%23.db", "source.db%3Fmode=rw", "source.db#fragment"} {
+		t.Run(output, func(t *testing.T) {
+			cfg := checkpointTestConfig(t)
+			t.Chdir(filepath.Dir(cfg.Cache.DBFile))
+			cfg.Cache.DBFile = "source.db"
+			cfg.ObservationCheckpoint = output
+			if parent := filepath.Dir(output); parent != "." {
+				if err := os.Mkdir(parent, 0700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			loader := &checkpointTestLoader{}
+			if err := prepareObservationCheckpoint(t.Context(), cfg, loader); err != nil {
+				t.Fatal(err)
+			}
+			if loader.calls != 1 {
+				t.Fatal("relative checkpoint did not reach loader")
+			}
+			source, err := os.ReadFile(cfg.Cache.DBFile)
+			if err != nil || checkpointDigest(source) != cfg.ObservationSourceSHA256 {
+				t.Fatal("source bytes changed through filename interpretation")
+			}
+			relative, err := inspectCheckpoint(t.Context(), output)
+			if err != nil {
+				t.Fatal(err)
+			}
+			absolute, err := filepath.Abs(output)
+			if err != nil {
+				t.Fatal(err)
+			}
+			full, err := inspectCheckpoint(t.Context(), absolute)
+			if err != nil || !reflect.DeepEqual(relative, full) {
+				t.Fatalf("relative and absolute inspection differ: %v", err)
+			}
+			candidate, err := readCheckpointFile(output)
+			if err != nil {
+				t.Fatal(err)
+			}
+			raw, err := os.ReadFile(output + ".json")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var receipt checkpointReceipt
+			if err := json.Unmarshal(raw, &receipt); err != nil || !receipt.Complete || receipt.CheckpointSHA256 != checkpointDigest(candidate) {
+				t.Fatalf("relative candidate receipt does not bind bytes: %v", err)
+			}
+		})
+	}
+}
+
+func TestCheckpointRootRejectsTraversalAndSymlinks(t *testing.T) {
+	dir := t.TempDir()
+	parent := filepath.Join(dir, "parent")
+	if err := os.Mkdir(parent, 0700); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(dir, "outside.db")
+	for _, path := range []string{outside, filepath.Join(parent, "source.db")} {
+		if err := os.WriteFile(path, []byte("example checkpoint"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for name, target := range map[string]string{"outside-link.db": "../outside.db", "inside-link.db": "source.db"} {
+		if err := os.Symlink(target, filepath.Join(parent, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	root, err := os.OpenRoot(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	for _, name := range []string{"../outside.db", outside, "sub/../source.db", "sub/source.db", "outside-link.db", "inside-link.db", ".", ""} {
+		t.Run(name, func(t *testing.T) {
+			if data, _, err := readCheckpointRoot(root, name); err == nil || data != nil {
+				t.Fatalf("read unsafe rooted checkpoint %q: %q, %v", name, data, err)
+			}
+		})
+	}
+	data, _, err := readCheckpointRoot(root, "source.db")
+	if err != nil || string(data) != "example checkpoint" {
+		t.Fatalf("safe leaf rejected: %q, %v", data, err)
+	}
+	alias := filepath.Join(dir, "alias")
+	if err := os.Symlink(parent, alias); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readCheckpointFile(filepath.Join(alias, "source.db")); err == nil {
+		t.Fatal("accepted symlink in parent path")
+	}
+	for _, suffix := range []string{"-wal", "-shm", "-journal"} {
+		if err := os.WriteFile(filepath.Join(parent, "source.db"+suffix), nil, 0600); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := readCheckpointRoot(root, "source.db"); err == nil {
+			t.Fatal("accepted SQLite sidecar")
+		}
+		if err := os.Remove(filepath.Join(parent, "source.db"+suffix)); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestCheckpointRootRemainsBoundToOpenedParent(t *testing.T) {
+	dir := t.TempDir()
+	parent := filepath.Join(dir, "parent")
+	if err := os.Mkdir(parent, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(parent, "source.db"), []byte("original"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.OpenRoot(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	if err := os.Rename(parent, filepath.Join(dir, "moved")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(parent, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(parent, "source.db"), []byte("replacement"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	data, _, err := readCheckpointRoot(root, "source.db")
+	if err != nil || string(data) != "original" {
+		t.Fatalf("root followed replaced parent: %q, %v", data, err)
+	}
+}
+
+func TestObservationCheckpointRejectsOutputDSNQueryBeforeLoading(t *testing.T) {
+	cfg := checkpointTestConfig(t)
+	// If passed to SQLite unchanged, this would open the existing source DB,
+	// not the distinct literal filename checked and created by os.OpenFile.
+	cfg.ObservationCheckpoint = cfg.Cache.DBFile + "?mode=rw"
+	loader := &checkpointTestLoader{}
+	if err := prepareObservationCheckpoint(t.Context(), cfg, loader); err == nil || loader.calls != 0 {
+		t.Fatalf("accepted SQLite query syntax: %v", err)
+	}
+	if _, err := os.Lstat(cfg.ObservationCheckpoint); !os.IsNotExist(err) {
+		t.Fatal("created query-shaped output")
+	}
+	source, err := os.ReadFile(cfg.Cache.DBFile)
+	if err != nil || checkpointDigest(source) != cfg.ObservationSourceSHA256 {
+		t.Fatal("source bytes changed")
+	}
+}
+
+func TestObservationCheckpointRejectsSourceOutputAliases(t *testing.T) {
+	for _, alias := range []string{"exact", "relative", "hardlink", "symlink"} {
+		t.Run(alias, func(t *testing.T) {
+			cfg := checkpointTestConfig(t)
+			switch alias {
+			case "exact":
+				cfg.ObservationCheckpoint = cfg.Cache.DBFile
+			case "relative":
+				t.Chdir(filepath.Dir(cfg.Cache.DBFile))
+				cfg.ObservationCheckpoint = "./source.db"
+			case "hardlink":
+				if err := os.Link(cfg.Cache.DBFile, cfg.ObservationCheckpoint); err != nil {
+					t.Fatal(err)
+				}
+			case "symlink":
+				if err := os.Symlink(cfg.Cache.DBFile, cfg.ObservationCheckpoint); err != nil {
+					t.Fatal(err)
+				}
+			}
+			loader := &checkpointTestLoader{}
+			if err := prepareObservationCheckpoint(t.Context(), cfg, loader); err == nil || loader.calls != 0 {
+				t.Fatalf("source/output alias reached loader: %v", err)
+			}
+			source, err := os.ReadFile(cfg.Cache.DBFile)
+			if err != nil || checkpointDigest(source) != cfg.ObservationSourceSHA256 {
+				t.Fatal("source bytes changed")
+			}
+			if _, err := os.Stat(cfg.ObservationCheckpoint + ".json"); !os.IsNotExist(err) {
+				t.Fatal("alias received a receipt")
 			}
 		})
 	}
