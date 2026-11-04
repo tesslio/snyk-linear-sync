@@ -563,3 +563,203 @@ func TestObservationCheckpointRejectsSourceOutputAliases(t *testing.T) {
 		})
 	}
 }
+
+func TestCheckpointRootCreatesExclusivePrivateLeaf(t *testing.T) {
+	dir := t.TempDir()
+	parent := filepath.Join(dir, "parent")
+	if err := os.Mkdir(parent, 0700); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(dir, "outside.db")
+	if err := os.WriteFile(outside, []byte("untouched"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(parent, "link.db")); err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.OpenRoot(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	for _, name := range []string{"../outside.db", outside, "sub/../candidate.db", "sub/candidate.db", "link.db", ".", ""} {
+		if file, err := createCheckpointRoot(root, name); err == nil {
+			_ = file.Close()
+			t.Fatalf("created unsafe leaf %q", name)
+		}
+	}
+	file, err := createCheckpointRoot(root, "candidate.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.Write([]byte("candidate")); err != nil {
+		t.Fatal(err)
+	}
+	info, err := file.Stat()
+	if err != nil || info.Mode().Perm() != 0600 {
+		t.Fatalf("unsafe file mode: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if file, err := createCheckpointRoot(root, "candidate.db"); err == nil {
+		_ = file.Close()
+		t.Fatal("overwrote existing file")
+	}
+	data, err := os.ReadFile(outside)
+	if err != nil || string(data) != "untouched" {
+		t.Fatalf("outside file changed: %q %v", data, err)
+	}
+}
+
+func TestCheckpointOutputRootSurvivesParentReplacement(t *testing.T) {
+	dir := t.TempDir()
+	parent := filepath.Join(dir, "parent")
+	if err := os.Mkdir(parent, 0700); err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.OpenRoot(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	moved := filepath.Join(dir, "moved")
+	if err := os.Rename(parent, moved); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(parent, 0700); err != nil {
+		t.Fatal(err)
+	}
+	name := "candidate.db"
+	file, err := createCheckpointRoot(root, name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := file.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(moved, name)); err != nil {
+		t.Fatal("creation escaped retained root", err)
+	}
+	if err := checkpointOutputParentUnchanged(root, filepath.Join(parent, name)); err == nil {
+		t.Fatal("accepted replaced parent")
+	}
+	for _, suffix := range []string{"", "-wal", "-shm", "-journal"} {
+		if err := os.WriteFile(filepath.Join(parent, name+suffix), []byte("replacement"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := removeCheckpointRoot(root, name, info); err != nil {
+		t.Fatal(err)
+	}
+	for _, suffix := range []string{"", "-wal", "-shm", "-journal"} {
+		data, err := os.ReadFile(filepath.Join(parent, name+suffix))
+		if err != nil || string(data) != "replacement" {
+			t.Fatalf("cleanup escaped root: %q %v", data, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(moved, name)); !os.IsNotExist(err) {
+		t.Fatal("retained-root candidate not removed")
+	}
+}
+
+func TestObservationCheckpointRejectsReplacedOutputParent(t *testing.T) {
+	cfg := checkpointTestConfig(t)
+	parent := filepath.Join(filepath.Dir(cfg.Cache.DBFile), "private-output")
+	if err := os.Mkdir(parent, 0700); err != nil {
+		t.Fatal(err)
+	}
+	cfg.ObservationCheckpoint = filepath.Join(parent, "candidate.db")
+	moved := parent + "-moved"
+	loader := &checkpointTestLoader{afterLoad: func() {
+		if err := os.Rename(parent, moved); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(parent, 0700); err != nil {
+			t.Fatal(err)
+		}
+		for _, suffix := range []string{"", ".json", "-wal", "-shm", "-journal"} {
+			if err := os.WriteFile(cfg.ObservationCheckpoint+suffix, []byte("replacement"), 0600); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}}
+	if err := prepareObservationCheckpoint(t.Context(), cfg, loader); err == nil || loader.calls != 1 {
+		t.Fatalf("accepted replaced parent: %v", err)
+	}
+	for _, suffix := range []string{"", ".json", "-wal", "-shm", "-journal"} {
+		data, err := os.ReadFile(cfg.ObservationCheckpoint + suffix)
+		if err != nil || string(data) != "replacement" {
+			t.Fatalf("modified replacement directory: %q %v", data, err)
+		}
+		if _, err := os.Stat(filepath.Join(moved, "candidate.db"+suffix)); !os.IsNotExist(err) {
+			t.Fatalf("failed output remained in retained root: %s", suffix)
+		}
+	}
+	source, err := os.ReadFile(cfg.Cache.DBFile)
+	if err != nil || checkpointDigest(source) != cfg.ObservationSourceSHA256 {
+		t.Fatal("source changed")
+	}
+}
+
+func TestObservationCheckpointPreservesRacedReceipt(t *testing.T) {
+	for _, symlink := range []bool{false, true} {
+		t.Run(fmt.Sprint(symlink), func(t *testing.T) {
+			cfg := checkpointTestConfig(t)
+			sentinel := filepath.Join(filepath.Dir(cfg.Cache.DBFile), "sentinel")
+			if err := os.WriteFile(sentinel, []byte("untouched"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			loader := &checkpointTestLoader{afterLoad: func() {
+				var err error
+				if symlink {
+					err = os.Symlink(sentinel, cfg.ObservationCheckpoint+".json")
+				} else {
+					err = os.WriteFile(cfg.ObservationCheckpoint+".json", []byte("untouched"), 0600)
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+			}}
+			if err := prepareObservationCheckpoint(t.Context(), cfg, loader); err == nil {
+				t.Fatal("overwrote raced receipt")
+			}
+			for _, path := range []string{sentinel, cfg.ObservationCheckpoint + ".json"} {
+				data, err := os.ReadFile(path)
+				if err != nil || string(data) != "untouched" {
+					t.Fatalf("removed or modified external file: %q %v", data, err)
+				}
+			}
+			if _, err := os.Stat(cfg.ObservationCheckpoint); !os.IsNotExist(err) {
+				t.Fatal("failed candidate remained")
+			}
+		})
+	}
+}
+
+func TestObservationCheckpointPreservesReplacedCandidate(t *testing.T) {
+	cfg := checkpointTestConfig(t)
+	moved := cfg.ObservationCheckpoint + ".moved"
+	loader := &checkpointTestLoader{afterLoad: func() {
+		if err := os.Rename(cfg.ObservationCheckpoint, moved); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(cfg.ObservationCheckpoint, []byte("replacement"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}}
+	if err := prepareObservationCheckpoint(t.Context(), cfg, loader); err == nil {
+		t.Fatal("accepted replaced candidate")
+	}
+	data, err := os.ReadFile(cfg.ObservationCheckpoint)
+	if err != nil || string(data) != "replacement" {
+		t.Fatalf("deleted replaced candidate: %q %v", data, err)
+	}
+	if _, err := os.Stat(cfg.ObservationCheckpoint + ".json"); !os.IsNotExist(err) {
+		t.Fatal("replaced candidate received receipt")
+	}
+}

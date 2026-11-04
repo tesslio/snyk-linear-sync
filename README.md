@@ -248,7 +248,11 @@ operator-selected; reads open only a single leaf inside an opened parent directo
 and reject symlinks, sidecars, and replacement during the read. Both relative and
 absolute checkpoint paths address the same file during SQLite inspection.
 Output paths containing `?` are rejected before creation because SQLite interprets
-that character as DSN query syntax rather than part of the filename.
+that character as DSN query syntax rather than part of the filename. Candidate and
+receipt creation, directory sync, and failure cleanup retain the same private
+parent-directory handle. Parent or candidate replacement fails preparation. Keep
+the source and output directories single-writer throughout preparation: SQLite
+reopens the candidate by pathname between identity checks.
 
 The completed receipt binds source/output hashes, protected logical state,
 version-2 settings digest and read provenance. `started_at` is a conservative

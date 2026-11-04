@@ -471,6 +471,11 @@ An observation-only checkpoint is a separate preparation boundary, not a normal
 preview database promoted for execution. It starts from checksum-pinned trusted
 source bytes, runs only the Snyk loader with strict source reads, and emits a new
 private candidate plus a complete hash-bound receipt only after SQLite closes.
+Candidate and receipt creation and cleanup are leaf-only operations relative to
+a retained private parent-directory handle. Replacement of the parent or candidate
+refuses publication; cleanup does not follow a replaced pathname. SQLite still
+reopens the absolute candidate pathname, so its directories must remain
+single-writer throughout preparation.
 Protected reconciliation hashes and prior cold-start provenance must remain
 unchanged. Schema is preserved except for the reviewed nullable `unignored_at`
 and `observed_issues` additions to supported legacy ignore tables; the receipt

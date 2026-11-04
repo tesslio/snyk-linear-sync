@@ -81,21 +81,34 @@ func prepareObservationCheckpoint(ctx context.Context, cfg config.Config, loader
 	if err := privateCheckpointParent(output); err != nil {
 		return err
 	}
-	if err := noCheckpointSidecars(output); err != nil {
+	outputRoot, err := os.OpenRoot(filepath.Dir(output))
+	if err != nil {
 		return err
 	}
-	receiptPath := output + ".json"
-	if _, err := os.Lstat(receiptPath); !os.IsNotExist(err) {
+	defer func() { err = errors.Join(err, outputRoot.Close()) }()
+	outputName := filepath.Base(output)
+	if err := checkpointOutputParentUnchanged(outputRoot, output); err != nil {
+		return err
+	}
+	if err := noCheckpointRootSidecars(outputRoot, outputName); err != nil {
+		return err
+	}
+	receiptName := outputName + ".json"
+	if _, err := outputRoot.Lstat(receiptName); !os.IsNotExist(err) {
 		return errors.New("observation receipt already exists or is inaccessible")
 	}
-	f, err := os.OpenFile(output, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	f, err := createCheckpointRoot(outputRoot, outputName)
 	if err != nil {
 		return fmt.Errorf("create new observation checkpoint: %w", err)
+	}
+	created, statErr := f.Stat()
+	if statErr != nil {
+		return errors.Join(statErr, f.Close(), outputRoot.Remove(outputName))
 	}
 	complete := false
 	defer func() {
 		if !complete {
-			err = errors.Join(err, removeCheckpoint(output))
+			err = errors.Join(err, removeCheckpointRoot(outputRoot, outputName, created))
 		}
 	}()
 	if _, err = f.Write(source); err != nil {
@@ -109,8 +122,14 @@ func prepareObservationCheckpoint(ctx context.Context, cfg config.Config, loader
 	if err = f.Close(); err != nil {
 		return err
 	}
+	if err := checkpointOutputUnchanged(outputRoot, output, created); err != nil {
+		return err
+	}
 	before, err := inspectCheckpoint(ctx, output)
 	if err != nil {
+		return err
+	}
+	if err := checkpointOutputUnchanged(outputRoot, output, created); err != nil {
 		return err
 	}
 	store, err := cache.Open(output)
@@ -129,6 +148,9 @@ func prepareObservationCheckpoint(ctx context.Context, cfg config.Config, loader
 		return err
 	}
 	if err = ctx.Err(); err != nil {
+		return err
+	}
+	if err := checkpointOutputUnchanged(outputRoot, output, created); err != nil {
 		return err
 	}
 	after, err := inspectCheckpoint(ctx, output)
@@ -174,9 +196,12 @@ func prepareObservationCheckpoint(ctx context.Context, cfg config.Config, loader
 	if checkpointDigest(currentSource) != cfg.ObservationSourceSHA256 {
 		return errors.New("observation source changed during preparation")
 	}
-	candidate, err := readCheckpointFile(output)
+	candidate, candidateInfo, err := readCheckpointRoot(outputRoot, outputName)
 	if err != nil {
 		return err
+	}
+	if !os.SameFile(created, candidateInfo) {
+		return errors.New("checkpoint output replaced before hashing")
 	}
 	protected, err := json.Marshal(after)
 	if err != nil {
@@ -198,43 +223,46 @@ func prepareObservationCheckpoint(ctx context.Context, cfg config.Config, loader
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	rf, err := os.OpenFile(receiptPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err := checkpointOutputBytesUnchanged(outputRoot, output, candidateInfo); err != nil {
+		return err
+	}
+	rf, err := createCheckpointRoot(outputRoot, receiptName)
 	if err != nil {
 		return err
+	}
+	receiptInfo, statErr := rf.Stat()
+	if statErr != nil {
+		return errors.Join(statErr, rf.Close(), outputRoot.Remove(receiptName))
 	}
 	if _, err = rf.Write(data); err == nil {
 		err = rf.Sync()
 	}
 	err = errors.Join(err, rf.Close())
 	if err != nil {
-		_ = os.Remove(receiptPath)
+		err = errors.Join(err, removeCheckpointLeaf(outputRoot, receiptName, receiptInfo))
 		return err
 	}
-	directory, err := os.OpenRoot(filepath.Dir(output))
+	dir, err := outputRoot.Open(".")
 	if err == nil {
-		var dir *os.File
-		dir, err = directory.Open(".")
-		if err == nil {
-			err = errors.Join(dir.Sync(), dir.Close())
+		err = errors.Join(dir.Sync(), dir.Close())
+	}
+	if err == nil {
+		err = checkpointOutputBytesUnchanged(outputRoot, output, candidateInfo)
+	}
+	if err == nil {
+		current, checkErr := outputRoot.Lstat(receiptName)
+		if checkErr != nil || !current.Mode().IsRegular() || !os.SameFile(receiptInfo, current) || current.Size() != int64(len(data)) {
+			err = errors.New("observation receipt replaced during publication")
 		}
-		err = errors.Join(err, directory.Close())
 	}
 	if err != nil {
-		_ = os.Remove(receiptPath)
+		err = errors.Join(err, removeCheckpointLeaf(outputRoot, receiptName, receiptInfo))
 		return err
 	}
 	complete = true
 	return nil
 }
 func checkpointDigest(data []byte) string { return fmt.Sprintf("%x", sha256.Sum256(data)) }
-func noCheckpointSidecars(path string) error {
-	for _, suffix := range []string{"-wal", "-shm", "-journal"} {
-		if _, err := os.Lstat(path + suffix); !os.IsNotExist(err) {
-			return errors.New("SQLite sidecar exists or is inaccessible")
-		}
-	}
-	return nil
-}
 func noCheckpointSymlinks(path string) error {
 	absolute, err := filepath.Abs(path)
 	if err != nil {
@@ -263,6 +291,63 @@ func privateCheckpointParent(path string) error {
 	info, err := os.Stat(parent)
 	if err != nil || !info.IsDir() || info.Mode().Perm() != 0700 {
 		return errors.New("checkpoint output parent must be a private mode-0700 directory")
+	}
+	return nil
+}
+
+// Creation and cleanup retain the same private directory handle. A renamed
+// parent must not redirect a candidate, its receipt, or failure cleanup.
+func createCheckpointRoot(root *os.Root, name string) (*os.File, error) {
+	if !filepath.IsLocal(name) || filepath.Base(name) != name || name == "." {
+		return nil, errors.New("checkpoint must name one file within its parent")
+	}
+	return root.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+}
+
+func noCheckpointRootSidecars(root *os.Root, name string) error {
+	for _, suffix := range []string{"-wal", "-shm", "-journal"} {
+		if _, err := root.Lstat(name + suffix); !os.IsNotExist(err) {
+			return errors.New("SQLite sidecar exists or is inaccessible")
+		}
+	}
+	return nil
+}
+
+// SQLite still opens the absolute pathname. Check that it addresses the
+// retained private directory and original candidate at each reopen boundary.
+func checkpointOutputParentUnchanged(root *os.Root, path string) error {
+	if err := privateCheckpointParent(path); err != nil {
+		return err
+	}
+	opened, err := root.Stat(".")
+	if err != nil {
+		return err
+	}
+	current, err := os.Lstat(filepath.Dir(path))
+	if err != nil || !os.SameFile(opened, current) || opened.Mode().Perm() != 0700 {
+		return errors.New("checkpoint output parent changed")
+	}
+	return nil
+}
+
+func checkpointOutputUnchanged(root *os.Root, path string, created os.FileInfo) error {
+	if err := checkpointOutputParentUnchanged(root, path); err != nil {
+		return err
+	}
+	current, err := root.Lstat(filepath.Base(path))
+	if err != nil || !current.Mode().IsRegular() || !os.SameFile(created, current) {
+		return errors.New("checkpoint output replaced")
+	}
+	return nil
+}
+
+func checkpointOutputBytesUnchanged(root *os.Root, path string, hashed os.FileInfo) error {
+	if err := checkpointOutputUnchanged(root, path, hashed); err != nil {
+		return err
+	}
+	current, err := root.Lstat(filepath.Base(path))
+	if err != nil || current.Size() != hashed.Size() || !current.ModTime().Equal(hashed.ModTime()) {
+		return errors.New("checkpoint output changed after hashing")
 	}
 	return nil
 }
@@ -300,15 +385,7 @@ func readCheckpointRoot(root *os.Root, name string) ([]byte, os.FileInfo, error)
 	if !filepath.IsLocal(name) || filepath.Base(name) != name {
 		return nil, nil, errors.New("checkpoint must name one file within its parent")
 	}
-	checkSidecars := func() error {
-		for _, suffix := range []string{"-wal", "-shm", "-journal"} {
-			if _, err := root.Lstat(name + suffix); !os.IsNotExist(err) {
-				return errors.New("SQLite sidecar exists or is inaccessible")
-			}
-		}
-		return nil
-	}
-	if err := checkSidecars(); err != nil {
+	if err := noCheckpointRootSidecars(root, name); err != nil {
 		return nil, nil, err
 	}
 	info, err := root.Lstat(name)
@@ -336,15 +413,32 @@ func readCheckpointRoot(root *os.Root, name string) ([]byte, os.FileInfo, error)
 	if err != nil || !after.Mode().IsRegular() || !os.SameFile(info, after) || after.Size() != int64(len(data)) || !after.ModTime().Equal(info.ModTime()) {
 		return nil, nil, errors.New("checkpoint changed during rooted read")
 	}
-	if err := checkSidecars(); err != nil {
+	if err := noCheckpointRootSidecars(root, name); err != nil {
 		return nil, nil, err
 	}
 	return data, opened, nil
 }
-func removeCheckpoint(path string) error {
+func removeCheckpointLeaf(root *os.Root, name string, created os.FileInfo) error {
+	current, err := root.Lstat(name)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !os.SameFile(created, current) {
+		return errors.New("refusing to remove replaced checkpoint file")
+	}
+	return root.Remove(name)
+}
+
+func removeCheckpointRoot(root *os.Root, name string, created os.FileInfo) error {
+	if err := removeCheckpointLeaf(root, name, created); err != nil {
+		return err
+	}
 	var errs []error
-	for _, name := range []string{path, path + "-wal", path + "-shm", path + "-journal"} {
-		if err := os.Remove(name); err != nil && !os.IsNotExist(err) {
+	for _, leaf := range []string{name + "-wal", name + "-shm", name + "-journal"} {
+		if err := root.Remove(leaf); err != nil && !os.IsNotExist(err) {
 			errs = append(errs, err)
 		}
 	}
