@@ -66,6 +66,59 @@ Dry run:
 go run ./cmd/snyk-linear-sync --env-file .env --dry-run
 ```
 
+Export a private per-ticket dry-run plan to a **new** file:
+
+```bash
+go run ./cmd/snyk-linear-sync --env-file .env --dry-run --plan-json private-plan.json
+```
+
+`--plan-json` requires `--dry-run`. It writes JSON with file mode `0600` and
+refuses to overwrite an existing path (including a symlink). The plan is emitted
+only after both source snapshots and reconciliation complete successfully. A
+failed or interrupted process does not supply a usable plan: require exit code
+zero and `complete: true` before consuming an artifact.
+
+The versioned plan covers each source finding and each ticket in the initial
+Linear snapshot, including creates, updates, resolutions, duplicate cancellation,
+cache hits, unchanged or archived tickets, deferred creates, and closed tickets
+retained by the reopen guard. One-based snapshot indexes account for coverage;
+a matched finding and ticket share a record. Repeated source fingerprints that
+were overwritten during reconciliation have an explicit superseded record.
+Mutation counts are checked against the normal dry-run counters.
+Snapshots with missing or repeated Linear issue IDs fail export without producing
+a complete plan: ambiguous rows cannot be assigned trustworthy per-row decisions.
+This validation is export-only and does not change the ordinary sync path.
+
+Records include old, calculated and proposed/planned due dates, the raw SLA
+deadline before sticky-date/cold-start overrides, source timestamps, reasons and
+held-date status. They also include state-preservation and reopen/history intent,
+requested managed/create-only labels, snapshot label names, and sanitized change
+flags (including metadata-only changes). `candidate_diff` describes the candidate
+fields even if a cache hit suppresses an operation. `planned` due dates remain
+unchanged for non-mutation records. Raw SLA deadlines are empty while awaiting a
+fix. State names/IDs and labels are **intent**, not fully resolved mutation input:
+real writes resolve workflow states and label IDs/groups and reread live labels.
+Protected-label and exclusive-group rules still apply at mutation time.
+
+All operations say `execution_status: not_attempted`. No Linear writes, comments,
+label creation, or sync-hash saves occur. This does not predict whether a later
+live operation will succeed. Reopen history may require read-only requests;
+`reopen_history_status: partial_or_failed` reports a history lookup error, and a
+record without a restored state uses the normal configured-state fallback.
+
+**Dry runs still update local ignore memory and cold-start/trust metadata.** Use
+a disposable copy of the intended cache when comparing plans, including when
+using `--bypass-cache` or `--clear-ignores-cold-start`. Keep an untouched candidate
+cache separately. The export contains private ticket IDs/identifiers, state and
+label names and timestamps; keep it private. It omits titles, descriptions, URLs,
+source paths, credentials and raw Snyk fingerprints. Fingerprint identities and
+full source/configuration/sync-cache inputs are SHA-256 digests. Input hashes
+preserve snapshot order because matching can depend on that order. Output record
+ordering is stable for identical inputs; this does not change the matching order
+or promise identical decisions for reordered/changing snapshots. Bind an approval
+to the exact tool revision and cache artifact separately; the plan is not a lock
+on either service.
+
 Normal run:
 
 ```bash
@@ -484,6 +537,7 @@ Optional:
 
 - `--env-file`
 - `--dry-run`
+- `--plan-json <new-private-file>` (requires `--dry-run`)
 - `--bypass-cache`
 - `--clear-ignores-cold-start`
 - `SNYK_REGION`

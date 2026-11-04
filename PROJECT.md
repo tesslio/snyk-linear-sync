@@ -359,6 +359,53 @@ When a configured ignore-memory store cannot be read or written, snapshot loadin
 
 With an empty ignore memory, the sync cannot tell an earlier due date that is a real change from one that merely reflects an expiry it no longer knows about. A run that starts with no cached ignore rows while the Linear snapshot holds managed open tickets with due dates therefore engages a guard: for a matched open ticket whose desired due date is earlier than its current one, the current date is kept this run (the reason says why) and the run warns with the count, reported as `held_due_dates`. Later dates still apply. Before loading can populate the cache, `ignores_memory_state` in `sync_meta` records a pending empty start. Both sync and diagnostic Snyk loads preserve this evidence across failures or interruptions, even when rows were already committed. After a successful pair of snapshots, an open dated ticket promotes that pending state to the `ignores_cold_start_at` guard; otherwise memory is marked trusted and no guard is engaged. The guard holds until `--clear-ignores-cold-start` records trusted memory and removes the marker. Trust persists even when the table stays empty, including on subsequent normal runs. Deleting only the guard key does not release pending memory; use the flag.
 
+## Dry-Run Plan Export
+
+`--dry-run --plan-json <new-private-file>` exports versioned JSON from the same
+reconciliation decisions as a normal run. It does not recompute a parallel plan,
+reorder matching inputs, reload either initial snapshot, or invoke mutation-time
+state/label resolution. The exporter is disabled by default, rejects non-dry-run
+use before loading, and returns a complete plan only after successful source
+loading and reconciliation. The CLI creates an exclusive `0600` file; existing
+paths and final-component symlinks are refused. Consumers must require successful
+process exit and the complete flag.
+
+Coverage includes every initial finding and ticket, with a matched pair in one
+record and explicit records for superseded source fingerprints, deferred creates,
+archived/unchanged/cache-suppressed tickets, terminal duplicates and rejected
+reopens. One-based input indexes allow coverage checks. Selected mutation totals
+must match the existing dry-run counters. Export rejects missing or repeated
+Linear issue IDs rather than claiming untrustworthy per-row decision provenance;
+this validation does not change the ordinary sync path. Each mutation is
+`not_attempted`, never
+reported as successful; no Linear writes or sync-hash saves are performed.
+Read-only reopen history requests remain part of planning, and lookup errors are
+reported without exporting their potentially sensitive error text.
+
+The sanitized schema records due-date inputs, the raw SLA deadline before
+sticky/cold-start overrides, proposed/planned dates, reasons, held status,
+state/reopen/history intent, requested labels and change flags. It does not export
+ticket prose, URLs, source paths, credentials or raw location-bearing fingerprints.
+Raw SLA dates are empty while awaiting a fix. A non-mutation record keeps its old
+planned date; candidate change flags may still show a cache-suppressed difference.
+State/label resolution is explicitly unattempted: actual writes resolve workflow
+states and label IDs/groups, reread live labels, preserve unmanaged labels and
+apply protected/exclusive-group rules. The export must not be treated as final
+mutation payloads or as a prediction of write success.
+
+Full ordered snapshots and an explicit credential-free configuration allowlist
+are hashed separately from the sync cache and selected decisions. Sorting output
+records provides stable serialization for identical ordered inputs without
+changing input-order-sensitive matching. The tool revision and exact cache file
+must be bound separately when approving a later run. Source drift and concurrent
+Linear edits can still change a live result.
+
+Dry run retains existing local ignore-memory and cold-start/trust metadata
+writes, including clear-marker behavior. Operators must use a disposable cache
+copy and retain the untouched candidate separately when collecting previews. The
+artifact itself remains private operational data (ticket IDs, state/label names
+and timestamps), even though sensitive prose and raw source identities are omitted.
+
 ## Safety Assumptions
 
 - The metadata block must remain intact.

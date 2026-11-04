@@ -150,6 +150,7 @@ type RunResult struct {
 	PlannedResolves     int64
 	CancelledDuplicates int64
 	FailedOps           int64
+	Plan                *ReconciliationPlan
 }
 
 func New(cfg config.Config, logger *slog.Logger, snyk SnykClient, linear LinearClient, cacheStore CacheStore) *Service {
@@ -163,6 +164,9 @@ func New(cfg config.Config, logger *slog.Logger, snyk SnykClient, linear LinearC
 }
 
 func (s *Service) Run(ctx context.Context) (RunResult, error) {
+	if s.cfg.PlanJSON != "" && (!s.cfg.DryRun || s.cfg.PlanJSON == "-") {
+		return RunResult{}, fmt.Errorf("plan export requires dry-run and a private file path")
+	}
 	runCtx := ctx
 	var (
 		snykSnapshot   model.SnykSnapshot
@@ -222,6 +226,11 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 		slog.Int("findings", len(findings)),
 		slog.Int("existing_issues", len(existingIssues)),
 	)
+
+	plan, err := newPlanCollector(s.cfg, snykSnapshot, existingIssues, cacheSnapshot, cacheEnabled)
+	if err != nil {
+		return RunResult{}, err
+	}
 
 	if !guard.active && guard.tableEmpty && hasOpenTicketWithDueDate(existingIssues, s.cfg.Linear.States) {
 		// The sync has no memory of expired ignores while Linear already
@@ -330,8 +339,10 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 	matchedExisting := make(map[string]model.ExistingIssue, len(findings))
 	snykHashes := make(map[string]string, len(findings))
 	var rebound, reopened int64
-	for _, finding := range findings {
+	for findingIndex, finding := range findings {
 		desired := desiredIssue(s.cfg, finding)
+		plan.finding(findingIndex, finding, desired)
+		heldDueDate := false
 
 		existing, matched := existingByFingerprint[finding.Fingerprint]
 		kind := matchExact
@@ -430,6 +441,7 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 					slog.String("existing", existing.Identifier),
 					slog.String("existing_state", existing.StateName),
 				)
+				plan.retained(existing.ID, "reopen-guard-retained")
 				delete(existingByFingerprint, finding.Fingerprint)
 				matched = false
 			}
@@ -450,6 +462,7 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 				slog.String("project_name", finding.ProjectName),
 			)
 			deferredFingerprints[finding.Fingerprint] = struct{}{}
+			plan.add("defer-create", "cluster-lookup-failed-with-rebind-candidate", finding.Fingerprint, nil, &desired)
 			continue
 		}
 
@@ -531,6 +544,7 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 				desired.DueDateBase = existing.DueDate
 				desired.DueDateReason = "kept existing due date: the ignore cache started empty, so an earlier date may only reflect a forgotten ignore expiry"
 				guard.held++
+				heldDueDate = true
 			}
 		}
 
@@ -540,12 +554,19 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 		desiredByFingerprint[finding.Fingerprint] = desired
 		snykHashes[finding.Fingerprint] = desiredIssueHash(desired)
 		if matched {
+			plan.matched(finding.Fingerprint, kind, heldDueDate)
 			matchedExisting[finding.Fingerprint] = existing
 		}
 	}
 
 	if reopened > 0 {
-		s.restoreReopenedStates(ctx, desiredByFingerprint, matchedExisting)
+		historyOK := s.restoreReopenedStates(ctx, desiredByFingerprint, matchedExisting)
+		if plan != nil {
+			plan.plan.ReopenHistoryStatus = "complete"
+			if !historyOK {
+				plan.plan.ReopenHistoryStatus = "partial_or_failed"
+			}
+		}
 	}
 
 	currentLinearHashes := make(map[string]string, len(matchedExisting))
@@ -608,6 +629,7 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 			}
 			existing, ok := matchedExisting[fingerprint]
 			if !ok {
+				plan.add("create", "no-reusable-ticket", fingerprint, nil, &desired)
 				createBatch = append(createBatch, desired)
 				if len(createBatch) == createBatchSize {
 					jobs <- job{kind: jobCreateBatch, desiredBatch: append([]model.DesiredIssue(nil), createBatch...)}
@@ -621,6 +643,7 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 			// terminal and are only matched here when the desired state is
 			// terminal too, so there is nothing to move.
 			if existing.ArchivedAt != nil {
+				plan.add("no-op", "archived", fingerprint, &existing, &desired)
 				continue
 			}
 			// The cache fast-path may not suppress a pending move into a terminal
@@ -633,17 +656,21 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 			// fingerprint must be rewritten: the cache is keyed by fingerprint
 			// and says nothing about a ticket that carried another one.
 			if cacheEnabled && cacheSnapshot.SnykHashes[fingerprint] == snykHashes[fingerprint] && cacheSnapshot.LinearHashes[fingerprint] == currentLinearHashes[fingerprint] && !pendingTerminalTransition(existing, desired) && !desired.Reopen && existing.Fingerprint == fingerprint {
+				plan.add("no-op", "cache-hit", fingerprint, &existing, &desired)
 				continue
 			}
 			if needsUpdate(existing, desired, s.cfg.Linear.States) {
 				update := model.IssueUpdate{Existing: existing, Desired: desired}
 				update.Diff = ComputeDiff(existing, desired, s.cfg.Linear.States)
+				plan.add("update", "managed-fields-differ", fingerprint, &existing, &desired)
 				updateBatch = append(updateBatch, update)
 				if len(updateBatch) == createBatchSize {
 					jobs <- job{kind: jobUpdate, updateBatch: append([]model.IssueUpdate(nil), updateBatch...)}
 					s.logQueueProgress(&queuedJobs, int64(len(updateBatch)))
 					updateBatch = updateBatch[:0]
 				}
+			} else {
+				plan.add("no-op", "unchanged", fingerprint, &existing, &desired)
 			}
 		}
 		if len(createBatch) > 0 {
@@ -664,6 +691,7 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 			// doesn't allow updating archived issues. Trying to resolve
 			// them would produce API errors.
 			if existing.ArchivedAt != nil {
+				plan.add("retain", "archived", fingerprint, &existing, nil)
 				continue
 			}
 			desiredState, stateReason := missingFindingState(existing.Fingerprint, snykSnapshot.ProjectIDs, snykSnapshot.InactiveProjectIDs)
@@ -703,12 +731,15 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 			if needsUpdate(existing, resolved, s.cfg.Linear.States) {
 				resolvedUpdate := model.IssueUpdate{Existing: existing, Desired: resolved}
 				resolvedUpdate.Diff = ComputeDiff(existing, resolved, s.cfg.Linear.States)
+				plan.add("resolve", "finding-absent", fingerprint, &existing, &resolved)
 				resolveBatch = append(resolveBatch, resolvedUpdate)
 				if len(resolveBatch) == createBatchSize {
 					jobs <- job{kind: jobResolve, updateBatch: append([]model.IssueUpdate(nil), resolveBatch...)}
 					s.logQueueProgress(&queuedJobs, int64(len(resolveBatch)))
 					resolveBatch = resolveBatch[:0]
 				}
+			} else {
+				plan.add("retain", "absent-finding-unchanged", fingerprint, &existing, &resolved)
 			}
 		}
 		if len(resolveBatch) > 0 {
@@ -725,6 +756,7 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 			// Linear API at all — attempting it would just produce an API
 			// error.
 			if isTerminalLinearState(duplicate, s.cfg.Linear.States) {
+				plan.retained(duplicate.ID, "terminal-duplicate")
 				continue
 			}
 			desired := model.DesiredIssue{
@@ -740,6 +772,7 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 			if needsUpdate(duplicate, desired, s.cfg.Linear.States) {
 				cancelUpdate := model.IssueUpdate{Existing: duplicate, Desired: desired}
 				cancelUpdate.Diff = ComputeDiff(duplicate, desired, s.cfg.Linear.States)
+				plan.add("cancel-duplicate", "duplicate-fingerprint", duplicate.Fingerprint, &duplicate, &desired)
 				cancelBatch = append(cancelBatch, cancelUpdate)
 				if len(cancelBatch) == createBatchSize {
 					jobs <- job{kind: jobCancelDuplicate, updateBatch: append([]model.IssueUpdate(nil), cancelBatch...)}
@@ -805,6 +838,13 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 		)
 	}
 
+	if plan != nil && runCtx.Err() != nil {
+		return result, runCtx.Err()
+	}
+	result.Plan, err = plan.finish(result, guard)
+	if err != nil {
+		return result, err
+	}
 	return result, nil
 }
 
@@ -1963,7 +2003,7 @@ func reopenCandidate(terminal []model.ExistingIssue, finding model.Finding, exis
 // project, and sending it back to Triage throws that triage away. The state
 // comes from the ticket's Linear history; when it cannot be read the reopen
 // still happens, into the configured open state as before.
-func (s *Service) restoreReopenedStates(ctx context.Context, desiredByFingerprint map[string]model.DesiredIssue, matchedExisting map[string]model.ExistingIssue) {
+func (s *Service) restoreReopenedStates(ctx context.Context, desiredByFingerprint map[string]model.DesiredIssue, matchedExisting map[string]model.ExistingIssue) bool {
 	var issueIDs []string
 	for fingerprint, desired := range desiredByFingerprint {
 		if desired.Reopen {
@@ -1997,6 +2037,7 @@ func (s *Service) restoreReopenedStates(ctx context.Context, desiredByFingerprin
 			slog.String("state", state.Name),
 		)
 	}
+	return err == nil
 }
 
 // FingerprintProjectID extracts the project ID portion of a Snyk fingerprint.

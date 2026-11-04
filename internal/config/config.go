@@ -47,6 +47,8 @@ const (
 
 type Config struct {
 	DryRun bool
+	// PlanJSON exports a private complete reconciliation plan; requires DryRun.
+	PlanJSON string
 
 	Log    LogConfig
 	Cache  CacheConfig
@@ -140,6 +142,7 @@ func Load(args []string) (Config, error) {
 	fs.SetOutput(os.Stderr)
 
 	dryRun := fs.Bool("dry-run", false, "plan changes without mutating Linear")
+	planJSON := fs.String("plan-json", "", "write a private JSON reconciliation plan to a new file (requires --dry-run)")
 	bypassCache := fs.Bool("bypass-cache", false, "ignore the SQLite sync cache and fetch/compare everything directly")
 	clearIgnoresColdStart := fs.Bool("clear-ignores-cold-start", false, "clear the ignore-cache cold-start marker so held-back earlier due dates are written again")
 	envFile := fs.String("env-file", "", "load configuration from a dotenv-style file before reading the process environment")
@@ -164,7 +167,8 @@ func Load(args []string) (Config, error) {
 	}
 
 	cfg := Config{
-		DryRun: *dryRun,
+		DryRun:   *dryRun,
+		PlanJSON: strings.TrimSpace(*planJSON),
 		Log: LogConfig{
 			ErrorFile: getEnv("ERROR_LOG_FILE", defaultErrorLogFile),
 		},
@@ -228,6 +232,12 @@ func Load(args []string) (Config, error) {
 
 func (c Config) Validate() error {
 	var errs []error
+	if c.PlanJSON != "" && !c.DryRun {
+		errs = append(errs, errors.New("--plan-json requires --dry-run"))
+	}
+	if c.PlanJSON == "-" {
+		errs = append(errs, errors.New("--plan-json requires a private file path, not stdout"))
+	}
 
 	if c.Snyk.ClientID == "" {
 		errs = append(errs, errors.New("SNYK_CLIENT_ID is required"))
