@@ -420,6 +420,8 @@ stop on partial/uncertain failure, and disable replay in the service, GraphQL
 client and HTTP transport. Missing mutation acknowledgments or generated IDs
 stop guarded dispatch, as does failed post-create subscription cleanup. The
 ordinary unguarded retry and best-effort cleanup behavior remains unchanged.
+Dispatch errors preserve their client cause and operation/batch context,
+including returned failed-item indexes, without retrying or continuing writes.
 Guarded execution requires an immutable configured Linear team UUID, rather than
 a workspace-relative team key. Its exact value is already included in the
 settings digest, and the Linear client uses that same UUID directly as the

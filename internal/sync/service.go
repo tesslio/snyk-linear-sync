@@ -958,20 +958,26 @@ func (s *Service) executeReviewedJob(ctx context.Context, j job) error {
 	switch j.kind {
 	case jobCreateBatch:
 		failed, err := s.linear.CreateIssues(ctx, j.desiredBatch)
-		if err != nil || len(failed) != 0 {
-			return fmt.Errorf("reviewed create failed or has uncertain outcome; stopped without retry")
+		if err != nil {
+			return fmt.Errorf("reviewed create failed or has uncertain outcome; stopped without retry (batch size=%d, failed indexes=%v): %w", len(j.desiredBatch), failed, err)
+		}
+		if len(failed) != 0 {
+			return fmt.Errorf("reviewed create has partial or unacknowledged results; stopped without retry (batch size=%d, failed indexes=%v)", len(j.desiredBatch), failed)
 		}
 	case jobUpdate, jobResolve, jobCancelDuplicate:
 		if err := s.linear.UpdateIssues(ctx, j.updateBatch); err != nil {
-			return fmt.Errorf("reviewed update failed or has uncertain outcome; stopped without retry")
+			return fmt.Errorf("reviewed %s failed or has uncertain outcome; stopped without retry (batch size=%d): %w", j.kind, len(j.updateBatch), err)
 		}
 		if j.kind == jobUpdate && s.cfg.Linear.CommentsEnabled {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
 			failed, err := s.linear.PostComments(ctx, j.updateBatch)
-			if err != nil || len(failed) != 0 {
-				return fmt.Errorf("reviewed comment failed or has uncertain outcome; stopped without retry")
+			if err != nil {
+				return fmt.Errorf("reviewed comment failed or has uncertain outcome; stopped without retry (batch size=%d, failed indexes=%v): %w", len(j.updateBatch), failed, err)
+			}
+			if len(failed) != 0 {
+				return fmt.Errorf("reviewed comment has partial or unacknowledged results; stopped without retry (batch size=%d, failed indexes=%v)", len(j.updateBatch), failed)
 			}
 		}
 	default:

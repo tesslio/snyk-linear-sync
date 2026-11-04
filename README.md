@@ -178,6 +178,8 @@ The Linear snapshot reader rejects missing connection/page data, null or
 unidentified issue rows, missing or repeated continuation cursors, and snapshots
 exceeding 10,000 pages rather than treating partial data as an empty import.
 Review actual remote state before attempting another run.
+Stopped-run errors retain the client cause, operation, batch size and available
+failed-item indexes so operators can investigate without automatically retrying.
 
 **This is a reconciliation preflight, not exact payload approval or an atomic
 transaction.** Version 1 does not commit final title/description/comment contents,

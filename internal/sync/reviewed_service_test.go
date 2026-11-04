@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -362,5 +363,82 @@ func TestReviewedCancellationBetweenUpdateAndCommentStopsDispatch(t *testing.T) 
 	err := svc.executeReviewedJob(ctx, job{kind: jobUpdate, updateBatch: []model.IssueUpdate{{Existing: model.ExistingIssue{ID: "ticket-1"}}}})
 	if !errors.Is(err, context.Canceled) || len(linear.updated) != 1 || len(linear.commentCallBatches) != 0 {
 		t.Fatal("cancellation did not stop the next mutation")
+	}
+}
+
+type reviewedFailureLinear struct {
+	fakeLinear
+	createErr, updateErr, commentErr       error
+	failed                                 []int
+	createCalls, updateCalls, commentCalls int
+}
+
+func (l *reviewedFailureLinear) CreateIssues(context.Context, []model.DesiredIssue) ([]int, error) {
+	l.createCalls++
+	return l.failed, l.createErr
+}
+func (l *reviewedFailureLinear) UpdateIssues(context.Context, []model.IssueUpdate) error {
+	l.updateCalls++
+	return l.updateErr
+}
+func (l *reviewedFailureLinear) PostComments(context.Context, []model.IssueUpdate) ([]int, error) {
+	l.commentCalls++
+	return l.failed, l.commentErr
+}
+
+func TestReviewedDispatchPreservesCauseAndBatchContext(t *testing.T) {
+	for _, operation := range []string{"create", "update", "resolve", "cancel-duplicate", "comment"} {
+		t.Run(operation, func(t *testing.T) {
+			cfg := planCfg()
+			cfg.Linear.CommentsEnabled = true
+			cause := errors.Join(errors.New("example actionable failure"), context.Canceled)
+			linear := &reviewedFailureLinear{failed: []int{1}}
+			j := job{kind: jobKind(operation), desiredBatch: make([]model.DesiredIssue, 2), updateBatch: make([]model.IssueUpdate, 2)}
+			switch operation {
+			case "create":
+				linear.createErr = cause
+			case "comment":
+				linear.commentErr = cause
+				j.kind = jobUpdate
+			default:
+				linear.updateErr = cause
+			}
+			err := New(cfg, discardLogger(), nil, linear, nil).executeReviewedJob(t.Context(), j)
+			if !errors.Is(err, cause) || !errors.Is(err, context.Canceled) || !strings.Contains(err.Error(), "example actionable failure") || !strings.Contains(err.Error(), "batch size=2") || !strings.Contains(err.Error(), "reviewed "+operation) {
+				t.Fatalf("lost failure diagnostics: %v", err)
+			}
+			if operation == "create" || operation == "comment" {
+				if !strings.Contains(err.Error(), "failed indexes=[1]") {
+					t.Fatal("lost failed-item indexes")
+				}
+			}
+			if linear.createCalls > 1 || linear.updateCalls > 1 || linear.commentCalls > 1 {
+				t.Fatal("failure reporting retried a mutation")
+			}
+			if operation != "comment" && linear.commentCalls != 0 {
+				t.Fatal("continued to comments after update failure")
+			}
+		})
+	}
+}
+
+func TestReviewedDispatchReportsPartialFailureIndexesWithoutRetry(t *testing.T) {
+	for _, operation := range []string{"create", "comment"} {
+		t.Run(operation, func(t *testing.T) {
+			cfg := planCfg()
+			cfg.Linear.CommentsEnabled = true
+			linear := &reviewedFailureLinear{failed: []int{1}}
+			j := job{kind: jobCreateBatch, desiredBatch: make([]model.DesiredIssue, 2), updateBatch: make([]model.IssueUpdate, 2)}
+			if operation == "comment" {
+				j.kind = jobUpdate
+			}
+			err := New(cfg, discardLogger(), nil, linear, nil).executeReviewedJob(t.Context(), j)
+			if err == nil || !strings.Contains(err.Error(), "partial or unacknowledged") || !strings.Contains(err.Error(), "failed indexes=[1]") || !strings.Contains(err.Error(), "batch size=2") {
+				t.Fatalf("lost partial failure details: %v", err)
+			}
+			if operation == "create" && linear.createCalls != 1 || operation == "comment" && (linear.updateCalls != 1 || linear.commentCalls != 1) {
+				t.Fatal("retried partial failure")
+			}
+		})
 	}
 }
