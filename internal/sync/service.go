@@ -18,6 +18,7 @@ import (
 
 	"github.com/tesslio/snyk-linear-sync/internal/cache"
 	"github.com/tesslio/snyk-linear-sync/internal/config"
+	"github.com/tesslio/snyk-linear-sync/internal/httpx"
 	"github.com/tesslio/snyk-linear-sync/internal/model"
 )
 
@@ -166,6 +167,25 @@ func New(cfg config.Config, logger *slog.Logger, snyk SnykClient, linear LinearC
 func (s *Service) Run(ctx context.Context) (RunResult, error) {
 	if s.cfg.PlanJSON != "" && (!s.cfg.DryRun || s.cfg.PlanJSON == "-") {
 		return RunResult{}, fmt.Errorf("plan export requires dry-run and a private file path")
+	}
+	// Read and validate accepted bytes once, before snapshot loading or workers.
+	// This guard binds reconciliation intent, not final mutation-time metadata.
+	var reviewed *ReconciliationPlan
+	if (s.cfg.ReviewedPlanJSON == "") != (s.cfg.ReviewedPlanSHA256 == "") {
+		return RunResult{}, fmt.Errorf("reviewed plan path and SHA-256 must be supplied together")
+	}
+	if s.cfg.ReviewedPlanJSON != "" {
+		if !config.IsLinearTeamUUID(s.cfg.Linear.TeamID) {
+			return RunResult{}, fmt.Errorf("reviewed reconciliation guard requires an immutable Linear team UUID; regenerate the reviewed plan using that UUID")
+		}
+		if s.cfg.DryRun || s.cfg.PlanJSON != "" || s.cfg.ReviewedPlanJSON == "-" {
+			return RunResult{}, fmt.Errorf("reviewed reconciliation guard requires live mode and a private input path without plan export")
+		}
+		var err error
+		reviewed, err = readReviewedPlan(s.cfg.ReviewedPlanJSON, s.cfg.ReviewedPlanSHA256)
+		if err != nil {
+			return RunResult{}, err
+		}
 	}
 	runCtx := ctx
 	var (
@@ -595,18 +615,38 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 	var queuedJobs int64
 
 	g, workerCtx := errgroup.WithContext(runCtx)
-	for i := 0; i < s.cfg.Sync.Workers; i++ {
-		g.Go(func() error {
-			for job := range jobs {
-				if err := s.executeJob(workerCtx, job, &result); err != nil {
-					return err
-				}
+	var prepared []job
+	enqueue := func(j job) { jobs <- j }
+	if reviewed != nil {
+		// Planning is single-threaded in guarded mode. No mutation workers exist
+		// until the entire candidate plan has passed comparison.
+		enqueue = func(j job) {
+			prepared = append(prepared, j)
+			switch j.kind {
+			case jobCreateBatch:
+				result.PlannedCreates += int64(len(j.desiredBatch))
+			case jobUpdate:
+				result.PlannedUpdates += int64(len(j.updateBatch))
+			case jobResolve:
+				result.PlannedResolves += int64(len(j.updateBatch))
+			case jobCancelDuplicate:
+				result.CancelledDuplicates += int64(len(j.updateBatch))
 			}
-			return nil
-		})
+		}
+	} else {
+		for i := 0; i < s.cfg.Sync.Workers; i++ {
+			g.Go(func() error {
+				for job := range jobs {
+					if err := s.executeJob(workerCtx, job, &result); err != nil {
+						return err
+					}
+				}
+				return nil
+			})
+		}
 	}
 
-	g.Go(func() error {
+	produceJobs := func() error {
 		defer close(jobs)
 
 		seen := make(map[string]struct{}, len(desiredByFingerprint)+len(reboundFingerprints))
@@ -632,7 +672,7 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 				plan.add("create", "no-reusable-ticket", fingerprint, nil, &desired)
 				createBatch = append(createBatch, desired)
 				if len(createBatch) == createBatchSize {
-					jobs <- job{kind: jobCreateBatch, desiredBatch: append([]model.DesiredIssue(nil), createBatch...)}
+					enqueue(job{kind: jobCreateBatch, desiredBatch: append([]model.DesiredIssue(nil), createBatch...)})
 					s.logQueueProgress(&queuedJobs, int64(len(createBatch)))
 					createBatch = createBatch[:0]
 				}
@@ -665,7 +705,7 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 				plan.add("update", "managed-fields-differ", fingerprint, &existing, &desired)
 				updateBatch = append(updateBatch, update)
 				if len(updateBatch) == createBatchSize {
-					jobs <- job{kind: jobUpdate, updateBatch: append([]model.IssueUpdate(nil), updateBatch...)}
+					enqueue(job{kind: jobUpdate, updateBatch: append([]model.IssueUpdate(nil), updateBatch...)})
 					s.logQueueProgress(&queuedJobs, int64(len(updateBatch)))
 					updateBatch = updateBatch[:0]
 				}
@@ -674,11 +714,11 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 			}
 		}
 		if len(createBatch) > 0 {
-			jobs <- job{kind: jobCreateBatch, desiredBatch: append([]model.DesiredIssue(nil), createBatch...)}
+			enqueue(job{kind: jobCreateBatch, desiredBatch: append([]model.DesiredIssue(nil), createBatch...)})
 			s.logQueueProgress(&queuedJobs, int64(len(createBatch)))
 		}
 		if len(updateBatch) > 0 {
-			jobs <- job{kind: jobUpdate, updateBatch: append([]model.IssueUpdate(nil), updateBatch...)}
+			enqueue(job{kind: jobUpdate, updateBatch: append([]model.IssueUpdate(nil), updateBatch...)})
 			s.logQueueProgress(&queuedJobs, int64(len(updateBatch)))
 		}
 
@@ -734,7 +774,7 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 				plan.add("resolve", "finding-absent", fingerprint, &existing, &resolved)
 				resolveBatch = append(resolveBatch, resolvedUpdate)
 				if len(resolveBatch) == createBatchSize {
-					jobs <- job{kind: jobResolve, updateBatch: append([]model.IssueUpdate(nil), resolveBatch...)}
+					enqueue(job{kind: jobResolve, updateBatch: append([]model.IssueUpdate(nil), resolveBatch...)})
 					s.logQueueProgress(&queuedJobs, int64(len(resolveBatch)))
 					resolveBatch = resolveBatch[:0]
 				}
@@ -743,7 +783,7 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 			}
 		}
 		if len(resolveBatch) > 0 {
-			jobs <- job{kind: jobResolve, updateBatch: append([]model.IssueUpdate(nil), resolveBatch...)}
+			enqueue(job{kind: jobResolve, updateBatch: append([]model.IssueUpdate(nil), resolveBatch...)})
 			s.logQueueProgress(&queuedJobs, int64(len(resolveBatch)))
 		}
 
@@ -775,22 +815,51 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 				plan.add("cancel-duplicate", "duplicate-fingerprint", duplicate.Fingerprint, &duplicate, &desired)
 				cancelBatch = append(cancelBatch, cancelUpdate)
 				if len(cancelBatch) == createBatchSize {
-					jobs <- job{kind: jobCancelDuplicate, updateBatch: append([]model.IssueUpdate(nil), cancelBatch...)}
+					enqueue(job{kind: jobCancelDuplicate, updateBatch: append([]model.IssueUpdate(nil), cancelBatch...)})
 					s.logQueueProgress(&queuedJobs, int64(len(cancelBatch)))
 					cancelBatch = cancelBatch[:0]
 				}
 			}
 		}
 		if len(cancelBatch) > 0 {
-			jobs <- job{kind: jobCancelDuplicate, updateBatch: append([]model.IssueUpdate(nil), cancelBatch...)}
+			enqueue(job{kind: jobCancelDuplicate, updateBatch: append([]model.IssueUpdate(nil), cancelBatch...)})
 			s.logQueueProgress(&queuedJobs, int64(len(cancelBatch)))
 		}
 
 		return nil
-	})
+	}
 
-	if err := g.Wait(); err != nil {
-		return result, err
+	if reviewed != nil {
+		if err := produceJobs(); err != nil {
+			return result, err
+		}
+		if err := runCtx.Err(); err != nil {
+			return result, err
+		}
+		currentPlan, err := plan.finish(result, guard)
+		if err != nil {
+			return result, err
+		}
+		if err := verifyReviewedPlan(reviewed, currentPlan); err != nil {
+			return result, err
+		}
+		s.logger.Info("reviewed reconciliation matched; executing buffered operations")
+		for _, j := range prepared {
+			if err := runCtx.Err(); err != nil {
+				return result, err
+			}
+			// Do not re-plan or retry uncertain mutations in guarded mode. A
+			// partial failure stops subsequent operations and requires review.
+			if err := s.executeReviewedJob(runCtx, j); err != nil {
+				result.FailedOps++
+				return result, err
+			}
+		}
+	} else {
+		g.Go(produceJobs)
+		if err := g.Wait(); err != nil {
+			return result, err
+		}
 	}
 
 	if !s.cfg.DryRun && s.cache != nil {
@@ -841,9 +910,11 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 	if plan != nil && runCtx.Err() != nil {
 		return result, runCtx.Err()
 	}
-	result.Plan, err = plan.finish(result, guard)
-	if err != nil {
-		return result, err
+	if reviewed == nil {
+		result.Plan, err = plan.finish(result, guard)
+		if err != nil {
+			return result, err
+		}
 	}
 	return result, nil
 }
@@ -873,6 +944,46 @@ type job struct {
 	kind         jobKind
 	desiredBatch []model.DesiredIssue
 	updateBatch  []model.IssueUpdate
+}
+
+// executeReviewedJob sends only the previously buffered intent. Unlike the
+// ordinary operational path, it stops after a partial or uncertain response and
+// never automatically repeats a possibly successful mutation. Client-internal
+// metadata resolution and follow-on writes are NOT frozen by this v1 guard.
+func (s *Service) executeReviewedJob(ctx context.Context, j job) error {
+	ctx = httpx.WithoutRetries(ctx)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	switch j.kind {
+	case jobCreateBatch:
+		failed, err := s.linear.CreateIssues(ctx, j.desiredBatch)
+		if err != nil {
+			return fmt.Errorf("reviewed create failed or has uncertain outcome; stopped without retry (batch size=%d, failed indexes=%v): %w", len(j.desiredBatch), failed, err)
+		}
+		if len(failed) != 0 {
+			return fmt.Errorf("reviewed create has partial or unacknowledged results; stopped without retry (batch size=%d, failed indexes=%v)", len(j.desiredBatch), failed)
+		}
+	case jobUpdate, jobResolve, jobCancelDuplicate:
+		if err := s.linear.UpdateIssues(ctx, j.updateBatch); err != nil {
+			return fmt.Errorf("reviewed %s failed or has uncertain outcome; stopped without retry (batch size=%d): %w", j.kind, len(j.updateBatch), err)
+		}
+		if j.kind == jobUpdate && s.cfg.Linear.CommentsEnabled {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			failed, err := s.linear.PostComments(ctx, j.updateBatch)
+			if err != nil {
+				return fmt.Errorf("reviewed comment failed or has uncertain outcome; stopped without retry (batch size=%d, failed indexes=%v): %w", len(j.updateBatch), failed, err)
+			}
+			if len(failed) != 0 {
+				return fmt.Errorf("reviewed comment has partial or unacknowledged results; stopped without retry (batch size=%d, failed indexes=%v)", len(j.updateBatch), failed)
+			}
+		}
+	default:
+		return fmt.Errorf("unknown reviewed job kind")
+	}
+	return nil
 }
 
 func (s *Service) executeJob(ctx context.Context, job job, result *RunResult) error {

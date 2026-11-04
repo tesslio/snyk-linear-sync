@@ -49,6 +49,9 @@ type Config struct {
 	DryRun bool
 	// PlanJSON exports a private complete reconciliation plan; requires DryRun.
 	PlanJSON string
+	// ReviewedPlanJSON and ReviewedPlanSHA256 gate live writes on exact input/decision equivalence.
+	ReviewedPlanJSON   string
+	ReviewedPlanSHA256 string
 
 	Log    LogConfig
 	Cache  CacheConfig
@@ -143,6 +146,8 @@ func Load(args []string) (Config, error) {
 
 	dryRun := fs.Bool("dry-run", false, "plan changes without mutating Linear")
 	planJSON := fs.String("plan-json", "", "write a private JSON reconciliation plan to a new file (requires --dry-run)")
+	reviewedPlanJSON := fs.String("reviewed-plan-json", "", "require this complete private dry-run reconciliation plan before live writes")
+	reviewedPlanSHA256 := fs.String("reviewed-plan-sha256", "", "independently reviewed SHA-256 of the exact approved plan file bytes")
 	bypassCache := fs.Bool("bypass-cache", false, "ignore the SQLite sync cache and fetch/compare everything directly")
 	clearIgnoresColdStart := fs.Bool("clear-ignores-cold-start", false, "clear the ignore-cache cold-start marker so held-back earlier due dates are written again")
 	envFile := fs.String("env-file", "", "load configuration from a dotenv-style file before reading the process environment")
@@ -167,8 +172,10 @@ func Load(args []string) (Config, error) {
 	}
 
 	cfg := Config{
-		DryRun:   *dryRun,
-		PlanJSON: strings.TrimSpace(*planJSON),
+		DryRun:             *dryRun,
+		PlanJSON:           strings.TrimSpace(*planJSON),
+		ReviewedPlanJSON:   strings.TrimSpace(*reviewedPlanJSON),
+		ReviewedPlanSHA256: strings.ToLower(strings.TrimSpace(*reviewedPlanSHA256)),
 		Log: LogConfig{
 			ErrorFile: getEnv("ERROR_LOG_FILE", defaultErrorLogFile),
 		},
@@ -239,6 +246,21 @@ func (c Config) Validate() error {
 		errs = append(errs, errors.New("--plan-json requires a private file path, not stdout"))
 	}
 
+	if (c.ReviewedPlanJSON == "") != (c.ReviewedPlanSHA256 == "") {
+		errs = append(errs, errors.New("--reviewed-plan-json and --reviewed-plan-sha256 must be supplied together"))
+	}
+	if c.ReviewedPlanJSON != "" {
+		if !IsLinearTeamUUID(c.Linear.TeamID) {
+			errs = append(errs, errors.New("reviewed reconciliation guard requires LINEAR_TEAM_ID to be an immutable team UUID, not a team key; regenerate the reviewed plan using that UUID"))
+		}
+		if c.DryRun || c.PlanJSON != "" {
+			errs = append(errs, errors.New("reviewed reconciliation guard requires live mode without --plan-json"))
+		}
+		if c.ReviewedPlanJSON == "-" {
+			errs = append(errs, errors.New("--reviewed-plan-json requires a private file path"))
+		}
+	}
+
 	if c.Snyk.ClientID == "" {
 		errs = append(errs, errors.New("SNYK_CLIENT_ID is required"))
 	}
@@ -295,6 +317,27 @@ func (c Config) Validate() error {
 	}
 
 	return nil
+}
+
+// IsLinearTeamUUID identifies the direct immutable-ID form accepted by the
+// Linear client. A team key can resolve to another team after credentials or
+// workspace configuration change, so it cannot identify a guarded destination.
+func IsLinearTeamUUID(value string) bool {
+	if len(value) != 36 {
+		return false
+	}
+	for i, r := range value {
+		if i == 8 || i == 13 || i == 18 || i == 23 {
+			if r != '-' {
+				return false
+			}
+			continue
+		}
+		if !(r >= '0' && r <= '9' || r >= 'a' && r <= 'f' || r >= 'A' && r <= 'F') {
+			return false
+		}
+	}
+	return true
 }
 
 func getEnv(key, fallback string) string {

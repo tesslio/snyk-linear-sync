@@ -145,6 +145,62 @@ go run ./cmd/snyk-linear-sync --env-file .env --clear-ignores-cold-start
 
 `--env-file` uses `github.com/joho/godotenv`, so the file can be a normal dotenv file and does not need to be sourced by your shell.
 
+### Reviewed reconciliation guard (preflight only)
+
+An opt-in live run can require the exact input and decision plan accepted by an
+operator. Supply the private artifact and its independently reviewed file-byte
+SHA-256 together:
+
+```bash
+go run ./cmd/snyk-linear-sync --env-file .env --reviewed-plan-json private-plan.json --reviewed-plan-sha256 <reviewed-file-sha256>
+```
+
+Use the same externally pinned executable/build, configuration, and untouched
+candidate cache for preview and guarded execution. The accepted digest must come
+from the actual review, not be calculated automatically from a replacement plan.
+Guarded execution requires `LINEAR_TEAM_ID` to be the immutable team UUID, not
+a symbolic team key. Generate the reviewed preview with that same UUID. Team
+keys can resolve to a different team after credentials or workspace changes;
+changing a key-based preview to a UUID at execution changes the settings digest
+and requires regenerating and reviewing the preview. Credentials are never hashed.
+The process reads accepted bytes once, rejects malformed/incomplete plans or
+incomplete reopen history, and recomputes the entire reconciliation from fresh
+snapshots. All input hashes, records, totals, guard and history status must match
+before any Linear mutation method is called. Jobs are buffered until this check
+passes and that same buffer is executed serially. A partial or uncertain mutation
+response stops subsequent jobs without an automatic retry in the service,
+GraphQL client or HTTP transport. Missing mutation acknowledgments or generated
+IDs, and failed post-create subscription cleanup, also stop guarded dispatch.
+HTTP redirects are not followed during guarded calls, including 307/308 POST
+redirects which would otherwise replay the mutation body.
+Read retries never merge data from failed attempts into a later response.
+The Linear snapshot reader rejects missing connection/page data, null or
+unidentified issue rows, missing or repeated continuation cursors, and snapshots
+exceeding 10,000 pages rather than treating partial data as an empty import.
+Review actual remote state before attempting another run.
+Stopped-run errors retain the client cause, operation, batch size and available
+failed-item indexes so operators can investigate without automatically retrying.
+
+**This is a reconciliation preflight, not exact payload approval or an atomic
+transaction.** Version 1 does not commit final title/description/comment contents,
+resolved workflow/label IDs and groups, final replacement label sets, subscription
+cleanup, or mutation order. The Linear client resolves metadata and rereads labels
+later; its create path may perform unsubscribe cleanup. Source and Linear state
+can change during and after snapshot loading. No compare-and-swap or rollback is
+provided, so earlier operations can succeed before a later failure. Exact ordered
+snapshot hashes deliberately reject even a benign row reorder or timestamp change.
+Raw history events and the workflow inventory are not hashed; history commits
+to a successful complete read and the selected restore-state decision only.
+A passing guard is not proof that writes succeeded or that remote state remained
+unchanged. It is insufficient on its own to authorize a production cutover whose
+contract requires frozen final payloads or no post-check drift.
+
+Local ignore-cache and trust metadata may change even when the guard rejects a
+run. Keep the source candidate cache immutable and use a disposable copy. The
+ordinary unguarded mode retains its existing behavior; these options do not make
+all live runs guarded. Successful guarded live runs do not export a dry-run plan
+as an execution receipt.
+
 ## Validation
 
 Run these before every commit, in order. Each step catches a different class
@@ -538,6 +594,7 @@ Optional:
 - `--env-file`
 - `--dry-run`
 - `--plan-json <new-private-file>` (requires `--dry-run`)
+- `--reviewed-plan-json <private-plan>` with `--reviewed-plan-sha256 <reviewed-digest>` (live reconciliation preflight only)
 - `--bypass-cache`
 - `--clear-ignores-cold-start`
 - `SNYK_REGION`

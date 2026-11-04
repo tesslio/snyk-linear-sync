@@ -319,3 +319,36 @@ func TestLoadPlanJSONRequiresDryRunAndPrivatePath(t *testing.T) {
 		t.Fatalf("plan config %+v", cfg)
 	}
 }
+
+func TestReviewedPlanFlagsRequireLivePairedInput(t *testing.T) {
+	for _, key := range []string{"SNYK_CLIENT_ID", "SNYK_CLIENT_SECRET", "SNYK_ORG_ID", "LINEAR_API_KEY", "LINEAR_TEAM_ID"} {
+		t.Setenv(key, "example-value")
+	}
+	t.Setenv("LINEAR_TEAM_ID", "11111111-1111-4111-8111-111111111111")
+	for _, args := range [][]string{{"--reviewed-plan-json", "private.json"}, {"--reviewed-plan-sha256", "abc"}, {"--dry-run", "--reviewed-plan-json", "private.json", "--reviewed-plan-sha256", "abc"}, {"--reviewed-plan-json", "-", "--reviewed-plan-sha256", "abc"}} {
+		if _, err := Load(args); err == nil {
+			t.Fatalf("accepted invalid reviewed flags %v", args)
+		}
+	}
+	cfg, err := Load([]string{"--reviewed-plan-json", "private.json", "--reviewed-plan-sha256", "ABC"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ReviewedPlanJSON != "private.json" || cfg.ReviewedPlanSHA256 != "abc" {
+		t.Fatal("reviewed flags not retained")
+	}
+}
+
+func TestReviewedPlanRejectsMutableTeamKeys(t *testing.T) {
+	for _, key := range []string{"SNYK_CLIENT_ID", "SNYK_CLIENT_SECRET", "SNYK_ORG_ID", "LINEAR_API_KEY"} {
+		t.Setenv(key, "example-value")
+	}
+	for _, team := range []string{"TEAM", "team-1", "", "11111111-1111-4111-8111-11111111111z", "11111111_1111-4111-8111-111111111111"} {
+		t.Run(team, func(t *testing.T) {
+			t.Setenv("LINEAR_TEAM_ID", team)
+			if _, err := Load([]string{"--reviewed-plan-json", "private.json", "--reviewed-plan-sha256", "abc"}); err == nil {
+				t.Fatal("mutable or invalid reviewed destination was accepted")
+			}
+		})
+	}
+}

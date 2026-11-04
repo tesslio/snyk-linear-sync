@@ -406,6 +406,54 @@ copy and retain the untouched candidate separately when collecting previews. The
 artifact itself remains private operational data (ticket IDs, state/label names
 and timestamps), even though sensitive prose and raw source identities are omitted.
 
+## Reviewed Reconciliation Preflight
+
+The optional paired `--reviewed-plan-json` and `--reviewed-plan-sha256` flags
+require live mode. The reader pins exact accepted artifact bytes, strictly validates
+version, completeness, input/record digests, coverage, operation totals and history
+status, and loads the file only once. A guarded run buffers the entire fresh
+reconciliation after overrides and history reads, validates the finished plan
+against all accepted fields, and only then invokes Linear mutation methods for
+that same buffer. A mismatch, cancellation before dispatch or incomplete required
+history read results in zero Linear mutation attempts. Guarded jobs run serially,
+stop on partial/uncertain failure, and disable replay in the service, GraphQL
+client and HTTP transport. Missing mutation acknowledgments or generated IDs
+stop guarded dispatch, as does failed post-create subscription cleanup. The
+ordinary unguarded retry and best-effort cleanup behavior remains unchanged.
+Dispatch errors preserve their client cause and operation/batch context,
+including returned failed-item indexes, without retrying or continuing writes.
+Guarded execution requires an immutable configured Linear team UUID, rather than
+a workspace-relative team key. Its exact value is already included in the
+settings digest, and the Linear client uses that same UUID directly as the
+mutation destination. A preview generated with a team key must be regenerated
+and reviewed with the UUID. No credential hash is used as destination identity.
+Guarded HTTP calls do not follow redirects, including mutation-body-preserving
+307/308 redirects. Ordinary calls retain the default ten-redirect limit.
+
+This is input/decision equivalence only. The executable/build must be externally
+pinned: version 1 does not bind generator code or final mutation payloads. Its
+snapshot hashes do not include raw history events or the workflow inventory;
+history is bound through successful complete reads and the selected restore-state
+decision. Workflow
+and label resolution, live-label rereads, generated comments, and create cleanup
+remain in the ordinary mutation client. Remote systems expose no transaction or
+compare-and-swap through this path. State can change after the check, and a late
+failure can leave earlier writes committed. This does not satisfy an exact-payload
+or all-or-nothing apply contract; those require a separately versioned prepared
+operation format and prepare/execute boundary, and still cannot eliminate remote
+races without server support. Local ignore/cache metadata is not rolled back.
+
+History and workflow inventory reads fail when responses omit required
+containers, nodes, fields or page data, or when continuation cursors are absent,
+empty, repeated or exceed the page limit. Partial workflow inventories are not
+installed in the client cache.
+Each retried read decodes into a fresh response and publishes it only on success,
+so data from a failed earlier attempt cannot supply fields omitted by the retry.
+The Linear issue snapshot also requires a complete issue connection/page marker
+and identified non-null rows. Missing, empty or repeated continuation cursors
+and snapshots exceeding 10,000 pages fail instead of returning partial data.
+A complete history containing no prior open state remains a valid fallback case.
+
 ## Safety Assumptions
 
 - The metadata block must remain intact.

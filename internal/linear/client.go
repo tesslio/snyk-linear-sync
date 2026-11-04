@@ -2,11 +2,13 @@ package linear
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"iter"
 	"log/slog"
 	"net/http"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -80,6 +82,7 @@ type linearIssueNode struct {
 func New(cfg config.LinearConfig, maxConcurrency int, logger *slog.Logger) *Client {
 	base := httpx.NewAdaptiveTransport("linear", maxConcurrency, logger, nil)
 	httpClient := &http.Client{
+		CheckRedirect: linearRedirect,
 		Transport: &httpx.HeaderTransport{
 			Base:  base,
 			Key:   "Authorization",
@@ -96,6 +99,18 @@ func New(cfg config.LinearConfig, maxConcurrency int, logger *slog.Logger) *Clie
 		managedLabelIDs:      map[string]string{},
 		managedLabelGroupIDs: map[string]string{},
 	}
+}
+
+func linearRedirect(req *http.Request, via []*http.Request) error {
+	if httpx.RetriesDisabled(req.Context()) {
+		// In particular, 307/308 redirects replay a mutation's POST body.
+		return http.ErrUseLastResponse
+	}
+	// Installing CheckRedirect replaces net/http's default redirect policy.
+	if len(via) >= 10 {
+		return errors.New("stopped after 10 redirects")
+	}
+	return nil
 }
 
 func (c *Client) LoadSnapshot(ctx context.Context) ([]model.ExistingIssue, error) {
@@ -350,12 +365,20 @@ func (c *Client) CreateIssues(ctx context.Context, desired []model.DesiredIssue)
 	var failed []int
 	for i := range desired {
 		alias := fmt.Sprintf("issueCreate%d", i)
-		if result, ok := resp[alias]; !ok || !result.Success {
+		if result, ok := resp[alias]; !ok || !result.Success || httpx.RetriesDisabled(ctx) && strings.TrimSpace(result.Issue.ID) == "" {
 			failed = append(failed, i)
 		}
 	}
+	if httpx.RetriesDisabled(ctx) && len(failed) != 0 {
+		// Even cleanup is a later mutation. Stop after an uncertain or partial
+		// create response rather than extending a guarded operation's effects.
+		return failed, nil
+	}
 
 	if err := c.issueUnsubscribeCreatedIssues(ctx, resp); err != nil {
+		if httpx.RetriesDisabled(ctx) {
+			return nil, fmt.Errorf("issues created but subscription cleanup failed or has uncertain outcome: %w", err)
+		}
 		// The issues above were already created successfully; unsubscribing
 		// the actor is best-effort cleanup (it only stops the sync's own
 		// actor from being subscribed to notifications on tickets it
@@ -450,8 +473,9 @@ func (c *Client) UpdateIssues(ctx context.Context, updates []model.IssueUpdate) 
 		return fmt.Errorf("update Linear issues: %w", err)
 	}
 
-	for alias, result := range resp {
-		if !result.Success {
+	for i := range updates {
+		alias := fmt.Sprintf("issueUpdate%d", i)
+		if result, ok := resp[alias]; !ok || !result.Success {
 			return fmt.Errorf("update Linear issues failed without GraphQL error for %s", alias)
 		}
 	}
@@ -517,7 +541,7 @@ func (c *Client) PostComments(ctx context.Context, updates []model.IssueUpdate) 
 	var failed []int
 	for j, job := range jobs {
 		alias := fmt.Sprintf("commentCreate%d", j)
-		if result, ok := resp[alias]; !ok || !result.Success {
+		if result, ok := resp[alias]; !ok || !result.Success || httpx.RetriesDisabled(ctx) && strings.TrimSpace(result.Comment.ID) == "" {
 			failed = append(failed, job.updateIndex)
 		}
 	}
@@ -530,8 +554,9 @@ func (c *Client) loadStates(ctx context.Context) error {
 	states := map[string]string{}
 	stateTypes := map[string]string{}
 	statesByID := map[string]workflowState{}
+	seenCursors := map[string]bool{}
 
-	for {
+	for range maxStatePages {
 		op := gqlclient.NewOperation(`
 query teamStates($id: String!, $after: String) {
   team(id: $id) {
@@ -552,15 +577,15 @@ query teamStates($id: String!, $after: String) {
 		op.Var("after", after)
 
 		var resp struct {
-			Team struct {
-				States struct {
-					Nodes []struct {
+			Team *struct {
+				States *struct {
+					Nodes []*struct {
 						ID   string `json:"id"`
 						Name string `json:"name"`
 						Type string `json:"type"`
 					} `json:"nodes"`
-					PageInfo struct {
-						HasNextPage bool    `json:"hasNextPage"`
+					PageInfo *struct {
+						HasNextPage *bool   `json:"hasNextPage"`
 						EndCursor   *string `json:"endCursor"`
 					} `json:"pageInfo"`
 				} `json:"states"`
@@ -569,8 +594,14 @@ query teamStates($id: String!, $after: String) {
 		if err := c.execute(ctx, op, &resp); err != nil {
 			return fmt.Errorf("fetch Linear states: %w", err)
 		}
+		if resp.Team == nil || resp.Team.States == nil || resp.Team.States.Nodes == nil || resp.Team.States.PageInfo == nil || resp.Team.States.PageInfo.HasNextPage == nil {
+			return fmt.Errorf("Linear states response is missing required data")
+		}
 
 		for _, state := range resp.Team.States.Nodes {
+			if state == nil || strings.TrimSpace(state.ID) == "" || strings.TrimSpace(state.Name) == "" || strings.TrimSpace(state.Type) == "" {
+				return fmt.Errorf("Linear states response has an incomplete state")
+			}
 			states[strings.ToLower(state.Name)] = state.ID
 			statesByID[state.ID] = workflowState{name: state.Name, stateType: state.Type}
 			if _, exists := stateTypes[state.Type]; !exists {
@@ -578,19 +609,25 @@ query teamStates($id: String!, $after: String) {
 			}
 		}
 
-		if !resp.Team.States.PageInfo.HasNextPage || resp.Team.States.PageInfo.EndCursor == nil {
-			break
+		page := resp.Team.States.PageInfo
+		if !*page.HasNextPage {
+			c.mu.Lock()
+			c.statesByName = states
+			c.statesByType = stateTypes
+			c.statesByID = statesByID
+			c.mu.Unlock()
+			return nil
 		}
-		after = resp.Team.States.PageInfo.EndCursor
+		if page.EndCursor == nil || strings.TrimSpace(*page.EndCursor) == "" || seenCursors[*page.EndCursor] {
+			return fmt.Errorf("Linear states pagination is incomplete or repeated")
+		}
+		seenCursors[*page.EndCursor] = true
+		after = page.EndCursor
 	}
-
-	c.mu.Lock()
-	c.statesByName = states
-	c.statesByType = stateTypes
-	c.statesByID = statesByID
-	c.mu.Unlock()
-	return nil
+	return fmt.Errorf("Linear states inventory is longer than %d pages", maxStatePages)
 }
+
+const maxStatePages = 20
 
 // workflowState is one of the team's workflow states, as the client caches
 // it for reading state IDs out of issue history.
@@ -657,6 +694,7 @@ func (c *Client) fetchStateTransitions(ctx context.Context, issueID string) ([]s
 	var (
 		after       *string
 		transitions []stateTransition
+		seenCursors = map[string]bool{}
 	)
 	for range maxHistoryPages {
 		op := gqlclient.NewOperation(`
@@ -679,15 +717,15 @@ query issueStateHistory($id: String!, $after: String) {
 		op.Var("after", after)
 
 		var resp struct {
-			Issue struct {
-				History struct {
-					Nodes []struct {
-						CreatedAt   string  `json:"createdAt"`
-						FromStateID *string `json:"fromStateId"`
-						ToStateID   *string `json:"toStateId"`
+			Issue *struct {
+				History *struct {
+					Nodes []*struct {
+						CreatedAt   *string         `json:"createdAt"`
+						FromStateID json.RawMessage `json:"fromStateId"`
+						ToStateID   json.RawMessage `json:"toStateId"`
 					} `json:"nodes"`
-					PageInfo struct {
-						HasNextPage bool    `json:"hasNextPage"`
+					PageInfo *struct {
+						HasNextPage *bool   `json:"hasNextPage"`
 						EndCursor   *string `json:"endCursor"`
 					} `json:"pageInfo"`
 				} `json:"history"`
@@ -697,30 +735,57 @@ query issueStateHistory($id: String!, $after: String) {
 			return nil, fmt.Errorf("fetch Linear issue history: %w", err)
 		}
 
+		if resp.Issue == nil || resp.Issue.History == nil || resp.Issue.History.PageInfo == nil || resp.Issue.History.PageInfo.HasNextPage == nil || resp.Issue.History.Nodes == nil {
+			return nil, fmt.Errorf("Linear issue history response is missing required data")
+		}
 		for _, node := range resp.Issue.History.Nodes {
-			toStateID := deref(node.ToStateID)
+			if node == nil || node.CreatedAt == nil {
+				return nil, fmt.Errorf("Linear issue history has an incomplete node")
+			}
+			at, err := time.Parse(time.RFC3339, *node.CreatedAt)
+			if err != nil {
+				return nil, fmt.Errorf("Linear issue history has an invalid time")
+			}
+			fromStateID, err := historyStateID(node.FromStateID)
+			if err != nil {
+				return nil, err
+			}
+			toStateID, err := historyStateID(node.ToStateID)
+			if err != nil {
+				return nil, err
+			}
 			if toStateID == "" {
 				// Not a state change.
 				continue
 			}
-			at, err := time.Parse(time.RFC3339, node.CreatedAt)
-			if err != nil {
-				return nil, fmt.Errorf("parse Linear issue history time %q: %w", node.CreatedAt, err)
-			}
 			transitions = append(transitions, stateTransition{
 				at:          at,
-				fromStateID: deref(node.FromStateID),
+				fromStateID: fromStateID,
 				toStateID:   toStateID,
 			})
 		}
 
 		page := resp.Issue.History.PageInfo
-		if !page.HasNextPage || page.EndCursor == nil {
+		if !*page.HasNextPage {
 			return transitions, nil
 		}
+		if page.EndCursor == nil || strings.TrimSpace(*page.EndCursor) == "" || seenCursors[*page.EndCursor] {
+			return nil, fmt.Errorf("Linear issue history pagination is incomplete or repeated")
+		}
+		seenCursors[*page.EndCursor] = true
 		after = page.EndCursor
 	}
 	return nil, fmt.Errorf("issue history is longer than %d pages", maxHistoryPages)
+}
+
+// Null state IDs identify non-state events; an omitted selected field instead
+// means the history response cannot be treated as complete.
+func historyStateID(raw json.RawMessage) (string, error) {
+	var value *string
+	if len(raw) == 0 || json.Unmarshal(raw, &value) != nil || value != nil && strings.TrimSpace(*value) == "" {
+		return "", fmt.Errorf("Linear issue history has an incomplete state field")
+	}
+	return deref(value), nil
 }
 
 // lastOpenState returns the latest open workflow state the transitions show
@@ -839,8 +904,9 @@ func (c *Client) loadIssues(ctx context.Context) ([]model.ExistingIssue, error) 
 
 	var after *string
 	var issues []model.ExistingIssue
+	seenCursors := map[string]bool{}
 
-	for {
+	for range maxSnapshotPages {
 		op := gqlclient.NewOperation(`
 query existingIssues($filter: IssueFilter!, $after: String) {
   issues(first: 100, after: $after, filter: $filter, includeArchived: true) {
@@ -880,10 +946,10 @@ query existingIssues($filter: IssueFilter!, $after: String) {
 		op.Var("after", after)
 
 		var resp struct {
-			Issues struct {
-				Nodes    []linearIssueNode `json:"nodes"`
-				PageInfo struct {
-					HasNextPage bool    `json:"hasNextPage"`
+			Issues *struct {
+				Nodes    []*linearIssueNode `json:"nodes"`
+				PageInfo *struct {
+					HasNextPage *bool   `json:"hasNextPage"`
 					EndCursor   *string `json:"endCursor"`
 				} `json:"pageInfo"`
 			} `json:"issues"`
@@ -891,19 +957,32 @@ query existingIssues($filter: IssueFilter!, $after: String) {
 		if err := c.execute(ctx, op, &resp); err != nil {
 			return nil, fmt.Errorf("fetch Linear issues: %w", err)
 		}
+		if resp.Issues == nil || resp.Issues.Nodes == nil || resp.Issues.PageInfo == nil || resp.Issues.PageInfo.HasNextPage == nil {
+			return nil, fmt.Errorf("Linear issue snapshot response is missing required data")
+		}
 
 		for _, issue := range resp.Issues.Nodes {
-			issues = append(issues, linearIssueToModel(issue))
+			if issue == nil || strings.TrimSpace(issue.ID) == "" {
+				return nil, fmt.Errorf("Linear issue snapshot contains an incomplete issue")
+			}
+			issues = append(issues, linearIssueToModel(*issue))
 		}
 
-		if !resp.Issues.PageInfo.HasNextPage || resp.Issues.PageInfo.EndCursor == nil {
-			break
+		page := resp.Issues.PageInfo
+		if !*page.HasNextPage {
+			return issues, nil
 		}
-		after = resp.Issues.PageInfo.EndCursor
+		if page.EndCursor == nil || strings.TrimSpace(*page.EndCursor) == "" || seenCursors[*page.EndCursor] {
+			return nil, fmt.Errorf("Linear issue snapshot pagination is incomplete or repeated")
+		}
+		seenCursors[*page.EndCursor] = true
+		after = page.EndCursor
 	}
 
-	return issues, nil
+	return nil, fmt.Errorf("Linear issue snapshot is longer than %d pages", maxSnapshotPages)
 }
+
+const maxSnapshotPages = 10000
 
 func (c *Client) resolveTeam(ctx context.Context) error {
 	c.mu.RLock()
@@ -987,8 +1066,9 @@ func (c *Client) issueUnsubscribeCreatedIssues(ctx context.Context, created map[
 	if err := c.execute(ctx, op, &resp); err != nil {
 		return fmt.Errorf("issue-unsubscribe Linear actor from created issues: %w", err)
 	}
-	for alias, result := range resp {
-		if !result.Success {
+	for i := range issueIDs {
+		alias := fmt.Sprintf("issueUnsubscribe%d", i)
+		if result, ok := resp[alias]; !ok || !result.Success {
 			return fmt.Errorf("issue-unsubscribe Linear actor from created issues failed without GraphQL error for %s", alias)
 		}
 	}
@@ -1611,25 +1691,7 @@ func timelessDatePtr(value string) *linearapi.TimelessDate {
 }
 
 func isLikelyUUID(value string) bool {
-	if len(value) != 36 {
-		return false
-	}
-	dashes := 0
-	for i, r := range value {
-		switch {
-		case r == '-':
-			if i != 8 && i != 13 && i != 18 && i != 23 {
-				return false
-			}
-			dashes++
-		case r >= '0' && r <= '9':
-		case r >= 'a' && r <= 'f':
-		case r >= 'A' && r <= 'F':
-		default:
-			return false
-		}
-	}
-	return dashes == 4
+	return config.IsLinearTeamUUID(value)
 }
 
 func stateType(state model.IssueState) string {
@@ -1829,15 +1891,26 @@ func commentCreateMutation(size int) string {
 
 func (c *Client) execute(ctx context.Context, op *gqlclient.Operation, out any) error {
 	var lastErr error
+	destination := reflect.ValueOf(out)
+	if destination.Kind() != reflect.Pointer || destination.IsNil() {
+		return fmt.Errorf("Linear response destination must be a non-nil pointer")
+	}
 
 	for attempt := range 6 {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if err := c.waitForRateLimitWindow(ctx); err != nil {
 			return err
 		}
 
-		if err := c.gql.Execute(ctx, op, out); err != nil {
+		// A GraphQL error can still contain data. Never merge it into a later
+		// retry's response: omitted fields must remain absent, not look complete
+		// because a failed earlier attempt happened to populate them.
+		response := reflect.New(destination.Type().Elem())
+		if err := c.gql.Execute(ctx, op, response.Interface()); err != nil {
 			lastErr = err
-			if !isLinearRateLimitError(err) {
+			if httpx.RetriesDisabled(ctx) || !isLinearRateLimitError(err) {
 				return err
 			}
 
@@ -1858,6 +1931,7 @@ func (c *Client) execute(ctx context.Context, op *gqlclient.Operation, out any) 
 			continue
 		}
 
+		destination.Elem().Set(response.Elem())
 		return nil
 	}
 
