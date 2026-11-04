@@ -188,13 +188,13 @@ type v1IgnoreEntry struct {
 	DisregardIfFixable bool   `json:"disregardIfFixable"`
 }
 
+// v1IgnoreFields shares the decoded field schema without the custom unmarshaller.
+// Strict validation uses it for either flat or path-wrapped ignore details.
+type v1IgnoreFields v1IgnoreEntry
+
 func (e *v1IgnoreEntry) UnmarshalJSON(data []byte) error {
 	// Try nested format first: {"*": {...}} or {"path": {...}}
-	var nested map[string]struct {
-		Created            string `json:"created"`
-		Expires            string `json:"expires"`
-		DisregardIfFixable bool   `json:"disregardIfFixable"`
-	}
+	var nested map[string]v1IgnoreFields
 	if err := json.Unmarshal(data, &nested); err == nil && len(nested) > 0 {
 		for _, details := range nested {
 			e.Created = details.Created
@@ -205,11 +205,7 @@ func (e *v1IgnoreEntry) UnmarshalJSON(data []byte) error {
 	}
 
 	// Try flat format: {...}
-	var flat struct {
-		Created            string `json:"created"`
-		Expires            string `json:"expires"`
-		DisregardIfFixable bool   `json:"disregardIfFixable"`
-	}
+	var flat v1IgnoreFields
 	if err := json.Unmarshal(data, &flat); err == nil {
 		e.Created = flat.Created
 		e.Expires = flat.Expires
@@ -240,6 +236,7 @@ const unconfirmedIgnoreGrace = 7 * 24 * time.Hour
 var errIgnoresNotFound = errors.New("v1 ignores endpoint returned 404 after all retries")
 
 func (c *Client) LoadSnapshot(ctx context.Context) (model.SnykSnapshot, error) {
+	c.sourceReads = SourceReads{}
 	if c.cache != nil {
 		if _, err := cache.PrepareIgnoreMemory(ctx, c.cache); err != nil {
 			return model.SnykSnapshot{}, fmt.Errorf("prepare ignore memory: %w", err)
@@ -289,13 +286,35 @@ func (c *Client) LoadSnapshot(ctx context.Context) (model.SnykSnapshot, error) {
 	var issues []issueResource
 
 	nextCursor := ""
+	seenCursors := map[string]bool{}
+	seenIssues := map[string]bool{}
 	for {
+		if c.requireFresh {
+			if seenCursors[nextCursor] || c.sourceReads.IssuePages >= freshMaxPages {
+				return model.SnykSnapshot{}, fmt.Errorf("Snyk issue pagination repeated or exhausted")
+			}
+			seenCursors[nextCursor] = true
+		}
 		page, cursor, err := c.listIssuesPage(ctx, nextCursor)
 		if err != nil {
 			return model.SnykSnapshot{}, err
 		}
 
 		for _, issue := range page {
+			if c.requireFresh {
+				if seenIssues[issue.ID] {
+					return model.SnykSnapshot{}, fmt.Errorf("duplicate Snyk issue id")
+				}
+				seenIssues[issue.ID] = true
+				// Excluded scan-item types have no project-scoped metadata to
+				// validate. Do not turn their IDs into bogus v1 project reads.
+				if !isProjectIssue(issue) {
+					continue
+				}
+				if _, ok := projectDetails[issue.Relationships.ScanItem.Data.ID]; !ok {
+					return model.SnykSnapshot{}, fmt.Errorf("Snyk issue references absent project")
+				}
+			}
 			projectID := issue.Relationships.ScanItem.Data.ID
 			if projectID == "" {
 				continue
@@ -410,6 +429,9 @@ func (c *Client) LoadSnapshot(ctx context.Context) (model.SnykSnapshot, error) {
 			if !ok {
 				cluster, err = c.fetchProjectClusterWithRetry(ctx, projectID, clusterLookupAttempts)
 				if err != nil {
+					if c.requireFresh {
+						return model.SnykSnapshot{}, fmt.Errorf("fresh Snyk cluster read: %w", err)
+					}
 					// Cluster is ticket enrichment, not sync-critical: log
 					// and continue rather than failing the whole run. The
 					// findings are marked cluster-unknown, which is not the
@@ -434,6 +456,9 @@ func (c *Client) LoadSnapshot(ctx context.Context) (model.SnykSnapshot, error) {
 		findings = append(findings, finding)
 	}
 
+	if c.requireFresh {
+		c.sourceReads.Complete = true
+	}
 	return model.SnykSnapshot{
 		Findings:              findings,
 		ProjectIDs:            projectIDs,
@@ -910,6 +935,12 @@ func (c *Client) fetchProjectIgnores(ctx context.Context, projectID string) (*pr
 	// mutable Linear state.
 	const maxAttempts = 3
 	apiIgnores, err := c.fetchProjectIgnoresWithRetry(ctx, projectID, maxAttempts)
+	if c.requireFresh && err != nil {
+		return nil, fmt.Errorf("fresh Snyk ignores required: %w", err)
+	}
+	if c.requireFresh {
+		c.sourceReads.IgnoreProjects++
+	}
 	switch {
 	case err == nil:
 		state.api = apiIgnores
@@ -1035,6 +1066,9 @@ func (c *Client) fetchProjectCluster(ctx context.Context, projectID string) (str
 	if err := c.decodeJSON(resp, &detail); err != nil {
 		return "", err
 	}
+	if c.requireFresh {
+		c.sourceReads.ClusterProjects++
+	}
 	return strings.TrimSpace(detail.ImageCluster), nil
 }
 
@@ -1094,8 +1128,11 @@ func (c *Client) fetchProjectIgnoresWithRetry(ctx context.Context, projectID str
 			continue
 		}
 
-		body, _ := io.ReadAll(resp.Body)
+		body, readErr := io.ReadAll(resp.Body)
 		resp.Body.Close()
+		if c.requireFresh && readErr != nil {
+			return nil, fmt.Errorf("read complete Snyk ignores response: %w", readErr)
+		}
 
 		if resp.StatusCode == http.StatusNotFound {
 			// A 404 can be transient (e.g. eventual consistency just after a
@@ -1127,6 +1164,11 @@ func (c *Client) fetchProjectIgnoresWithRetry(ctx context.Context, projectID str
 			continue
 		}
 
+		if c.requireFresh {
+			if err := validateFreshIgnores(body); err != nil {
+				return nil, err
+			}
+		}
 		var attemptIgnores v1ProjectIgnores
 		if err := json.Unmarshal(body, &attemptIgnores); err != nil {
 			lastErr = fmt.Errorf("decode v1 ignores: %w", err)
@@ -1146,6 +1188,13 @@ func (c *Client) fetchProjectIgnoresWithRetry(ctx context.Context, projectID str
 	}
 
 	if lastErr != nil {
+		if c.requireFresh {
+			// A final failure makes the maximum-expiry observation series
+			// incomplete, even if an earlier attempt succeeded. Transient
+			// HTTP failures followed by a validated final success may pass;
+			// malformed successful bodies fail immediately in strict mode.
+			return nil, fmt.Errorf("fresh Snyk ignores failed: %w", lastErr)
+		}
 		if lastErrNotFound {
 			// Every attempt (or at least the last one) 404ed. Keep the
 			// existing non-fatal behavior: don't fail the run. Return
@@ -1433,6 +1482,9 @@ func parseTime(raw string) (time.Time, error) {
 }
 
 func (c *Client) listProjects(ctx context.Context) ([]projectRef, error) {
+	if c.requireFresh {
+		return c.listFreshProjects(ctx)
+	}
 	projects := make([]projectRef, 0, 256)
 	opts := &snyksdk.ListProjectsOptions{}
 
@@ -1509,6 +1561,9 @@ func (c *Client) orgSlug(ctx context.Context) (string, error) {
 		return "", err
 	}
 
+	if c.requireFresh {
+		c.sourceReads.Organization = true
+	}
 	return strings.TrimSpace(payload.Data.Attributes.Slug), nil
 }
 
@@ -1541,6 +1596,11 @@ func (c *Client) listIssuesPage(ctx context.Context, cursor string) ([]issueReso
 		return nil, "", err
 	}
 
+	if c.requireFresh {
+		c.sourceReads.IssuePages++
+		next, err := freshCursor(payload.Links.Next)
+		return payload.Data, next, err
+	}
 	nextCursor, err := extractCursor(payload.Links.Next)
 	if err != nil {
 		return nil, "", err
@@ -2041,4 +2101,164 @@ func projectRepository(name, origin string) string {
 		name = strings.TrimSpace(name[:idx])
 	}
 	return name
+}
+
+// Bound even a server that supplies an endless sequence of distinct cursors.
+const freshMaxPages = 10000
+
+type freshProjectsResponse struct {
+	Data []struct {
+		ID         string `json:"id"`
+		Attributes struct {
+			Name            string `json:"name"`
+			Origin          string `json:"origin"`
+			TargetReference string `json:"target_reference"`
+			TargetFile      string `json:"target_file"`
+			Status          string `json:"status"`
+		} `json:"attributes"`
+	} `json:"data"`
+	Links struct {
+		Next string `json:"next"`
+	} `json:"links"`
+}
+
+func freshCursor(raw string) (string, error) {
+	cursor, err := extractCursor(raw)
+	if err != nil {
+		return "", err
+	}
+	if raw != "" && strings.TrimSpace(cursor) == "" {
+		return "", fmt.Errorf("Snyk continuation missing starting_after")
+	}
+	return cursor, nil
+}
+
+func (c *Client) listFreshProjects(ctx context.Context) ([]projectRef, error) {
+	var projects []projectRef
+	seenCursors, seenIDs := map[string]bool{}, map[string]bool{}
+	cursor := ""
+	for {
+		if seenCursors[cursor] || c.sourceReads.ProjectPages >= freshMaxPages {
+			return nil, fmt.Errorf("Snyk project pagination repeated or exhausted")
+		}
+		seenCursors[cursor] = true
+		endpoint, err := c.restBase.Parse(fmt.Sprintf("orgs/%s/projects", c.orgID))
+		if err != nil {
+			return nil, err
+		}
+		query := endpoint.Query()
+		query.Set("version", issuesAPIVersion)
+		query.Set("limit", "100")
+		if cursor != "" {
+			query.Set("starting_after", cursor)
+		}
+		endpoint.RawQuery = query.Encode()
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Accept", "application/vnd.api+json")
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		var page freshProjectsResponse
+		if err := c.decodeJSON(resp, &page); err != nil {
+			return nil, err
+		}
+		c.sourceReads.ProjectPages++
+		for _, row := range page.Data {
+			if seenIDs[row.ID] {
+				return nil, fmt.Errorf("duplicate Snyk project id")
+			}
+			seenIDs[row.ID] = true
+			a := row.Attributes
+			projects = append(projects, projectRef{ID: row.ID, Name: a.Name, Origin: a.Origin, TargetReference: a.TargetReference, TargetFile: a.TargetFile, Repository: projectRepository(a.Name, a.Origin), Namespace: kubernetesNamespace(a.Name, a.Origin), Active: isActiveProjectStatus(a.Status)})
+		}
+		cursor, err = freshCursor(page.Links.Next)
+		if err != nil {
+			return nil, err
+		}
+		if cursor == "" {
+			return projects, nil
+		}
+	}
+}
+
+func validateFreshIgnores(body []byte) error {
+	if err := validateFreshJSON(body, nil); err != nil {
+		return err
+	}
+	var ignores map[string][]json.RawMessage
+	if err := json.Unmarshal(body, &ignores); err != nil {
+		return err
+	}
+	for key, entries := range ignores {
+		if strings.TrimSpace(key) == "" || entries == nil {
+			return fmt.Errorf("invalid Snyk ignore container")
+		}
+		for _, entry := range entries {
+			details := entry
+			obj, err := requireJSONObject(entry)
+			if err != nil {
+				return err
+			}
+			// Nested path entries must have exactly one path: the legacy decoder
+			// selects one map entry, so accepting more would be nondeterministic.
+			if _, flat := obj["created"]; !flat {
+				if len(obj) != 1 {
+					return fmt.Errorf("ambiguous Snyk ignore paths")
+				}
+				for _, raw := range obj {
+					details = raw
+					obj, err = requireJSONObject(raw)
+					if err != nil {
+						return err
+					}
+				}
+			}
+			if err := validateFreshJSON(details, (*v1IgnoreFields)(nil)); err != nil {
+				return err
+			}
+			var created string
+			if err := json.Unmarshal(obj["created"], &created); err != nil {
+				return fmt.Errorf("Snyk ignore missing created")
+			}
+			if _, err := parseIssueCreatedAt(created); err != nil {
+				return err
+			}
+			if expires, ok := freshIgnoreField(obj, "expires"); ok && string(expires) != "null" {
+				var value string
+				if err := json.Unmarshal(expires, &value); err != nil {
+					return err
+				}
+				if value != "" {
+					if _, err := time.Parse(time.RFC3339, value); err != nil {
+						return err
+					}
+				}
+			}
+			if flag, ok := freshIgnoreField(obj, "disregardIfFixable"); ok {
+				var value bool
+				if string(flag) == "null" {
+					return fmt.Errorf("null Snyk ignore flag")
+				}
+				if err := json.Unmarshal(flag, &value); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// Fresh ignore details have already been checked for aliases. Match optional
+// fields as the custom decoder does, so alternate casing cannot evade validation.
+func freshIgnoreField(obj map[string]json.RawMessage, name string) (json.RawMessage, bool) {
+	for key, value := range obj {
+		if strings.EqualFold(key, name) {
+			return value, true
+		}
+	}
+	return nil, false
 }

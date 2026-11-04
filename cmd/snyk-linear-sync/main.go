@@ -43,6 +43,10 @@ func run(cfg config.Config, logger *slog.Logger) error {
 		return err
 	}
 
+	if cfg.ObservationCheckpoint != "" {
+		return prepareObservationCheckpoint(ctx, cfg, snyk)
+	}
+
 	cacheStore, err := cache.Open(cfg.Cache.DBFile)
 	if err != nil {
 		return err

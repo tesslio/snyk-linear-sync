@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -52,6 +53,11 @@ type Config struct {
 	// ReviewedPlanJSON and ReviewedPlanSHA256 gate live writes on exact input/decision equivalence.
 	ReviewedPlanJSON   string
 	ReviewedPlanSHA256 string
+	// ReplaySafe opts into the v2 deterministic, fresh-source plan contract.
+	ReplaySafe bool
+	// ObservationCheckpoint writes a new private loader-only candidate.
+	ObservationCheckpoint   string
+	ObservationSourceSHA256 string
 
 	Log    LogConfig
 	Cache  CacheConfig
@@ -148,6 +154,9 @@ func Load(args []string) (Config, error) {
 	planJSON := fs.String("plan-json", "", "write a private JSON reconciliation plan to a new file (requires --dry-run)")
 	reviewedPlanJSON := fs.String("reviewed-plan-json", "", "require this complete private dry-run reconciliation plan before live writes")
 	reviewedPlanSHA256 := fs.String("reviewed-plan-sha256", "", "independently reviewed SHA-256 of the exact approved plan file bytes")
+	replaySafe := fs.Bool("replay-safe", false, "use v2 deterministic ordering and mandatory fresh source reads")
+	observationCheckpoint := fs.String("observation-checkpoint", "", "write a new private observation-only cache checkpoint; no Linear calls")
+	observationSourceSHA256 := fs.String("observation-source-sha256", "", "required SHA-256 of the untouched source cache for observation checkpoint")
 	bypassCache := fs.Bool("bypass-cache", false, "ignore the SQLite sync cache and fetch/compare everything directly")
 	clearIgnoresColdStart := fs.Bool("clear-ignores-cold-start", false, "clear the ignore-cache cold-start marker so held-back earlier due dates are written again")
 	envFile := fs.String("env-file", "", "load configuration from a dotenv-style file before reading the process environment")
@@ -172,10 +181,13 @@ func Load(args []string) (Config, error) {
 	}
 
 	cfg := Config{
-		DryRun:             *dryRun,
-		PlanJSON:           strings.TrimSpace(*planJSON),
-		ReviewedPlanJSON:   strings.TrimSpace(*reviewedPlanJSON),
-		ReviewedPlanSHA256: strings.ToLower(strings.TrimSpace(*reviewedPlanSHA256)),
+		DryRun:                  *dryRun,
+		PlanJSON:                strings.TrimSpace(*planJSON),
+		ReviewedPlanJSON:        strings.TrimSpace(*reviewedPlanJSON),
+		ReviewedPlanSHA256:      strings.ToLower(strings.TrimSpace(*reviewedPlanSHA256)),
+		ReplaySafe:              *replaySafe,
+		ObservationCheckpoint:   strings.TrimSpace(*observationCheckpoint),
+		ObservationSourceSHA256: strings.ToLower(strings.TrimSpace(*observationSourceSHA256)),
 		Log: LogConfig{
 			ErrorFile: getEnv("ERROR_LOG_FILE", defaultErrorLogFile),
 		},
@@ -239,6 +251,24 @@ func Load(args []string) (Config, error) {
 
 func (c Config) Validate() error {
 	var errs []error
+	if c.ReplaySafe && c.ObservationCheckpoint == "" && c.PlanJSON == "" && c.ReviewedPlanJSON == "" {
+		errs = append(errs, errors.New("--replay-safe requires plan export, reviewed execution, or observation checkpoint"))
+	}
+	if (c.ObservationCheckpoint == "") != (c.ObservationSourceSHA256 == "") {
+		errs = append(errs, errors.New("--observation-checkpoint and --observation-source-sha256 must be supplied together"))
+	}
+	if c.ObservationCheckpoint != "" {
+		if !IsLinearTeamUUID(c.Linear.TeamID) {
+			errs = append(errs, errors.New("observation checkpoint requires immutable LINEAR_TEAM_ID for its later plan binding"))
+		}
+		if c.DryRun || c.PlanJSON != "" || c.ReviewedPlanJSON != "" || c.Cache.BypassCache || c.Cache.ClearIgnoresColdStart || c.ObservationCheckpoint == "-" {
+			errs = append(errs, errors.New("observation checkpoint cannot reconcile, bypass cache, clear protection, or write stdout"))
+		}
+		decoded, err := hex.DecodeString(c.ObservationSourceSHA256)
+		if err != nil || len(decoded) != 32 {
+			errs = append(errs, errors.New("observation checkpoint requires source SHA-256"))
+		}
+	}
 	if c.PlanJSON != "" && !c.DryRun {
 		errs = append(errs, errors.New("--plan-json requires --dry-run"))
 	}
@@ -270,10 +300,10 @@ func (c Config) Validate() error {
 	if c.Snyk.OrgID == "" {
 		errs = append(errs, errors.New("SNYK_ORG_ID is required"))
 	}
-	if c.Linear.APIKey == "" {
+	if c.Linear.APIKey == "" && c.ObservationCheckpoint == "" {
 		errs = append(errs, errors.New("LINEAR_API_KEY is required"))
 	}
-	if c.Linear.TeamID == "" {
+	if c.Linear.TeamID == "" && c.ObservationCheckpoint == "" {
 		errs = append(errs, errors.New("LINEAR_TEAM_ID is required"))
 	}
 	switch c.Source.Provider {

@@ -454,6 +454,50 @@ and identified non-null rows. Missing, empty or repeated continuation cursors
 and snapshots exceeding 10,000 pages fail instead of returning partial data.
 A complete history containing no prior open state remains a valid fallback case.
 
+
+## Replay-safe Observation Input
+
+The opt-in version-2 plan contract requires validated fresh Snyk reads and
+canonicalizes full snapshots before both matching and hashing. It retains all
+raw field values and duplicate semantic-set entries, rejects ambiguous source
+fingerprints and JSON field aliases, and makes buffered reconciliation order
+deterministic. Case-distinct map identities remain separate; project-only metadata
+reads exclude non-project scan items. Matching
+semantics can differ from version 1, including canonical duplicate selection for
+coarse migration; a new plan and independent review are mandatory. Version 1 is
+not silently normalized or upgraded.
+
+An observation-only checkpoint is a separate preparation boundary, not a normal
+preview database promoted for execution. It starts from checksum-pinned trusted
+source bytes, runs only the Snyk loader with strict source reads, and emits a new
+private candidate plus a complete hash-bound receipt only after SQLite closes.
+Candidate and receipt creation and cleanup are leaf-only operations relative to
+a retained private parent-directory handle. Replacement of the parent or candidate
+refuses publication; cleanup does not follow a replaced pathname. SQLite still
+reopens the absolute candidate pathname, so its directories must remain
+single-writer throughout preparation.
+Protected reconciliation hashes and prior cold-start provenance must remain
+unchanged. Schema is preserved except for the reviewed nullable `unignored_at`
+and `observed_issues` additions to supported legacy ignore tables; the receipt
+binds the final schema and every other schema change is rejected. An empty-start
+pending marker is preserved. The command does not construct a Linear client,
+reconcile, save sync hashes, or authorize writes.
+
+Observation timestamps become durable inputs to subsequent fresh preview and
+reviewed execution, each on independent untouched checkpoint copies. Real-time
+expiry, revocation grace and deferral behavior stays current; new transitions and
+drift still refuse exact replay. Source provenance checks reject unavailable
+required reads even when cache fallback would produce identical findings.
+Received response validation cannot establish an atomic remote snapshot or detect
+truthful-looking server omissions.
+
+Consumers remain responsible for authenticating and accepting receipt/candidate/
+plan bytes, pinning the executable and destination, limiting review age, rejecting
+future timestamps, and holding a single-writer cache-generation lease through
+execution/publication. The receipt records a read interval, not one event time.
+This interface does not remove remote races or freeze mutation-time metadata/API
+payloads. See README for the command contract and remaining integration gates.
+
 ## Safety Assumptions
 
 - The metadata block must remain intact.

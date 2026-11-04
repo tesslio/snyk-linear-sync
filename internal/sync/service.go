@@ -156,7 +156,7 @@ type RunResult struct {
 
 func New(cfg config.Config, logger *slog.Logger, snyk SnykClient, linear LinearClient, cacheStore CacheStore) *Service {
 	return &Service{
-		cfg:    cfg,
+		cfg:    replayConfig(cfg),
 		logger: logger,
 		snyk:   snyk,
 		linear: linear,
@@ -185,6 +185,9 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 		reviewed, err = readReviewedPlan(s.cfg.ReviewedPlanJSON, s.cfg.ReviewedPlanSHA256)
 		if err != nil {
 			return RunResult{}, err
+		}
+		if reviewed.Version != replayPlanVersion(s.cfg) {
+			return RunResult{}, fmt.Errorf("reviewed plan version does not match replay-safe mode; generate and review a new plan")
 		}
 	}
 	runCtx := ctx
@@ -246,6 +249,21 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 		slog.Int("findings", len(findings)),
 		slog.Int("existing_issues", len(existingIssues)),
 	)
+
+	if s.cfg.ReplaySafe {
+		fresh, ok := s.snyk.(interface{ ValidateFreshSnapshot() error })
+		if !ok {
+			return RunResult{}, fmt.Errorf("replay-safe mode requires a fresh validated Snyk snapshot")
+		}
+		if err := fresh.ValidateFreshSnapshot(); err != nil {
+			return RunResult{}, fmt.Errorf("replay-safe Snyk snapshot: %w", err)
+		}
+		snykSnapshot, existingIssues, err = canonicalReplayInputs(snykSnapshot, existingIssues)
+		if err != nil {
+			return RunResult{}, err
+		}
+		findings = snykSnapshot.Findings
+	}
 
 	plan, err := newPlanCollector(s.cfg, snykSnapshot, existingIssues, cacheSnapshot, cacheEnabled)
 	if err != nil {
@@ -329,6 +347,17 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 				}
 			}
 		}
+	}
+
+	if s.cfg.ReplaySafe {
+		// Use the selected canonical copy for coarse migration as well.
+		existingByCoarseFingerprint = map[string]model.ExistingIssue{}
+		for fingerprint, issue := range existingByFingerprint {
+			if model.CoarseFingerprint(fingerprint) == fingerprint && isNonTerminalLinearState(issue, s.cfg.Linear.States) {
+				existingByCoarseFingerprint[fingerprint] = issue
+			}
+		}
+		slices.SortFunc(duplicatesToCancel, func(a, b model.ExistingIssue) int { return strings.Compare(a.ID, b.ID) })
 	}
 
 	// rebindCandidates indexes, by project-independent identity, the tickets
@@ -646,6 +675,19 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 		}
 	}
 
+	if s.cfg.ReplaySafe {
+		baseEnqueue := enqueue
+		enqueue = func(j job) {
+			for _, update := range j.updateBatch {
+				if update.Diff != nil {
+					slices.Sort(update.Diff.LabelsAdded)
+					slices.Sort(update.Diff.LabelsRemoved)
+				}
+			}
+			baseEnqueue(j)
+		}
+	}
+
 	produceJobs := func() error {
 		defer close(jobs)
 
@@ -659,7 +701,8 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 		}
 		createBatch := make([]model.DesiredIssue, 0, createBatchSize)
 		updateBatch := make([]model.IssueUpdate, 0, createBatchSize)
-		for fingerprint, desired := range desiredByFingerprint {
+		for _, fingerprint := range replayMapKeys(desiredByFingerprint, s.cfg.ReplaySafe) {
+			desired := desiredByFingerprint[fingerprint]
 			seen[fingerprint] = struct{}{}
 			// Also mark the coarse fingerprint as seen so the resolve loop
 			// doesn't try to close a terminal ticket whose coarse fingerprint
@@ -723,7 +766,8 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 		}
 
 		resolveBatch := make([]model.IssueUpdate, 0, createBatchSize)
-		for fingerprint, existing := range existingByFingerprint {
+		for _, fingerprint := range replayMapKeys(existingByFingerprint, s.cfg.ReplaySafe) {
+			existing := existingByFingerprint[fingerprint]
 			if _, ok := seen[fingerprint]; ok {
 				continue
 			}
@@ -949,7 +993,7 @@ type job struct {
 // executeReviewedJob sends only the previously buffered intent. Unlike the
 // ordinary operational path, it stops after a partial or uncertain response and
 // never automatically repeats a possibly successful mutation. Client-internal
-// metadata resolution and follow-on writes are NOT frozen by this v1 guard.
+// metadata resolution and follow-on writes are NOT frozen by either plan version.
 func (s *Service) executeReviewedJob(ctx context.Context, j job) error {
 	ctx = httpx.WithoutRetries(ctx)
 	if err := ctx.Err(); err != nil {
