@@ -8,6 +8,8 @@ import (
 func TestBoundOptionsFailClosed(t *testing.T) {
 	n := int64(5)
 	valid := Config{PlanAndExecuteBound: true, ReplaySafe: true, PlanJSON: "private/plan.json", MaxCreates: &n, MaxUpdates: &n, MaxResolves: &n, MaxCancelDuplicates: &n, Linear: LinearConfig{TeamID: "11111111-1111-4111-8111-111111111111"}}
+	max := int64(999999)
+	valid.MaxCreates = &max
 	if err := valid.ValidateBound(); err != nil {
 		t.Fatal(err)
 	}
@@ -27,7 +29,7 @@ func TestBoundOptionsFailClosed(t *testing.T) {
 				v := int64(-1)
 				c.MaxCreates = &v
 			case "huge":
-				v := int64(1000001)
+				v := int64(1000000)
 				c.MaxCreates = &v
 			case "dry-run":
 				c.DryRun = true

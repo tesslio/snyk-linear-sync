@@ -67,7 +67,19 @@ func readBound[T any](t *testing.T, cfg config.Config, name string) T {
 
 type boundLinear struct {
 	planLinear
-	before func()
+	before  func()
+	refresh func() ([]model.ExistingIssue, error)
+}
+
+func (l *boundLinear) LoadSnapshot(ctx context.Context) ([]model.ExistingIssue, error) {
+	if l.calls == 0 {
+		return l.planLinear.LoadSnapshot(ctx)
+	}
+	l.calls++
+	if l.refresh != nil {
+		return l.refresh()
+	}
+	return l.snapshot, l.err
 }
 
 func (l *boundLinear) CreateIssues(ctx context.Context, d []model.DesiredIssue) ([]int, error) {
@@ -79,7 +91,7 @@ func (l *boundLinear) UpdateIssues(ctx context.Context, u []model.IssueUpdate) e
 	return l.fakeLinear.UpdateIssues(ctx, u)
 }
 
-func TestBoundExecutesOneSnapshotWithDurableExactBinding(t *testing.T) {
+func TestBoundExecutesOnePlanningSnapshotThenRefreshesAfterAllWrites(t *testing.T) {
 	cfg := boundCfg(t)
 	changed := planFixtureFinding("issue-change")
 	ticket := storedIssue("ticket-change", "SNYK-100", "Todo", desiredIssue(cfg, changed))
@@ -93,6 +105,9 @@ func TestBoundExecutesOneSnapshotWithDurableExactBinding(t *testing.T) {
 	store := &fakeCache{ignoreRows: true}
 	linear := &boundLinear{planLinear: planLinear{fakeLinear: fakeLinear{snapshot: []model.ExistingIssue{ticket, duplicate, absent}}}}
 	linear.before = func() {
+		if source.calls != 1 || linear.calls != 1 {
+			t.Fatal("reloaded planning snapshots before dispatch completed")
+		}
 		attempt := readBound[BoundAttempt](t, cfg, "attempt.json")
 		data, err := os.ReadFile(cfg.PlanJSON)
 		if err != nil || attempt.PlanSHA256 != planTextDigest(string(data)) || attempt.Status != "attempt_started" {
@@ -105,6 +120,15 @@ func TestBoundExecutesOneSnapshotWithDurableExactBinding(t *testing.T) {
 		source.snapshot = planSnapshot(planFixtureFinding("unrelated-later-source"))
 		linear.snapshot = nil
 	}
+	refreshedTicket := ticket
+	refreshedTicket.Title = "new remote value after dispatch"
+	refreshedNew := storedIssue("ticket-new", "SNYK-104", "Todo", desiredIssue(cfg, snapshot.Findings[1]))
+	linear.refresh = func() ([]model.ExistingIssue, error) {
+		if len(linear.created) != 1 || len(linear.updated) != 3 {
+			t.Fatal("post-write refresh preceded final mutation")
+		}
+		return []model.ExistingIssue{refreshedTicket, duplicate, absent, refreshedNew}, nil
+	}
 	result, err := New(cfg, discardLogger(), source, linear, store).Run(t.Context())
 	if err != nil {
 		t.Fatal(err)
@@ -112,7 +136,7 @@ func TestBoundExecutesOneSnapshotWithDurableExactBinding(t *testing.T) {
 	if result.Plan != nil || result.PlannedCreates != 1 || result.PlannedUpdates != 1 || result.PlannedResolves != 1 || result.CancelledDuplicates != 1 {
 		t.Fatalf("wrong result: %+v", result)
 	}
-	if source.calls != 1 || linear.calls != 1 || len(linear.created) != 1 || len(linear.updated) != 3 {
+	if source.calls != 1 || linear.calls != 2 || len(linear.created) != 1 || len(linear.updated) != 3 {
 		t.Fatal("reloaded, skipped or repeated jobs")
 	}
 	if !reflect.DeepEqual(linear.created[0], desiredIssue(cfg, snapshot.Findings[1])) {
@@ -124,12 +148,12 @@ func TestBoundExecutesOneSnapshotWithDurableExactBinding(t *testing.T) {
 	}
 	attempt := readBound[BoundAttempt](t, cfg, "attempt.json")
 	final := readBound[BoundResult](t, cfg, "result.json")
-	if final.Status != "success" || final.PlanSHA256 != attempt.PlanSHA256 || final.JobsSHA256 != attempt.JobsSHA256 || final.BatchesAcknowledged != 4 || final.BatchesAttempted != 4 || final.CacheStatus != "saved" || len(store.saved.LinearHashes) != 0 || len(store.saved.SnykHashes) != 2 {
+	if final.Status != "success" || final.PlanSHA256 != attempt.PlanSHA256 || final.JobsSHA256 != attempt.JobsSHA256 || final.BatchesAcknowledged != 4 || final.BatchesAttempted != 4 || final.CacheStatus != "saved" || len(store.saved.LinearHashes) != 3 || store.saved.LinearHashes[changed.Fingerprint] != existingIssueHash(refreshedTicket) || len(store.saved.SnykHashes) != 2 {
 		t.Fatalf("wrong proof: %+v", final)
 	}
 	// Receipt directory reservation rejects a second run before any reads/writes.
 	_, err = New(cfg, discardLogger(), source, linear, store).Run(t.Context())
-	if err == nil || source.calls != 1 || linear.calls != 1 {
+	if err == nil || source.calls != 1 || linear.calls != 2 {
 		t.Fatal("reused attempt directory")
 	}
 }
@@ -152,7 +176,7 @@ func TestBoundLimitsRejectAllMutationKindsBeforeWrites(t *testing.T) {
 				cfg.MaxUpdates = &zero
 			case "resolve":
 				cfg.MaxResolves = &zero
-				snapshot = planSnapshot()
+				snapshot = planSnapshot(planFixtureFinding("different-issue"))
 			case "cancel-duplicate":
 				cfg.MaxCancelDuplicates = &zero
 				duplicate := ticket
@@ -228,8 +252,11 @@ func (s *boundFailCache) Save(context.Context, cache.Snapshot) error {
 }
 func TestBoundCacheFailureCannotClaimSuccess(t *testing.T) {
 	cfg := boundCfg(t)
-	linear := &reviewedContextLinear{t: t}
-	_, err := New(cfg, discardLogger(), &planSnyk{snapshot: planSnapshot(planFixtureFinding("issue-a"))}, linear, &boundFailCache{fakeCache{ignoreRows: true}}).Run(t.Context())
+	f := planFixtureFinding("issue-a")
+	linear := &boundLinear{before: func() {}, refresh: func() ([]model.ExistingIssue, error) {
+		return []model.ExistingIssue{storedIssue("ticket-a", "SNYK-100", "Todo", desiredIssue(cfg, f))}, nil
+	}}
+	_, err := New(cfg, discardLogger(), &planSnyk{snapshot: planSnapshot(f)}, linear, &boundFailCache{fakeCache{ignoreRows: true}}).Run(t.Context())
 	if err == nil || len(linear.created) != 1 {
 		t.Fatal("cache failure hidden")
 	}
@@ -520,5 +547,104 @@ func TestBoundExistingPlanRefusesBeforeSourceAccess(t *testing.T) {
 				t.Fatal("loaded before rejecting existing plan")
 			}
 		})
+	}
+}
+
+func TestBoundRefreshFailureStopsWithoutRetryOrStaleCache(t *testing.T) {
+	for _, kind := range []string{"transport", "empty", "duplicate-id", "missing-id", "no-fingerprint", "late-tamper", "canceled"} {
+		t.Run(kind, func(t *testing.T) {
+			cfg := boundCfg(t)
+			f := planFixtureFinding("issue-a")
+			store := &fakeCache{ignoreRows: true}
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			linear := &boundLinear{before: func() {}}
+			linear.refresh = func() ([]model.ExistingIssue, error) {
+				if len(linear.created) != 1 {
+					t.Fatal("refresh preceded mutation")
+				}
+				ticket := storedIssue("ticket-a", "SNYK-100", "Todo", desiredIssue(cfg, f))
+				switch kind {
+				case "transport":
+					return nil, errors.New("post-write read failed")
+				case "empty":
+					return nil, nil
+				case "duplicate-id":
+					return []model.ExistingIssue{ticket, ticket}, nil
+				case "missing-id":
+					ticket.ID = ""
+				case "no-fingerprint":
+					ticket.Fingerprint = ""
+				case "late-tamper":
+					if err := os.WriteFile(cfg.PlanJSON, []byte("{}"), 0600); err != nil {
+						t.Fatal(err)
+					}
+				case "canceled":
+					cancel()
+				}
+				return []model.ExistingIssue{ticket}, nil
+			}
+			_, err := New(cfg, discardLogger(), &planSnyk{snapshot: planSnapshot(f)}, linear, store).Run(ctx)
+			if err == nil || linear.calls != 2 || len(linear.createCallBatches) != 1 || store.saved.SnykHashes != nil {
+				t.Fatal("failed refresh retried, repeated mutations or saved cache")
+			}
+			final := readBound[BoundResult](t, cfg, "result.json")
+			if final.Status == "success" || final.BatchesAcknowledged != 1 || final.CacheStatus == "saved" {
+				t.Fatalf("dishonest refresh proof: %+v", final)
+			}
+		})
+	}
+}
+
+func TestBoundEmptySourceCacheRefusesBeforeMutation(t *testing.T) {
+	cfg := boundCfg(t)
+	f := planFixtureFinding("issue-absent")
+	ticket := storedIssue("ticket-a", "SNYK-100", "Todo", desiredIssue(cfg, f))
+	linear := &planLinear{fakeLinear: fakeLinear{snapshot: []model.ExistingIssue{ticket}}}
+	_, err := New(cfg, discardLogger(), &planSnyk{snapshot: planSnapshot()}, linear, &fakeCache{ignoreRows: true}).Run(t.Context())
+	if err == nil || !strings.Contains(err.Error(), "nonempty Snyk hashes") {
+		t.Fatalf("error=%v", err)
+	}
+	assertNoReviewedWrites(t, linear)
+}
+
+func TestBoundOversizedPlanCannotBindOrExecute(t *testing.T) {
+	cfg := boundCfg(t)
+	f := planFixtureFinding("issue-a")
+	preview := planCfg()
+	preview.ReplaySafe = true
+	result, _, _ := runPlan(t, preview, planSnapshot(f), nil, nil)
+	result.Plan.Records[0].Reason = strings.Repeat("x", maxBoundPlanBytes)
+	result.Plan.DecisionsSHA256, _ = planDigest(result.Plan.Records)
+	b, err := reserveBoundRun(cfg.PlanJSON)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.close()
+	jobs := []job{{kind: jobCreateBatch, desiredBatch: []model.DesiredIssue{desiredIssue(cfg, f)}}}
+	if err := b.bind(cfg, result.Plan, jobs); err == nil || !strings.Contains(err.Error(), "size limit") {
+		t.Fatalf("oversized plan bound: %v", err)
+	}
+	for _, path := range []string{cfg.PlanJSON, filepath.Join(boundDir(cfg), "attempt.json")} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatal("oversized binding created artifacts")
+		}
+	}
+}
+
+func TestBoundArtifactSizeBoundaryIncludesExactFileBytes(t *testing.T) {
+	cfg := boundCfg(t)
+	b, err := reserveBoundRun(cfg.PlanJSON)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.close()
+	// JSON quotes and newline consume three bytes beyond this ASCII string.
+	data, err := b.write("plan.json", strings.Repeat("x", maxBoundPlanBytes-3))
+	if err != nil || len(data) != maxBoundPlanBytes {
+		t.Fatalf("exact boundary rejected: %v", err)
+	}
+	if _, err := b.write("attempt.json", strings.Repeat("x", maxBoundReceiptBytes)); err == nil {
+		t.Fatal("unbounded receipt accepted")
 	}
 }

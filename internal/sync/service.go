@@ -908,6 +908,9 @@ func (s *Service) Run(ctx context.Context) (result RunResult, runErr error) {
 			return result, err
 		}
 		if bound != nil {
+			if s.cache != nil && len(snykHashes) == 0 {
+				return result, errors.New("bounded cache publication requires nonempty Snyk hashes")
+			}
 			if err := bound.bind(s.cfg, currentPlan, prepared); err != nil {
 				return result, err
 			}
@@ -961,23 +964,34 @@ func (s *Service) Run(ctx context.Context) (result RunResult, runErr error) {
 		}
 	}
 	if !s.cfg.DryRun && s.cache != nil {
-		// Refresh the cache even if some Linear operations failed. Snyk data and
-		// ignore metadata are still valid and should be cached so the next run
-		// does not have to re-fetch everything. Linear hashes are taken from a
-		// fresh snapshot when possible; if the reload fails we fall back to the
-		// hashes from the initial load, which will cause the next run to retry
-		// any issues whose writes failed.
+		// Guarded mutation failures returned above. Bounded mode requires a
+		// successful fresh cache read; other modes preserve their existing refresh
+		// and fallback behavior. Ordinary mode can save despite failed operations,
+		// retaining valid Snyk data and ignore memory for the next run.
 		cacheLinearHashes := currentLinearHashes
-		if bound != nil {
-			// Never reload execution inputs; invalidate Linear hashes for the next run.
-			cacheLinearHashes = map[string]string{}
-		} else if result.PlannedCreates > 0 || result.PlannedUpdates > 0 || result.PlannedResolves > 0 {
-			refreshedIssues, err := s.linear.LoadSnapshot(runCtx)
+		if bound != nil || result.PlannedCreates > 0 || result.PlannedUpdates > 0 || result.PlannedResolves > 0 {
+			refreshCtx := runCtx
+			if bound != nil {
+				bound.result.CacheStatus = "refresh_failed_or_uncertain"
+				refreshCtx = httpx.WithoutRetries(refreshCtx)
+			}
+			// This post-execution read only builds cache evidence. It cannot add jobs,
+			// change the bound plan, or trigger another mutation.
+			refreshedIssues, err := s.linear.LoadSnapshot(refreshCtx)
 			if err != nil {
+				if bound != nil {
+					return result, fmt.Errorf("bounded post-write Linear refresh failed; cache not saved: %w", err)
+				}
 				s.logger.Warn("failed to refresh Linear snapshot, using current hashes for cache",
 					"error", err,
 				)
 			} else {
+				if bound != nil {
+					_, refreshedIssues, err = canonicalReplayInputs(model.SnykSnapshot{}, refreshedIssues)
+					if err != nil {
+						return result, fmt.Errorf("bounded post-write Linear refresh is invalid; cache not saved: %w", err)
+					}
+				}
 				cacheLinearHashes = linearHashesByFingerprint(refreshedIssues)
 				// A fingerprint shared by several tickets must cache the hash of
 				// the ticket the finding is matched to, not whichever copy the
@@ -993,6 +1007,19 @@ func (s *Service) Run(ctx context.Context) (result RunResult, runErr error) {
 				}
 			}
 		}
+		if bound != nil {
+			if len(cacheLinearHashes) == 0 {
+				return result, errors.New("bounded post-write Linear refresh has no hashes; cache not saved")
+			}
+			bound.result.CacheStatus = "not_saved"
+			if err := runCtx.Err(); err != nil {
+				return result, err
+			}
+			if err := bound.verify(prepared); err != nil {
+				return result, err
+			}
+		}
+
 		nextSnapshot := cache.Snapshot{
 			SchemaSignature: cacheSignature,
 			SnykHashes:      snykHashes,

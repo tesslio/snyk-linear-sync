@@ -559,7 +559,7 @@ The current implementation is intentionally optimized for correctness first, the
 The explicit `--plan-and-execute-bound --replay-safe` live mode accepts operator
 bounds rather than an independently reviewed prior snapshot. It requires all of
 `--max-creates`, `--max-updates`, `--max-resolves`, `--max-cancel-duplicates`
-(canonical decimal integers in `[0, 1000000]`), an immutable destination team
+(canonical decimal integers in `[0, 999999]`), an immutable destination team
 UUID, and a new `--plan-json` file. Reopens consume update capacity; duplicate
 cancellations have an independent bound. Dry-run, reviewed-plan and checkpoint
 modes and clearing cold-start protection cannot be combined with this mode.
@@ -591,12 +591,22 @@ private API error text. Death before a final receipt leaves a consumed,
 potentially uncertain attempt, never a successful one. Output failures fail the
 process and never erase the reservation.
 
-Only complete execution saves sync hashes. To preserve a single source load,
-bounded execution invalidates all Linear hashes instead of reloading Linear for
-cache refresh. Cache-save failure cannot claim success. Loader observation and
-cold-start metadata may already have changed, so callers must isolate the cache
-and publish it only after success and exact readback. The caller also owns
-source and executable provenance, freshness, single-writer exclusion, a durable
-attempt-one guard across paths, and private receipt retention of at most seven
-days. Existing ordinary and independently reviewed-plan behavior is preserved,
-including strict JSON/input/decision equivalence for reviewed execution.
+Only complete execution saves sync hashes. A configured cache requires nonempty
+Snyk hashes before the write gate. After executing all buffered jobs, bounded
+mode performs one mandatory post-write Linear read solely for cache evidence. It
+cannot replan, enqueue jobs or trigger another mutation. Failed, empty or
+malformed reads stop without saving hashes; bounded mode never substitutes
+pre-write hashes. Successful refresh saves nonempty current Linear hashes using
+the existing canonical matched-ticket cache selection. Ordinary and
+reviewed-mode refresh behavior remains unchanged. Cache-save failure cannot
+claim success.
+
+Loader observation and cold-start metadata may already have changed, so callers
+must isolate the cache and publish only after successful exact readback. Callers
+also own source/executable provenance, freshness, single-writer exclusion and a
+durable attempt-one guard across paths. Retain the exact plan, hash-bound
+attempt and any final result privately for at most seven days, including on
+partial or uncertain failure, before cleanup removes job scratch; do not retain
+raw API logs or databases as receipt artifacts. Existing ordinary and
+independently reviewed-plan behavior is preserved, including strict
+JSON/input/decision equivalence for reviewed execution.

@@ -541,8 +541,8 @@ func (c Config) ValidateBound() error {
 		return errors.New("bounded execution requires --plan-json with a new private file path")
 	}
 	for _, limit := range []*int64{c.MaxCreates, c.MaxUpdates, c.MaxResolves, c.MaxCancelDuplicates} {
-		if limit == nil || *limit < 0 || *limit > 1000000 {
-			return errors.New("bounded execution requires all four explicit limits between 0 and 1000000")
+		if limit == nil || *limit < 0 || *limit > 999999 {
+			return errors.New("bounded execution requires all four explicit limits between 0 and 999999")
 		}
 	}
 	return nil

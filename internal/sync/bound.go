@@ -13,6 +13,9 @@ import (
 	"github.com/tesslio/snyk-linear-sync/internal/model"
 )
 
+const maxBoundPlanBytes = 32 << 20
+const maxBoundReceiptBytes = 4096
+
 // BoundAttempt contains hashes and aggregate limits, never raw source payloads.
 // Its durable existence consumes this receipt directory even if the process dies.
 type BoundAttempt struct {
@@ -148,6 +151,13 @@ func (b *boundRun) write(name string, value any) ([]byte, error) {
 		return nil, err
 	}
 	data = append(data, '\n')
+	limit := maxBoundReceiptBytes
+	if name == "plan.json" {
+		limit = maxBoundPlanBytes
+	}
+	if len(data) > limit {
+		return nil, errors.New("bound artifact exceeds its private retention size limit")
+	}
 	root := b.root
 	if name == "plan.json" {
 		root, name = b.planRoot, b.planName

@@ -728,7 +728,7 @@ independently reviewed-plan guard. It requires `--replay-safe`, an immutable
   --plan-json /physical/private-parent/new-plan.json
 ```
 
-Each limit must be a canonical decimal integer in `[0, 1000000]`; omitted,
+Each limit must be a canonical decimal integer in `[0, 999999]`; omitted,
 negative, overflowing or malformed limits fail closed. Reopens count as updates.
 Duplicate cancellations have their own required limit. Limits apply to the
 complete plan, including every batch, before the first Linear mutation. This
@@ -742,33 +742,47 @@ loading sources and is never automatically removed, even after failure. Files
 are created exclusively with mode `0600`:
 
 - `PATH` (the `--plan-json` file): complete v2 reconciliation intent from one validated fresh Snyk
-  load, one Linear load and complete required reopen history. This file remains
+  load, one Linear planning load and complete required reopen history. The exact
+  file, including its trailing newline, must fit within 32 MiB before dispatch. This file remains
   an unattempted plan, not an execution receipt.
 - `PATH.receipts/attempt.json`: schema version `1`, status `attempt_started`, `started_at`, exact
   file-byte `plan_sha256`, full buffered-payload `jobs_sha256`, `creates`,
   `updates`, `resolves`, `cancel_duplicates`, the four `max_*` limits and
-  `batches`. The plan and receipt files and directory entries are synced before
+  `batches`. The receipt is capped at 4 KiB. The plan and receipt files and directory entries are synced before
   dispatch. Exactly one `msg="bound plan written" plan_sha256=<raw file hash>`
   line is logged after binding and before dispatch. Raw source snapshots and buffered payloads are not persisted.
 - `PATH.receipts/result.json`: schema version `1`, `finished_at`, the same plan/job hashes,
   `status`, `linear_writes_attempted`, `batches_attempted`,
-  `batches_acknowledged`, and `cache_status`. It contains no raw API error text.
+  `batches_acknowledged`, and `cache_status`. It is capped at 4 KiB and contains
+  no raw API error text.
 
 `status` is `success`, `failed_before_writes`, or `partial_or_uncertain`.
-`cache_status` is `not_saved`, `saved`, or `save_failed_or_uncertain`. With no
-cache store, `not_saved` also applies to successful execution. Acknowledgement
-means all mutation and applicable follow-on comment responses in that batch
-succeeded; it does not imply atomicity or independently verified remote state.
-No mutations are retried. A failed or uncertain batch stops later batches and
-skips sync-cache saving. Cache saving or result persistence failure also makes
-the process fail. Missing, incomplete or mismatched receipts are never evidence
-of success.
+`cache_status` is `not_saved`, `refresh_failed_or_uncertain`, `saved`, or
+`save_failed_or_uncertain`. With no cache store, `not_saved` also applies to
+successful execution. Acknowledgement means all mutation and applicable
+follow-on comment responses in that batch succeeded; it does not imply atomicity
+or independently verified remote state. No mutations are retried. A failed or
+uncertain batch stops later batches and skips sync-cache saving. Cache saving or
+result persistence failure also makes the process fail. Missing, incomplete or
+mismatched receipts are never evidence of success.
 
-Successful bounded execution saves Snyk hashes and empty Linear hashes. It does
-not load Linear again; the next run must compare current Linear values. Loader
-ignore memory and cold-start metadata can change before the write gate, as in
-preview mode. Always run on a disposable copy of the trusted cache and publish
-nothing on failure. Keep the exact completed cache separately from the receipts.
+When a cache is configured, bounded execution requires nonempty Snyk hashes
+before the write gate. After all buffered jobs succeed, it loads Linear once
+more solely to build fresh cache hashes. That read never replans, adds jobs or
+triggers mutations. Missing, malformed, empty or failed refresh results fail
+closed without saving sync hashes or falling back to pre-write hashes.
+Successful execution saves nonempty Snyk and freshly read Linear hashes and
+emits the existing cache-refresh and completion messages. This read is cache
+evidence, not independent verification of every remote outcome.
+
+Loader ignore memory and cold-start metadata can change before the write gate,
+as in preview mode. Always run on a disposable copy of the trusted cache and
+publish nothing on failure. Retain the exact plan, `PATH.receipts/attempt.json`
+and any `PATH.receipts/result.json` privately for at most seven days, including
+on failure, before removing job scratch. Retain no database or raw log as a plan
+artifact. A missing final receipt means an interrupted or uncertain attempt.
+Keep the completed cache separately and publish it only after independent exact
+readback validation.
 
 The caller owns executable/source provenance, freshness policy, a single-writer
 lease, a durable attempt-one gate across different output paths, private receipt
