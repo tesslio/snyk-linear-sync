@@ -186,7 +186,7 @@ func PlanSettingsSHA256(cfg config.Config) (string, error) {
 }
 
 func newPlanCollector(cfg config.Config, snapshot model.SnykSnapshot, existing []model.ExistingIssue, cached cache.Snapshot, cacheEnabled bool) (*planCollector, error) {
-	if cfg.PlanJSON == "" && cfg.ReviewedPlanJSON == "" {
+	if cfg.PlanJSON == "" && cfg.ReviewedPlanJSON == "" && !cfg.PlanAndExecuteBound {
 		return nil, nil
 	}
 	if cfg.ReplaySafe {
