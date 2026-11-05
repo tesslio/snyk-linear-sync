@@ -553,3 +553,60 @@ If this project grows further, the next reasonable extensions would be:
 - explicit conflict reporting output
 
 The current implementation is intentionally optimized for correctness first, then steady-state efficiency.
+
+## Single-Snapshot Bounded Reconciliation
+
+The explicit `--plan-and-execute-bound --replay-safe` live mode accepts operator
+bounds rather than an independently reviewed prior snapshot. It requires all of
+`--max-creates`, `--max-updates`, `--max-resolves`, `--max-cancel-duplicates`
+(canonical decimal integers in `[0, 999999]`), an immutable destination team
+UUID, and a new `--plan-json` file. Reopens consume update capacity; duplicate
+cancellations have an independent bound. Dry-run, reviewed-plan and checkpoint
+modes and clearing cold-start protection cannot be combined with this mode.
+
+It reserves a new private `PLAN_PATH.receipts` directory under a physical,
+mode-0700 parent before loading. The service loads source snapshots once,
+buffers every job, finishes the complete v2 plan, validates coverage, actions
+and reopen history, verifies exact job/record correspondence, and enforces
+aggregate limits. Before dispatch it exclusively creates and fsyncs the
+requested plan file and `attempt.json` in the receipt directory (mode 0600),
+then fsyncs their directories. The attempt binds exact plan-file bytes and a
+digest of the full buffered job payloads, with aggregate counts, limits and a
+start timestamp. Exactly one `bound plan written` message carries the raw
+plan-file SHA-256 after binding and before dispatch. Raw source snapshots and
+payloads remain in memory. Receipt paths cannot overwrite existing attempts or
+follow symlinks, and retained directory handles prevent renamed parents from
+redirecting receipt writes. Artifact and payload tampering is checked before
+dispatch. The operator controls and protects the private parent against
+concurrent modification; receipts are local evidence, not signatures.
+
+Execution sends those same jobs sequentially through the existing no-retry
+guarded dispatch path. A partial or uncertain response, cancellation, or receipt
+verification failure stops subsequent jobs; no sync hashes are saved on an
+incomplete execution. Follow-on writes and mutation-time metadata resolution
+remain non-atomic. `PLAN_PATH.receipts/result.json` separately records
+conservative attempted and acknowledged batch counts, write-attempt status,
+bound hashes, completion time, cache status and final success/failure, without
+private API error text. Death before a final receipt leaves a consumed,
+potentially uncertain attempt, never a successful one. Output failures fail the
+process and never erase the reservation.
+
+Only complete execution saves sync hashes. A configured cache requires nonempty
+Snyk hashes before the write gate. After executing all buffered jobs, bounded
+mode performs one mandatory post-write Linear read solely for cache evidence. It
+cannot replan, enqueue jobs or trigger another mutation. Failed, empty or
+malformed reads stop without saving hashes; bounded mode never substitutes
+pre-write hashes. Successful refresh saves nonempty current Linear hashes using
+the existing canonical matched-ticket cache selection. Ordinary and
+reviewed-mode refresh behavior remains unchanged. Cache-save failure cannot
+claim success.
+
+Loader observation and cold-start metadata may already have changed, so callers
+must isolate the cache and publish only after successful exact readback. Callers
+also own source/executable provenance, freshness, single-writer exclusion and a
+durable attempt-one guard across paths. Retain the exact plan, hash-bound
+attempt and any final result privately for at most seven days, including on
+partial or uncertain failure, before cleanup removes job scratch; do not retain
+raw API logs or databases as receipt artifacts. Existing ordinary and
+independently reviewed-plan behavior is preserved, including strict
+JSON/input/decision equivalence for reviewed execution.

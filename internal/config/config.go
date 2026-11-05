@@ -47,8 +47,10 @@ const (
 )
 
 type Config struct {
-	DryRun bool
-	// PlanJSON exports a private complete reconciliation plan; requires DryRun.
+	DryRun                                                   bool
+	PlanAndExecuteBound                                      bool
+	MaxCreates, MaxUpdates, MaxResolves, MaxCancelDuplicates *int64
+	// PlanJSON exports a private complete plan in dry-run or bounded execution.
 	PlanJSON string
 	// ReviewedPlanJSON and ReviewedPlanSHA256 gate live writes on exact input/decision equivalence.
 	ReviewedPlanJSON   string
@@ -150,8 +152,13 @@ func Load(args []string) (Config, error) {
 	fs := flag.NewFlagSet("snyk-linear-sync", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 
+	bound := fs.Bool("plan-and-execute-bound", false, "plan once, bind private receipts, then execute within explicit limits")
+	maxCreates := boundFlag(fs, "max-creates", "maximum creates for bounded execution (required)")
+	maxUpdates := boundFlag(fs, "max-updates", "maximum updates including reopens (required)")
+	maxResolves := boundFlag(fs, "max-resolves", "maximum resolves (required)")
+	maxCancelDuplicates := boundFlag(fs, "max-cancel-duplicates", "maximum duplicate cancellations for bounded execution (required)")
 	dryRun := fs.Bool("dry-run", false, "plan changes without mutating Linear")
-	planJSON := fs.String("plan-json", "", "write a private JSON reconciliation plan to a new file (requires --dry-run)")
+	planJSON := fs.String("plan-json", "", "write a private JSON plan to a new file (requires --dry-run or --plan-and-execute-bound)")
 	reviewedPlanJSON := fs.String("reviewed-plan-json", "", "require this complete private dry-run reconciliation plan before live writes")
 	reviewedPlanSHA256 := fs.String("reviewed-plan-sha256", "", "independently reviewed SHA-256 of the exact approved plan file bytes")
 	replaySafe := fs.Bool("replay-safe", false, "use v2 deterministic ordering and mandatory fresh source reads")
@@ -163,6 +170,23 @@ func Load(args []string) (Config, error) {
 
 	if err := fs.Parse(args); err != nil {
 		return Config{}, err
+	}
+	supplied := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { supplied[f.Name] = true })
+	if !supplied["max-creates"] {
+		maxCreates = nil
+	}
+	if !supplied["max-updates"] {
+		maxUpdates = nil
+	}
+	if !supplied["max-resolves"] {
+		maxResolves = nil
+	}
+	if !supplied["max-cancel-duplicates"] {
+		maxCancelDuplicates = nil
+	}
+	if fs.NArg() != 0 {
+		return Config{}, errors.New("unexpected positional arguments")
 	}
 	if strings.TrimSpace(*envFile) != "" {
 		path := strings.TrimSpace(*envFile)
@@ -182,6 +206,11 @@ func Load(args []string) (Config, error) {
 
 	cfg := Config{
 		DryRun:                  *dryRun,
+		PlanAndExecuteBound:     *bound,
+		MaxCreates:              maxCreates,
+		MaxUpdates:              maxUpdates,
+		MaxResolves:             maxResolves,
+		MaxCancelDuplicates:     maxCancelDuplicates,
 		PlanJSON:                strings.TrimSpace(*planJSON),
 		ReviewedPlanJSON:        strings.TrimSpace(*reviewedPlanJSON),
 		ReviewedPlanSHA256:      strings.ToLower(strings.TrimSpace(*reviewedPlanSHA256)),
@@ -251,8 +280,11 @@ func Load(args []string) (Config, error) {
 
 func (c Config) Validate() error {
 	var errs []error
-	if c.ReplaySafe && c.ObservationCheckpoint == "" && c.PlanJSON == "" && c.ReviewedPlanJSON == "" {
-		errs = append(errs, errors.New("--replay-safe requires plan export, reviewed execution, or observation checkpoint"))
+	if err := c.ValidateBound(); err != nil {
+		errs = append(errs, err)
+	}
+	if c.ReplaySafe && c.ObservationCheckpoint == "" && c.PlanJSON == "" && c.ReviewedPlanJSON == "" && !c.PlanAndExecuteBound {
+		errs = append(errs, errors.New("--replay-safe requires plan export, reviewed execution, bounded execution, or observation checkpoint"))
 	}
 	if (c.ObservationCheckpoint == "") != (c.ObservationSourceSHA256 == "") {
 		errs = append(errs, errors.New("--observation-checkpoint and --observation-source-sha256 must be supplied together"))
@@ -269,7 +301,7 @@ func (c Config) Validate() error {
 			errs = append(errs, errors.New("observation checkpoint requires source SHA-256"))
 		}
 	}
-	if c.PlanJSON != "" && !c.DryRun {
+	if c.PlanJSON != "" && !c.DryRun && !c.PlanAndExecuteBound {
 		errs = append(errs, errors.New("--plan-json requires --dry-run"))
 	}
 	if c.PlanJSON == "-" {
@@ -489,4 +521,50 @@ func parseLabelMap(envName, raw string) (map[string]string, error) {
 		return nil, nil
 	}
 	return out, nil
+}
+
+// ValidateBound is also called by Service.Run, before any loader or cache access.
+func (c Config) ValidateBound() error {
+	if !c.PlanAndExecuteBound {
+		if c.MaxCreates != nil || c.MaxUpdates != nil || c.MaxResolves != nil || c.MaxCancelDuplicates != nil {
+			return errors.New("bounded options require --plan-and-execute-bound")
+		}
+		return nil
+	}
+	if !c.ReplaySafe || c.DryRun || c.ReviewedPlanJSON != "" || c.ReviewedPlanSHA256 != "" || c.ObservationCheckpoint != "" || c.ObservationSourceSHA256 != "" || c.Cache.ClearIgnoresColdStart {
+		return errors.New("bounded execution requires --replay-safe live mode without other plan modes or clearing cold-start protection")
+	}
+	if !IsLinearTeamUUID(c.Linear.TeamID) {
+		return errors.New("bounded execution requires immutable LINEAR_TEAM_ID UUID")
+	}
+	if strings.TrimSpace(c.PlanJSON) == "" || c.PlanJSON == "-" {
+		return errors.New("bounded execution requires --plan-json with a new private file path")
+	}
+	for _, limit := range []*int64{c.MaxCreates, c.MaxUpdates, c.MaxResolves, c.MaxCancelDuplicates} {
+		if limit == nil || *limit < 0 || *limit > 999999 {
+			return errors.New("bounded execution requires all four explicit limits between 0 and 999999")
+		}
+	}
+	return nil
+}
+
+func boundFlag(fs *flag.FlagSet, name, usage string) *int64 {
+	value := new(int64)
+	fs.Func(name, usage, func(raw string) error {
+		if raw == "" || (len(raw) > 1 && raw[0] == '0') {
+			return errors.New("requires a canonical nonnegative decimal integer")
+		}
+		for _, digit := range raw {
+			if digit < '0' || digit > '9' {
+				return errors.New("requires a canonical nonnegative decimal integer")
+			}
+		}
+		parsed, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil {
+			return errors.New("bound integer overflows")
+		}
+		*value = parsed
+		return nil
+	})
+	return value
 }

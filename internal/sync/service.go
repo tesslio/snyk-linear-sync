@@ -2,6 +2,7 @@ package sync
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/url"
@@ -164,8 +165,31 @@ func New(cfg config.Config, logger *slog.Logger, snyk SnykClient, linear LinearC
 	}
 }
 
-func (s *Service) Run(ctx context.Context) (RunResult, error) {
-	if s.cfg.PlanJSON != "" && (!s.cfg.DryRun || s.cfg.PlanJSON == "-") {
+func (s *Service) Run(ctx context.Context) (result RunResult, runErr error) {
+	if err := s.cfg.ValidateBound(); err != nil {
+		return result, err
+	}
+	var bound *boundRun
+	if s.cfg.PlanAndExecuteBound {
+		var err error
+		bound, err = reserveBoundRun(s.cfg.PlanJSON)
+		if err != nil {
+			return result, err
+		}
+		defer func() {
+			defer bound.close()
+			bound.result.FinishedAt = time.Now().UTC().Format(time.RFC3339Nano)
+			if runErr == nil {
+				bound.result.Status = "success"
+			}
+			_, err := bound.write("result.json", bound.result)
+			if err != nil {
+				runErr = errors.Join(runErr, fmt.Errorf("persist bound result: %w", err))
+			}
+		}()
+	}
+
+	if s.cfg.PlanJSON != "" && ((!s.cfg.DryRun && !s.cfg.PlanAndExecuteBound) || s.cfg.PlanJSON == "-") {
 		return RunResult{}, fmt.Errorf("plan export requires dry-run and a private file path")
 	}
 	// Read and validate accepted bytes once, before snapshot loading or workers.
@@ -624,7 +648,6 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 	}
 
 	jobs := make(chan job)
-	var result RunResult
 	result.Findings = len(findings)
 	result.ExistingIssues = len(existingIssues)
 	result.ActiveProjects = len(snykSnapshot.ProjectIDs)
@@ -646,7 +669,7 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 	g, workerCtx := errgroup.WithContext(runCtx)
 	var prepared []job
 	enqueue := func(j job) { jobs <- j }
-	if reviewed != nil {
+	if reviewed != nil || bound != nil {
 		// Planning is single-threaded in guarded mode. No mutation workers exist
 		// until the entire candidate plan has passed comparison.
 		enqueue = func(j job) {
@@ -873,7 +896,7 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 		return nil
 	}
 
-	if reviewed != nil {
+	if reviewed != nil || bound != nil {
 		if err := produceJobs(); err != nil {
 			return result, err
 		}
@@ -884,19 +907,45 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 		if err != nil {
 			return result, err
 		}
-		if err := verifyReviewedPlan(reviewed, currentPlan); err != nil {
+		if bound != nil {
+			if s.cache != nil && len(snykHashes) == 0 {
+				return result, errors.New("bounded cache publication requires nonempty Snyk hashes")
+			}
+			if err := bound.bind(s.cfg, currentPlan, prepared); err != nil {
+				return result, err
+			}
+			s.logger.Info("bound plan written", slog.String("plan_sha256", bound.attempt.PlanSHA256))
+			if err := bound.verify(prepared); err != nil {
+				return result, err
+			}
+		} else if err := verifyReviewedPlan(reviewed, currentPlan); err != nil {
 			return result, err
 		}
-		s.logger.Info("reviewed reconciliation matched; executing buffered operations")
+		if bound != nil {
+			s.logger.Info("bounded reconciliation bound; executing buffered operations")
+		} else {
+			s.logger.Info("reviewed reconciliation matched; executing buffered operations")
+		}
 		for _, j := range prepared {
 			if err := runCtx.Err(); err != nil {
 				return result, err
+			}
+			if bound != nil {
+				if err := bound.verify(prepared); err != nil {
+					return result, err
+				}
+				bound.result.Status = "partial_or_uncertain"
+				bound.result.LinearWritesAttempted = true
+				bound.result.BatchesAttempted++
 			}
 			// Do not re-plan or retry uncertain mutations in guarded mode. A
 			// partial failure stops subsequent operations and requires review.
 			if err := s.executeReviewedJob(runCtx, j); err != nil {
 				result.FailedOps++
 				return result, err
+			}
+			if bound != nil {
+				bound.result.BatchesAcknowledged++
 			}
 		}
 	} else {
@@ -906,21 +955,43 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 		}
 	}
 
+	if bound != nil {
+		if err := runCtx.Err(); err != nil {
+			return result, err
+		}
+		if err := bound.verify(prepared); err != nil {
+			return result, err
+		}
+	}
 	if !s.cfg.DryRun && s.cache != nil {
-		// Refresh the cache even if some Linear operations failed. Snyk data and
-		// ignore metadata are still valid and should be cached so the next run
-		// does not have to re-fetch everything. Linear hashes are taken from a
-		// fresh snapshot when possible; if the reload fails we fall back to the
-		// hashes from the initial load, which will cause the next run to retry
-		// any issues whose writes failed.
+		// Guarded mutation failures returned above. Bounded mode requires a
+		// successful fresh cache read; other modes preserve their existing refresh
+		// and fallback behavior. Ordinary mode can save despite failed operations,
+		// retaining valid Snyk data and ignore memory for the next run.
 		cacheLinearHashes := currentLinearHashes
-		if result.PlannedCreates > 0 || result.PlannedUpdates > 0 || result.PlannedResolves > 0 {
-			refreshedIssues, err := s.linear.LoadSnapshot(runCtx)
+		if bound != nil || result.PlannedCreates > 0 || result.PlannedUpdates > 0 || result.PlannedResolves > 0 {
+			refreshCtx := runCtx
+			if bound != nil {
+				bound.result.CacheStatus = "refresh_failed_or_uncertain"
+				refreshCtx = httpx.WithoutRetries(refreshCtx)
+			}
+			// This post-execution read only builds cache evidence. It cannot add jobs,
+			// change the bound plan, or trigger another mutation.
+			refreshedIssues, err := s.linear.LoadSnapshot(refreshCtx)
 			if err != nil {
+				if bound != nil {
+					return result, fmt.Errorf("bounded post-write Linear refresh failed; cache not saved: %w", err)
+				}
 				s.logger.Warn("failed to refresh Linear snapshot, using current hashes for cache",
 					"error", err,
 				)
 			} else {
+				if bound != nil {
+					_, refreshedIssues, err = canonicalReplayInputs(model.SnykSnapshot{}, refreshedIssues)
+					if err != nil {
+						return result, fmt.Errorf("bounded post-write Linear refresh is invalid; cache not saved: %w", err)
+					}
+				}
 				cacheLinearHashes = linearHashesByFingerprint(refreshedIssues)
 				// A fingerprint shared by several tickets must cache the hash of
 				// the ticket the finding is matched to, not whichever copy the
@@ -936,13 +1007,32 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 				}
 			}
 		}
+		if bound != nil {
+			if len(cacheLinearHashes) == 0 {
+				return result, errors.New("bounded post-write Linear refresh has no hashes; cache not saved")
+			}
+			bound.result.CacheStatus = "not_saved"
+			if err := runCtx.Err(); err != nil {
+				return result, err
+			}
+			if err := bound.verify(prepared); err != nil {
+				return result, err
+			}
+		}
+
 		nextSnapshot := cache.Snapshot{
 			SchemaSignature: cacheSignature,
 			SnykHashes:      snykHashes,
 			LinearHashes:    cacheLinearHashes,
 		}
+		if bound != nil {
+			bound.result.CacheStatus = "save_failed_or_uncertain"
+		}
 		if err := s.cache.Save(runCtx, nextSnapshot); err != nil {
 			return result, err
+		}
+		if bound != nil {
+			bound.result.CacheStatus = "saved"
 		}
 		s.logger.Info("refreshed sync cache",
 			slog.Int("snyk_rows", len(nextSnapshot.SnykHashes)),
@@ -954,7 +1044,7 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 	if plan != nil && runCtx.Err() != nil {
 		return result, runCtx.Err()
 	}
-	if reviewed == nil {
+	if reviewed == nil && bound == nil {
 		result.Plan, err = plan.finish(result, guard)
 		if err != nil {
 			return result, err
