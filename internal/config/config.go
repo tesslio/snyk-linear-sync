@@ -49,6 +49,7 @@ const (
 type Config struct {
 	DryRun                                                   bool
 	PlanAndExecuteBound                                      bool
+	ExpectedSettingsSHA256                                   string
 	MaxCreates, MaxUpdates, MaxResolves, MaxCancelDuplicates *int64
 	// PlanJSON exports a private complete plan in dry-run or bounded execution.
 	PlanJSON string
@@ -152,6 +153,7 @@ func Load(args []string) (Config, error) {
 	fs := flag.NewFlagSet("snyk-linear-sync", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 
+	expectedSettings := fs.String("expected-settings-sha256", "", "require matching settings and no deferred creates before bounded execution")
 	bound := fs.Bool("plan-and-execute-bound", false, "plan once, bind private receipts, then execute within explicit limits")
 	maxCreates := boundFlag(fs, "max-creates", "maximum creates for bounded execution (required)")
 	maxUpdates := boundFlag(fs, "max-updates", "maximum updates including reopens (required)")
@@ -185,6 +187,9 @@ func Load(args []string) (Config, error) {
 	if !supplied["max-cancel-duplicates"] {
 		maxCancelDuplicates = nil
 	}
+	if supplied["expected-settings-sha256"] && *expectedSettings == "" {
+		return Config{}, errors.New("expected settings digest must not be empty")
+	}
 	if fs.NArg() != 0 {
 		return Config{}, errors.New("unexpected positional arguments")
 	}
@@ -207,6 +212,7 @@ func Load(args []string) (Config, error) {
 	cfg := Config{
 		DryRun:                  *dryRun,
 		PlanAndExecuteBound:     *bound,
+		ExpectedSettingsSHA256:  *expectedSettings,
 		MaxCreates:              maxCreates,
 		MaxUpdates:              maxUpdates,
 		MaxResolves:             maxResolves,
@@ -526,10 +532,16 @@ func parseLabelMap(envName, raw string) (map[string]string, error) {
 // ValidateBound is also called by Service.Run, before any loader or cache access.
 func (c Config) ValidateBound() error {
 	if !c.PlanAndExecuteBound {
-		if c.MaxCreates != nil || c.MaxUpdates != nil || c.MaxResolves != nil || c.MaxCancelDuplicates != nil {
+		if c.ExpectedSettingsSHA256 != "" || c.MaxCreates != nil || c.MaxUpdates != nil || c.MaxResolves != nil || c.MaxCancelDuplicates != nil {
 			return errors.New("bounded options require --plan-and-execute-bound")
 		}
 		return nil
+	}
+	if c.ExpectedSettingsSHA256 != "" {
+		digest, err := hex.DecodeString(c.ExpectedSettingsSHA256)
+		if err != nil || len(digest) != 32 || strings.ToLower(c.ExpectedSettingsSHA256) != c.ExpectedSettingsSHA256 {
+			return errors.New("expected settings digest must be 64 lowercase hexadecimal characters")
+		}
 	}
 	if !c.ReplaySafe || c.DryRun || c.ReviewedPlanJSON != "" || c.ReviewedPlanSHA256 != "" || c.ObservationCheckpoint != "" || c.ObservationSourceSHA256 != "" || c.Cache.ClearIgnoresColdStart {
 		return errors.New("bounded execution requires --replay-safe live mode without other plan modes or clearing cold-start protection")

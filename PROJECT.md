@@ -610,3 +610,16 @@ partial or uncertain failure, before cleanup removes job scratch; do not retain
 raw API logs or databases as receipt artifacts. Existing ordinary and
 independently reviewed-plan behavior is preserved, including strict
 JSON/input/decision equivalence for reviewed execution.
+
+### Strict settings-bound execution
+
+For callers that bind execution to previously validated settings, bounded mode
+accepts `--expected-settings-sha256` with exactly 64 lowercase hexadecimal
+characters. It requires `--plan-and-execute-bound` and refuses an explicitly
+empty or malformed digest. Before writing the plan or attempt receipt and before
+any Linear mutation, the generated plan must match the expected settings digest
+and contain no deferred creates. A mismatch or deferral fails without executing
+any buffered jobs. The result receipt retains the existing failed-before-writes
+status. Omitting this option preserves existing manual bounded behavior. The
+option does not change the settings digest, count limits, job binding, retry
+policy or cache-publication requirements.

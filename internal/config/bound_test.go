@@ -69,3 +69,28 @@ func TestBoundOptionsFailClosed(t *testing.T) {
 		t.Fatal("ignored positional arguments")
 	}
 }
+
+func TestExpectedSettingsOptions(t *testing.T) {
+	n := int64(5)
+	valid := Config{PlanAndExecuteBound: true, ReplaySafe: true, PlanJSON: "private/plan.json", MaxCreates: &n, MaxUpdates: &n, MaxResolves: &n, MaxCancelDuplicates: &n, Linear: LinearConfig{TeamID: "11111111-1111-4111-8111-111111111111"}}
+	for _, digest := range []string{strings.Repeat("a", 64), ""} {
+		c := valid
+		c.ExpectedSettingsSHA256 = digest
+		if err := c.ValidateBound(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, digest := range []string{"x", strings.Repeat("a", 63), strings.Repeat("a", 65), strings.Repeat("g", 64), strings.Repeat("A", 64), " " + strings.Repeat("a", 64)} {
+		c := valid
+		c.ExpectedSettingsSHA256 = digest
+		if c.ValidateBound() == nil {
+			t.Fatal("accepted malformed digest")
+		}
+	}
+	if (Config{ExpectedSettingsSHA256: strings.Repeat("a", 64)}).ValidateBound() == nil {
+		t.Fatal("accepted outside bound mode")
+	}
+	if _, err := Load([]string{"--expected-settings-sha256="}); err == nil || !strings.Contains(err.Error(), "empty") {
+		t.Fatal("accepted empty supplied digest")
+	}
+}
