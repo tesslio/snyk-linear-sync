@@ -648,3 +648,98 @@ func TestBoundArtifactSizeBoundaryIncludesExactFileBytes(t *testing.T) {
 		t.Fatal("unbounded receipt accepted")
 	}
 }
+
+func TestBoundExpectedSettingsBeforeWrites(t *testing.T) {
+	for _, match := range []bool{false, true} {
+		t.Run(fmt.Sprint(match), func(t *testing.T) {
+			cfg := boundCfg(t)
+			digest, err := PlanSettingsSHA256(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cfg.ExpectedSettingsSHA256 = digest
+			if !match {
+				cfg.ExpectedSettingsSHA256 = strings.Repeat("0", 64)
+			}
+			linear := &planLinear{}
+			_, err = New(cfg, discardLogger(), &planSnyk{snapshot: planSnapshot(planFixtureFinding("issue-a"))}, linear, nil).Run(t.Context())
+			if match {
+				if err != nil || len(linear.created) != 1 {
+					t.Fatalf("matching settings did not execute: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), "settings differ") {
+				t.Fatalf("wrong refusal: %v", err)
+			}
+			if len(linear.created) != 0 || len(linear.updated) != 0 {
+				t.Fatal("mutation preceded refusal")
+			}
+			if _, err := os.Stat(artifactPath(cfg, "attempt.json")); !os.IsNotExist(err) {
+				t.Fatal("attempt persisted before refusal")
+			}
+			if _, err := os.Stat(cfg.PlanJSON); !os.IsNotExist(err) {
+				t.Fatal("plan persisted before refusal")
+			}
+			final := readBound[BoundResult](t, cfg, "result.json")
+			if final.LinearWritesAttempted || final.BatchesAttempted != 0 || final.Status != "failed_before_writes" || final.CacheStatus != "not_saved" {
+				t.Fatalf("wrong result: %+v", final)
+			}
+		})
+	}
+}
+
+func TestBoundStrictDeferredCreatesBeforeWrites(t *testing.T) {
+	for _, strict := range []bool{false, true} {
+		t.Run(fmt.Sprint(strict), func(t *testing.T) {
+			cfg := boundCfg(t)
+			if strict {
+				var err error
+				cfg.ExpectedSettingsSHA256, err = PlanSettingsSHA256(cfg)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			old := planFixtureFinding("issue-old")
+			old.ProjectID = "project-old"
+			old.Fingerprint = model.Fingerprint(old.ProjectID, old.SnykIssueID, "package-a@1")
+			old.ProjectName = "namespace/deployment.apps/app:example.test/image"
+			old.ProjectOrigin = "kubernetes"
+			old.ProjectReference = ""
+			old.ProjectTargetFile = ""
+			old.ProjectCluster = "cluster-a"
+			issue := storedIssue("ticket-old", "SNYK-100", "Todo", desiredIssue(cfg, old))
+			finding := old
+			finding.ProjectID = "project-new"
+			finding.SnykIssueID = "issue-new"
+			finding.Fingerprint = model.Fingerprint(finding.ProjectID, finding.SnykIssueID, "package-a@1")
+			finding.ProjectCluster = ""
+			finding.ProjectClusterUnknown = true
+			snapshot := model.SnykSnapshot{Findings: []model.Finding{finding}, ProjectIDs: map[string]struct{}{"project-new": {}}, ClusterLookupFailures: 1}
+			linear := &planLinear{fakeLinear: fakeLinear{snapshot: []model.ExistingIssue{issue}}}
+			_, err := New(cfg, discardLogger(), &planSnyk{snapshot: snapshot}, linear, nil).Run(t.Context())
+			if !strict {
+				if err != nil || len(linear.updated) != 1 {
+					t.Fatalf("manual compatibility changed: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), "deferred creates") {
+				t.Fatalf("wrong refusal: %v", err)
+			}
+			if len(linear.created) != 0 || len(linear.updated) != 0 {
+				t.Fatal("executed jobs despite deferred create")
+			}
+			if _, err := os.Stat(artifactPath(cfg, "attempt.json")); !os.IsNotExist(err) {
+				t.Fatal("attempt persisted before refusal")
+			}
+			if _, err := os.Stat(cfg.PlanJSON); !os.IsNotExist(err) {
+				t.Fatal("plan persisted before refusal")
+			}
+			final := readBound[BoundResult](t, cfg, "result.json")
+			if final.LinearWritesAttempted || final.BatchesAttempted != 0 || final.Status != "failed_before_writes" || final.CacheStatus != "not_saved" {
+				t.Fatalf("wrong result: %+v", final)
+			}
+		})
+	}
+}

@@ -201,6 +201,14 @@ func (b *boundRun) bind(cfg config.Config, plan *ReconciliationPlan, jobs []job)
 		return err
 	}
 	s := plan.Summary
+	if cfg.ExpectedSettingsSHA256 != "" {
+		if plan.Inputs.SettingsSHA256 != cfg.ExpectedSettingsSHA256 {
+			return errors.New("bounded plan settings differ from expected settings")
+		}
+		if s.DeferredCreates != 0 {
+			return errors.New("bounded plan contains deferred creates")
+		}
+	}
 	// Each mutation kind has an independent explicit bound.
 	if s.Creates < 0 || s.Updates < 0 || s.Resolves < 0 || s.CancelDuplicates < 0 || s.Creates > *cfg.MaxCreates || s.Updates > *cfg.MaxUpdates || s.Resolves > *cfg.MaxResolves || s.CancelDuplicates > *cfg.MaxCancelDuplicates {
 		return errors.New("complete plan exceeds bounded execution limits")
