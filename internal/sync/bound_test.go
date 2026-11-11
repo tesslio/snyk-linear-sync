@@ -190,6 +190,18 @@ func TestBoundLimitsRejectAllMutationKindsBeforeWrites(t *testing.T) {
 			if err == nil || !strings.Contains(err.Error(), "limits") {
 				t.Fatalf("error=%v", err)
 			}
+			var limitErr *BoundLimitError
+			if !errors.As(err, &limitErr) {
+				t.Fatalf("missing typed refusal: %v", err)
+			}
+			refusal := readBound[BoundRefusal](t, cfg, "refusal.json")
+			expected := map[string]string{"create": "creates", "update": "updates", "resolve": "resolves", "cancel-duplicate": "cancel_duplicates"}[kind]
+			if !reflect.DeepEqual(refusal, limitErr.Refusal) || !reflect.DeepEqual(refusal.Exceeded, []string{expected}) || refusal.Version != 1 || refusal.Status != "limits_exceeded" {
+				t.Fatalf("wrong refusal: %+v", refusal)
+			}
+			if _, err := os.Stat(cfg.PlanJSON); !os.IsNotExist(err) {
+				t.Fatal("rejected plan persisted")
+			}
 			assertNoReviewedWrites(t, linear)
 			final := readBound[BoundResult](t, cfg, "result.json")
 			if final.LinearWritesAttempted || final.Status != "failed_before_writes" || store.saved.SnykHashes != nil {
@@ -739,6 +751,149 @@ func TestBoundStrictDeferredCreatesBeforeWrites(t *testing.T) {
 			final := readBound[BoundResult](t, cfg, "result.json")
 			if final.LinearWritesAttempted || final.BatchesAttempted != 0 || final.Status != "failed_before_writes" || final.CacheStatus != "not_saved" {
 				t.Fatalf("wrong result: %+v", final)
+			}
+		})
+	}
+}
+
+func TestBoundExactAndMultipleLimits(t *testing.T) {
+	for _, exceeded := range []bool{false, true} {
+		t.Run(fmt.Sprint(exceeded), func(t *testing.T) {
+			cfg := boundCfg(t)
+			limit := int64(1)
+			if exceeded {
+				limit = 0
+			}
+			cfg.MaxCreates, cfg.MaxUpdates, cfg.MaxResolves, cfg.MaxCancelDuplicates = &limit, &limit, &limit, &limit
+			finding := planFixtureFinding("issue-a")
+			ticket := storedIssue("ticket-a", "SNYK-100", "Todo", desiredIssue(cfg, finding))
+			ticket.Title = "old"
+			duplicate := ticket
+			duplicate.ID, duplicate.Identifier = "ticket-b", "SNYK-101"
+			absent := storedIssue("ticket-c", "SNYK-102", "Todo", desiredIssue(cfg, planFixtureFinding("issue-absent")))
+			linear := &planLinear{fakeLinear: fakeLinear{snapshot: []model.ExistingIssue{ticket, duplicate, absent}}}
+			store := &fakeCache{ignoreRows: true}
+			var cacheStore CacheStore
+			if exceeded {
+				cacheStore = store
+			}
+			_, err := New(cfg, discardLogger(), &planSnyk{snapshot: planSnapshot(finding, planFixtureFinding("issue-new"))}, linear, cacheStore).Run(t.Context())
+			if !exceeded {
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(linear.created) != 1 || len(linear.updated) != 3 {
+					t.Fatal("exact limits rejected")
+				}
+				if _, err := os.Stat(artifactPath(cfg, "refusal.json")); !os.IsNotExist(err) {
+					t.Fatal("success emitted refusal")
+				}
+				return
+			}
+			var limitErr *BoundLimitError
+			if !errors.As(err, &limitErr) {
+				t.Fatalf("missing refusal: %v", err)
+			}
+			refusal := readBound[BoundRefusal](t, cfg, "refusal.json")
+			data, err := os.ReadFile(artifactPath(cfg, "refusal.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var fields map[string]json.RawMessage
+			if err := json.Unmarshal(data, &fields); err != nil {
+				t.Fatal(err)
+			}
+			keys := []string{"version", "status", "creates", "updates", "resolves", "cancel_duplicates", "max_creates", "max_updates", "max_resolves", "max_cancel_duplicates", "exceeded"}
+			if len(fields) != len(keys) {
+				t.Fatal("unexpected refusal fields")
+			}
+			for _, key := range keys {
+				if _, ok := fields[key]; !ok {
+					t.Fatalf("missing field %s", key)
+				}
+			}
+			if len(data) > maxBoundReceiptBytes {
+				t.Fatal("unbounded refusal")
+			}
+			if refusal.Creates != 1 || refusal.Updates != 1 || refusal.Resolves != 1 || refusal.CancelDuplicates != 1 || !reflect.DeepEqual(refusal.Exceeded, []string{"creates", "updates", "resolves", "cancel_duplicates"}) {
+				t.Fatalf("wrong refusal: %+v", refusal)
+			}
+			assertNoReviewedWrites(t, linear)
+			final := readBound[BoundResult](t, cfg, "result.json")
+			if final.LinearWritesAttempted || final.BatchesAttempted != 0 || final.BatchesAcknowledged != 0 || final.CacheStatus != "not_saved" || final.Status != "failed_before_writes" || final.PlanSHA256 != "" || final.JobsSHA256 != "" || store.saved.SnykHashes != nil {
+				t.Fatal("refusal claimed writes or saved cache")
+			}
+			for _, name := range []string{"plan.json", "attempt.json"} {
+				if _, err := os.Stat(artifactPath(cfg, name)); !os.IsNotExist(err) {
+					t.Fatal("refusal bound execution")
+				}
+			}
+		})
+	}
+}
+
+func TestBoundRefusalRequiresValidEvidenceAndExclusiveArtifact(t *testing.T) {
+	for _, kind := range []string{"negative-summary", "wrong-summary", "missing-job", "collision", "symlink", "directory"} {
+		t.Run(kind, func(t *testing.T) {
+			cfg := boundCfg(t)
+			zero := int64(0)
+			cfg.MaxCreates = &zero
+			finding := planFixtureFinding("issue-a")
+			preview := planCfg()
+			preview.ReplaySafe = true
+			result, _, _ := runPlan(t, preview, planSnapshot(finding), nil, nil)
+			jobs := []job{{kind: jobCreateBatch, desiredBatch: []model.DesiredIssue{desiredIssue(cfg, finding)}}}
+			b, err := reserveBoundRun(cfg.PlanJSON)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer b.close()
+			refusalPath := artifactPath(cfg, "refusal.json")
+			switch kind {
+			case "negative-summary":
+				result.Plan.Summary.Creates = -1
+			case "wrong-summary":
+				result.Plan.Summary.Creates = 2
+			case "missing-job":
+				jobs = nil
+			case "collision":
+				if err := os.WriteFile(refusalPath, []byte("existing"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			case "symlink":
+				if err := os.Symlink("missing", refusalPath); err != nil {
+					t.Fatal(err)
+				}
+			case "directory":
+				if err := os.Chmod(boundDir(cfg), 0755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			err = b.bind(cfg, result.Plan, jobs)
+			if err == nil {
+				t.Fatal("invalid evidence bound")
+			}
+			if kind == "negative-summary" || kind == "wrong-summary" || kind == "missing-job" {
+				var limitErr *BoundLimitError
+				if errors.As(err, &limitErr) {
+					t.Fatal("malformed evidence misreported as limits")
+				}
+				if _, err := os.Stat(refusalPath); !os.IsNotExist(err) {
+					t.Fatal("malformed evidence emitted refusal")
+				}
+			} else if !strings.Contains(err.Error(), "persist bound refusal") {
+				t.Fatalf("artifact error hidden: %v", err)
+			}
+			if kind == "collision" {
+				data, _ := os.ReadFile(refusalPath)
+				if string(data) != "existing" {
+					t.Fatal("overwrote refusal")
+				}
+			}
+			for _, name := range []string{"plan.json", "attempt.json"} {
+				if _, err := os.Stat(artifactPath(cfg, name)); !os.IsNotExist(err) {
+					t.Fatal("failed refusal bound execution")
+				}
 			}
 		})
 	}

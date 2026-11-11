@@ -580,6 +580,19 @@ redirecting receipt writes. Artifact and payload tampering is checked before
 dispatch. The operator controls and protects the private parent against
 concurrent modification; receipts are local evidence, not signatures.
 
+A validated plan and matching buffered jobs that exceed any limit instead
+produce a private, exclusively created and fsynced `refusal.json` (at most
+4 KiB). Its version-1 schema contains status `limits_exceeded`, the four
+aggregate counts and configured maxima, and the exact nonempty `exceeded`
+category list in creates/updates/resolves/cancel_duplicates order. No source
+payloads, identifiers or hashes are included. The returned typed `BoundLimitError`
+also exposes these aggregates. Malformed plan/job evidence is rejected before
+emitting this diagnostic. Refusal persistence errors remain fatal. Rejection
+writes no plan or attempt, attempts no Linear mutations, and saves no sync
+hashes; the final result remains `failed_before_writes` with zero batches and
+`not_saved`. Refusal evidence neither authorizes execution nor allows directory
+reuse, and consumers must validate its schema and consistency with the result.
+
 Execution sends those same jobs sequentially through the existing no-retry
 guarded dispatch path. A partial or uncertain response, cancellation, or receipt
 verification failure stops subsequent jobs; no sync hashes are saved on an
@@ -605,7 +618,7 @@ Loader observation and cold-start metadata may already have changed, so callers
 must isolate the cache and publish only after successful exact readback. Callers
 also own source/executable provenance, freshness, single-writer exclusion and a
 durable attempt-one guard across paths. Retain the exact plan, hash-bound
-attempt and any final result privately for at most seven days, including on
+attempt, any refusal diagnostic and any final result privately for at most seven days, including on
 partial or uncertain failure, before cleanup removes job scratch; do not retain
 raw API logs or databases as receipt artifacts. Existing ordinary and
 independently reviewed-plan behavior is preserved, including strict

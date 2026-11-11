@@ -35,6 +35,30 @@ type BoundAttempt struct {
 	Batches             int    `json:"batches"`
 }
 
+// BoundRefusal records only validated aggregate intent, never an execution attempt.
+// It does not authorize execution or reuse of the reserved receipt directory.
+type BoundRefusal struct {
+	Version             int      `json:"version"`
+	Status              string   `json:"status"`
+	Creates             int64    `json:"creates"`
+	Updates             int64    `json:"updates"`
+	Resolves            int64    `json:"resolves"`
+	CancelDuplicates    int64    `json:"cancel_duplicates"`
+	MaxCreates          int64    `json:"max_creates"`
+	MaxUpdates          int64    `json:"max_updates"`
+	MaxResolves         int64    `json:"max_resolves"`
+	MaxCancelDuplicates int64    `json:"max_cancel_duplicates"`
+	Exceeded            []string `json:"exceeded"`
+}
+
+// BoundLimitError exposes aggregate diagnostics without source payloads.
+type BoundLimitError struct{ Refusal BoundRefusal }
+
+func (e *BoundLimitError) Error() string {
+	r := e.Refusal
+	return fmt.Sprintf("complete plan exceeds bounded execution limits: creates=%d/%d updates=%d/%d resolves=%d/%d cancel_duplicates=%d/%d exceeded=%v", r.Creates, r.MaxCreates, r.Updates, r.MaxUpdates, r.Resolves, r.MaxResolves, r.CancelDuplicates, r.MaxCancelDuplicates, r.Exceeded)
+}
+
 type BoundResult struct {
 	Version               int    `json:"version"`
 	Status                string `json:"status"`
@@ -209,12 +233,34 @@ func (b *boundRun) bind(cfg config.Config, plan *ReconciliationPlan, jobs []job)
 			return errors.New("bounded plan contains deferred creates")
 		}
 	}
-	// Each mutation kind has an independent explicit bound.
-	if s.Creates < 0 || s.Updates < 0 || s.Resolves < 0 || s.CancelDuplicates < 0 || s.Creates > *cfg.MaxCreates || s.Updates > *cfg.MaxUpdates || s.Resolves > *cfg.MaxResolves || s.CancelDuplicates > *cfg.MaxCancelDuplicates {
-		return errors.New("complete plan exceeds bounded execution limits")
-	}
+	// Validate buffered evidence before describing a refusal as a limit failure.
 	if err := validateBoundJobs(plan, jobs); err != nil {
 		return err
+	}
+	refusal := BoundRefusal{Version: 1, Status: "limits_exceeded", Creates: s.Creates, Updates: s.Updates, Resolves: s.Resolves, CancelDuplicates: s.CancelDuplicates, MaxCreates: *cfg.MaxCreates, MaxUpdates: *cfg.MaxUpdates, MaxResolves: *cfg.MaxResolves, MaxCancelDuplicates: *cfg.MaxCancelDuplicates}
+	// Each mutation kind has an independent explicit bound; never truncate jobs.
+	for _, limit := range []struct {
+		name       string
+		count, max int64
+	}{
+		{"creates", refusal.Creates, refusal.MaxCreates},
+		{"updates", refusal.Updates, refusal.MaxUpdates},
+		{"resolves", refusal.Resolves, refusal.MaxResolves},
+		{"cancel_duplicates", refusal.CancelDuplicates, refusal.MaxCancelDuplicates},
+	} {
+		if limit.count < 0 || limit.max < 0 {
+			return errors.New("invalid bounded execution counts or limits")
+		}
+		if limit.count > limit.max {
+			refusal.Exceeded = append(refusal.Exceeded, limit.name)
+		}
+	}
+	if len(refusal.Exceeded) != 0 {
+		limitErr := &BoundLimitError{Refusal: refusal}
+		if _, err := b.write("refusal.json", refusal); err != nil {
+			return errors.Join(limitErr, fmt.Errorf("persist bound refusal: %w", err))
+		}
+		return limitErr
 	}
 	digest, err := boundJobsDigest(jobs)
 	if err != nil {
