@@ -639,6 +639,11 @@ policy or cache-publication requirements.
 
 ### Bounded drain protocol primitives
 
+[The offline interchange contract](docs/BOUNDED_DRAIN_SCHEMA.md) specifies
+producer/consumer bytes, evidence semantics and initialization receipts. Runtime
+provenance, membership proof and auxiliary-effect accounting remain separate
+integration gates.
+
 The drain protocol uses a separate `<managed-schema>+drain-v1` cache signature
 and the `bounded_drain_pending` and `bounded_drain_hash_evidence` metadata rows.
 Both rows, the signature, and both hash tables are committed in one SQLite
@@ -656,9 +661,13 @@ budget is at most 100 and independent per-kind ceilings still apply. Selected
 jobs are rebuilt in stable batches of at most ten and revalidated.
 
 Deferred and unverified operations retain their first pending generation and
-withhold every affected fingerprint. Three consecutive unverified generations
-refuse further progress. Disappeared work is removed, so genuinely new work gets
-a new age. Verification uses freshly read issue IDs and desired managed fields;
+withhold every affected fingerprint. Three selected-but-unverified generations
+while work remains pending
+refuse further progress; intervening deferrals preserve the counter. Missing
+restored work refuses rather than silently resetting its age. A create-to-issue
+handoff preserves age and the unverified counter; unrelated issue targets do
+not inherit ownership through shared fingerprints. Verification uses freshly
+read issue IDs and desired managed fields;
 create acknowledgements preserve those IDs even on partial errors. An unchanged
 retained terminal copy is allowed when the newly created ticket is canonical.
 

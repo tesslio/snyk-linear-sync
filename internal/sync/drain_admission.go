@@ -10,6 +10,19 @@ import (
 	"github.com/tesslio/snyk-linear-sync/internal/cache"
 )
 
+// Run IDs are opaque decimal strings, never floating-point JSON numbers.
+func drainValidRunID(value string) bool {
+	if len(value) == 0 || len(value) > 20 || value[0] < '1' || value[0] > '9' {
+		return false
+	}
+	for _, c := range value {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 func drainSHA256(value string) bool {
 	if len(value) != 64 {
 		return false
@@ -26,7 +39,7 @@ func drainValidWorkKey(key string) bool {
 	if after, ok := strings.CutPrefix(key, "create:"); ok {
 		return drainSHA256(after)
 	}
-	if !strings.HasPrefix(key, "issue:") || len(key) <= len("issue:") || len(key) > drainFingerprintByteCeiling {
+	if !strings.HasPrefix(key, "issue:") || len(key) <= len("issue:") || len(key) > len("issue:")+64 {
 		return false
 	}
 	for _, c := range strings.TrimPrefix(key, "issue:") {
@@ -85,14 +98,14 @@ func validateDrainSnapshot(snapshot cache.Snapshot) (DrainPending, DrainHashEvid
 	if err := decodeCanonicalDrain(snapshot.BoundedDrainHashEvidence, &evidence); err != nil {
 		return invalid()
 	}
-	if pending.Version != drainVersion || evidence.Version != drainVersion || pending.Generation < 0 || pending.Generation != evidence.Generation || pending.Entries == nil || evidence.Refreshed == nil || evidence.PreWrite == nil || evidence.Withheld == nil || snapshot.LinearHashes == nil {
+	if pending.Version != drainVersion || evidence.Version != drainVersion || pending.Generation < 0 || pending.Generation >= 1<<53 || pending.Generation != evidence.Generation || pending.Entries == nil || evidence.Refreshed == nil || evidence.PreWrite == nil || evidence.Withheld == nil || snapshot.LinearHashes == nil {
 		return invalid()
 	}
-	if strings.TrimSpace(evidence.ProducerRunID) == "" || evidence.ProducerRunAttempt < 1 || len(evidence.Refreshed) == 0 || len(evidence.Refreshed) > drainEvidenceEntryCeiling || len(evidence.PreWrite) > drainEvidenceEntryCeiling || len(pending.Entries) > drainEvidenceEntryCeiling {
+	if !drainValidRunID(evidence.ProducerRunID) || evidence.ProducerRunAttempt < 1 || evidence.ProducerRunAttempt >= 1<<53 || len(evidence.Refreshed) == 0 || len(evidence.Refreshed) > drainEvidenceEntryCeiling || len(evidence.PreWrite) > drainEvidenceEntryCeiling || len(pending.Entries) > drainEvidenceEntryCeiling {
 		return invalid()
 	}
 	for key, entry := range pending.Entries {
-		if !drainValidWorkKey(key) || entry.SinceGeneration < 1 || entry.SinceGeneration > pending.Generation || entry.UnverifiedGenerations < 0 || len(entry.FingerprintSHA256s) == 0 || !drainSortedUnique(entry.FingerprintSHA256s) {
+		if !drainValidWorkKey(key) || entry.SinceGeneration < 1 || entry.SinceGeneration > pending.Generation || entry.UnverifiedGenerations < 0 || entry.UnverifiedGenerations >= 1<<53 || len(entry.FingerprintSHA256s) == 0 || !drainSortedUnique(entry.FingerprintSHA256s) {
 			return invalid()
 		}
 		for _, hash := range entry.FingerprintSHA256s {
@@ -179,7 +192,7 @@ func validateDrainSnapshot(snapshot cache.Snapshot) (DrainPending, DrainHashEvid
 			}
 		}
 		init := evidence.Initialization
-		if strings.TrimSpace(init.SourceCacheKey) == "" || !drainSHA256(init.SourceCacheSHA256) || strings.TrimSpace(init.V2ProducerRunID) == "" || strings.TrimSpace(init.AuthorizingRunID) == "" {
+		if strings.TrimSpace(init.SourceCacheKey) == "" || !drainSHA256(init.SourceCacheSHA256) || !drainValidRunID(init.V2ProducerRunID) || !drainValidRunID(init.AuthorizingRunID) || init.AuthorizingRunID != evidence.ProducerRunID || strings.Contains(init.SourceCacheKey, "-v3-drain-") {
 			return invalid()
 		}
 		if len(evidence.PreWrite) != len(evidence.Refreshed) {

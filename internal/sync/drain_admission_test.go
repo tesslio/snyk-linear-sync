@@ -11,9 +11,9 @@ import (
 func admissionFixture(generation int64) (DrainPending, DrainHashEvidence, cache.Snapshot) {
 	hash := strings.Repeat("a", 64)
 	p := DrainPending{Version: 1, Generation: generation, Entries: map[string]DrainPendingEntry{}}
-	e := DrainHashEvidence{Version: 1, Generation: generation, ProducerRunID: "run-a", ProducerRunAttempt: 1, Refreshed: map[string]string{"finding-a": hash}, PreWrite: map[string]string{"finding-a": hash}, Withheld: map[string]DrainWithheld{}}
+	e := DrainHashEvidence{Version: 1, Generation: generation, ProducerRunID: "101", ProducerRunAttempt: 1, Refreshed: map[string]string{"finding-a": hash}, PreWrite: map[string]string{"finding-a": hash}, Withheld: map[string]DrainWithheld{}}
 	if generation == 0 {
-		e.Initialization = &DrainInitialization{"cache-a", hash, "run-b", "run-a"}
+		e.Initialization = &DrainInitialization{"cache-a", hash, "100", "101"}
 	} else {
 		e.FullPlanSHA256 = hash
 		e.SelectedOpsSHA256 = hash

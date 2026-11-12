@@ -53,7 +53,7 @@ func TestDrainNormalUpdatesSurviveSQLiteGenerations(t *testing.T) {
 	}
 	pending := drainEmptyPending()
 	pre := drainPreWriteHashes(current, nil)
-	initialEvidence := DrainHashEvidence{Version: drainVersion, Generation: 0, ProducerRunID: "init-run", ProducerRunAttempt: 1, Refreshed: maps.Clone(pre), PreWrite: maps.Clone(pre), Withheld: map[string]DrainWithheld{}, Initialization: &DrainInitialization{SourceCacheKey: "source-cache", SourceCacheSHA256: planTextDigest("source-cache-bytes"), V2ProducerRunID: "source-run", AuthorizingRunID: "init-run"}}
+	initialEvidence := DrainHashEvidence{Version: drainVersion, Generation: 0, ProducerRunID: "101", ProducerRunAttempt: 1, Refreshed: maps.Clone(pre), PreWrite: maps.Clone(pre), Withheld: map[string]DrainWithheld{}, Initialization: &DrainInitialization{SourceCacheKey: "source-cache", SourceCacheSHA256: planTextDigest("source-cache-bytes"), V2ProducerRunID: "100", AuthorizingRunID: "101"}}
 	initial := cache.Snapshot{SchemaSignature: managedSchemaSignature() + "+drain-v1", SnykHashes: initialSource, LinearHashes: pre, BoundedDrainPending: encode(pending), BoundedDrainHashEvidence: encode(initialEvidence)}
 	if _, _, err := validateDrainSnapshot(initial); err != nil {
 		t.Fatal(err)
@@ -170,7 +170,7 @@ func TestDrainNormalUpdatesSurviveSQLiteGenerations(t *testing.T) {
 			t.Fatal("incorrect withheld partition")
 		}
 		evidence.Generation = generation
-		evidence.ProducerRunID = fmt.Sprintf("run-%d", generation)
+		evidence.ProducerRunID = fmt.Sprint(101 + generation)
 		evidence.ProducerRunAttempt = 1
 		evidence.FullPlanSHA256 = digest(plan)
 		evidence.SelectedOpsSHA256 = digest(selection.selected)

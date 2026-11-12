@@ -826,6 +826,10 @@ without stranding blocked queue sends or publishing its cache.
 
 ### Bounded drain development
 
+See the [offline interchange contract](docs/BOUNDED_DRAIN_SCHEMA.md) for the
+retained full plan, canonical receipt bytes, initialization types and evidence
+sets. It is an offline compatibility contract, not an enabled execution route.
+
 The separate drain protocol primitives support deterministic whole-group
 selection of at most 100 total issue mutations, persistent pending ages, fresh
 ID-based effect verification, and atomic hash evidence. They are not yet wired
@@ -841,3 +845,8 @@ resolves and duplicate cancellations. It does not mean 100 API mutations:
 subscription cleanup and optional comments are additional effects. Runtime
 integration also requires evidence for changed same-fingerprint membership,
 which a matched issue's unchanged hash cannot detect by itself.
+
+Pending ages and unverified counters survive deferral. Missing restored work
+refuses rather than silently resetting its age; only a create-to-issue handoff
+can transfer ownership through a fingerprint. Three unverified selections while
+work remains pending stop further progress, even with intervening deferrals.

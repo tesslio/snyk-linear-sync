@@ -193,23 +193,14 @@ func TestDrainRepeatedUnverifiedRetainsAgeAndStalls(t *testing.T) {
 		t.Fatal(err)
 	}
 }
-func TestDrainDisappearedWorkDoesNotRetainAge(t *testing.T) {
+func TestDrainDisappearedWorkRefuses(t *testing.T) {
 	p, j := drainFixture(t, 1)
 	prior := drainEmptyPending()
 	prior.Generation = 8
 	prior.Entries["issue:gone"] = DrainPendingEntry{1, []string{strings.Repeat("a", 64)}, 2}
-	selected, err := selectDrain(p, j, prior, drainDefaultLimits(), nil, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	after := finishDrainPending(selected, prior, map[string]bool{})
-	if _, ok := after.Entries["issue:gone"]; ok {
-		t.Fatal("disappeared work retained")
-	}
-	for _, entry := range after.Entries {
-		if entry.SinceGeneration != 9 {
-			t.Fatal(entry)
-		}
+	_, err := selectDrain(p, j, prior, drainDefaultLimits(), nil, nil)
+	if err == nil || err.Error() != "drain-pending-lost" {
+		t.Fatalf("disappeared work must refuse: %v", err)
 	}
 }
 
@@ -285,5 +276,168 @@ func TestDrainEvidenceBoundIncludesPendingBytesOutsideKnownFingerprints(t *testi
 	}
 	if _, err := drainEvidenceBound(nil, nil, operations); err == nil {
 		t.Fatal("oversized pending row omitted from preflight")
+	}
+}
+
+func TestDrainCreateToIssueInheritsAgeAndCumulativeCounter(t *testing.T) {
+	for _, deferred := range []bool{false, true} {
+		t.Run(fmt.Sprintf("deferred=%v", deferred), func(t *testing.T) {
+			p, jobs := drainFixture(t, 3)
+			key := "issue:" + p.Records[1].IssueID
+			fp := p.Records[1].FingerprintSHA256
+			oldFingerprint := "snyk:project-old:issue-a:location"
+			oldFP := planTextDigest(oldFingerprint)
+			jobs[1].updateBatch[0].Existing.Fingerprint = oldFingerprint
+			p.Records[1].PreviousFingerprintSHA256 = oldFP
+			p.DecisionsSHA256, _ = planDigest(p.Records)
+			aliases := []string{fp, oldFP}
+			slices.Sort(aliases)
+			before := drainEmptyPending()
+			before.Generation = 8
+			before.Entries[key] = DrainPendingEntry{4, aliases, 1}
+			before.Entries["create:"+fp] = DrainPendingEntry{2, []string{fp}, 2}
+			before.Entries["create:"+oldFP] = DrainPendingEntry{3, []string{oldFP}, 1}
+			limits := drainDefaultLimits()
+			limits.MaxIssueChanges = 1
+			if deferred {
+				// Earlier independent work consumes the one-operation budget.
+				before.Entries["issue:"+p.Records[2].IssueID] = DrainPendingEntry{1, []string{p.Records[2].FingerprintSHA256}, 0}
+			}
+			selection, err := selectDrain(p, jobs, before, limits, nil, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if (selection.selected[0].WorkKey == key) == deferred {
+				t.Fatalf("inherited age did not control selection: %+v", selection.selected)
+			}
+			after := finishDrainPending(selection, before, nil)
+			entry := after.Entries[key]
+			wantCount := 3
+			if deferred {
+				wantCount = 2
+			}
+			if entry.SinceGeneration != 2 || entry.UnverifiedGenerations != wantCount || !slices.Equal(entry.FingerprintSHA256s, aliases) {
+				t.Fatalf("continuity lost: %+v", entry)
+			}
+			if _, retained := after.Entries["create:"+fp]; retained {
+				t.Fatal("transferred create retained under its old key")
+			}
+			verified := finishDrainPending(selection, before, map[string]bool{key: true})
+			_, remains := verified.Entries[key]
+			if remains != deferred {
+				t.Fatal("verification removed deferred work or retained selected work")
+			}
+			if !deferred {
+				_, err = selectDrain(p, jobs, after, drainDefaultLimits(), nil, nil)
+				if err == nil || err.Error() != "drain-stalled-effect" {
+					t.Fatalf("transferred counter failed to stall: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestDrainPendingAliasesCannotDischargeOtherIssue(t *testing.T) {
+	for _, test := range []string{"missing-issue", "narrowed-issue", "missing-create"} {
+		t.Run(test, func(t *testing.T) {
+			p, jobs := drainFixture(t, 3)
+			before := drainEmptyPending()
+			before.Generation = 5
+			shared := p.Records[2].FingerprintSHA256
+			switch test {
+			case "missing-issue":
+				before.Entries["issue:gone"] = DrainPendingEntry{1, []string{shared}, 1}
+			case "narrowed-issue":
+				// Another issue still covers the lost alias, but is not its owner.
+				before.Entries["issue:"+p.Records[1].IssueID] = DrainPendingEntry{1, []string{p.Records[1].FingerprintSHA256, shared}, 1}
+			case "missing-create":
+				missing := planTextDigest("snyk:project-missing:issue-missing")
+				before.Entries["create:"+missing] = DrainPendingEntry{1, []string{missing}, 1}
+			}
+			_, err := selectDrain(p, jobs, before, drainDefaultLimits(), nil, nil)
+			if err == nil || err.Error() != "drain-pending-lost" {
+				t.Fatalf("lost ownership accepted: %v", err)
+			}
+		})
+	}
+}
+
+func TestDrainSharedIssueAliasDoesNotInheritOwnership(t *testing.T) {
+	p, jobs := drainFixture(t, 3)
+	jobs[1].updateBatch[0].Existing.Fingerprint = jobs[2].updateBatch[0].Desired.Fingerprint
+	p.Records[1].PreviousFingerprintSHA256 = p.Records[2].FingerprintSHA256
+	p.DecisionsSHA256, _ = planDigest(p.Records)
+	before := drainEmptyPending()
+	before.Generation = 5
+	before.Entries["issue:"+p.Records[2].IssueID] = DrainPendingEntry{1, []string{p.Records[2].FingerprintSHA256}, 2}
+	selection, err := selectDrain(p, jobs, before, drainDefaultLimits(), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	after := finishDrainPending(selection, before, nil)
+	entry := after.Entries["issue:"+p.Records[1].IssueID]
+	if entry.SinceGeneration != 6 || entry.UnverifiedGenerations != 1 {
+		t.Fatalf("unrelated issue ownership inherited: %+v", entry)
+	}
+}
+
+func TestDrainStalledWorkRefusesBeforeSelection(t *testing.T) {
+	for _, keyKind := range []string{"issue", "create", "missing"} {
+		t.Run(keyKind, func(t *testing.T) {
+			p, jobs := drainFixture(t, 3)
+			before := drainEmptyPending()
+			before.Generation = 5
+			before.Entries["issue:"+p.Records[2].IssueID] = DrainPendingEntry{1, []string{p.Records[2].FingerprintSHA256}, 0}
+			key := "issue:" + p.Records[1].IssueID
+			if keyKind == "create" {
+				key = "create:" + p.Records[1].FingerprintSHA256
+			} else if keyKind == "missing" {
+				key = "issue:gone"
+			}
+			before.Entries[key] = DrainPendingEntry{2, []string{p.Records[1].FingerprintSHA256}, 3}
+			limits := drainDefaultLimits()
+			limits.MaxIssueChanges = 1
+			_, err := selectDrain(p, jobs, before, limits, nil, nil)
+			if err == nil || err.Error() != "drain-stalled-effect" {
+				t.Fatalf("stalled pending work accepted: %v", err)
+			}
+		})
+	}
+}
+
+func TestDrainCreateToNewIssueRetainsPendingHistory(t *testing.T) {
+	p, jobs := drainFixture(t, 2)
+	before := drainEmptyPending()
+	before.Generation = 8
+	fp := p.Records[1].FingerprintSHA256
+	before.Entries["create:"+fp] = DrainPendingEntry{2, []string{fp}, 2}
+	limits := drainDefaultLimits()
+	limits.MaxIssueChanges = 1
+	selection, err := selectDrain(p, jobs, before, limits, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := "issue:" + p.Records[1].IssueID
+	if selection.selected[0].WorkKey != key {
+		t.Fatal("create history was not transferred to new issue")
+	}
+	after := finishDrainPending(selection, before, nil)
+	if entry := after.Entries[key]; entry.SinceGeneration != 2 || entry.UnverifiedGenerations != 3 {
+		t.Fatalf("create history lost: %+v", entry)
+	}
+}
+
+func TestDrainInheritedPendingUsesMaxNotSum(t *testing.T) {
+	a, b := planTextDigest("alias-a"), planTextDigest("alias-b")
+	for _, counts := range [][3]int{{2, 1, 0}, {0, 2, 1}, {1, 0, 2}, {1, 1, 1}} {
+		before := DrainPending{Version: drainVersion, Generation: 8, Entries: map[string]DrainPendingEntry{
+			"issue:one":   {4, []string{a, b}, counts[0]},
+			"create:" + a: {2, []string{a}, counts[1]},
+			"create:" + b: {3, []string{b}, counts[2]},
+		}}
+		entry := drainInheritedPending(DrainOperation{"issue:one", "update", []string{a, b}}, before)
+		if entry.SinceGeneration != 2 || entry.UnverifiedGenerations != max(counts[0], counts[1], counts[2]) {
+			t.Fatalf("incorrect merge for %v: %+v", counts, entry)
+		}
 	}
 }

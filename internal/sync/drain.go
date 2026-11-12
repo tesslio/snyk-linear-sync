@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"strings"
 
 	"github.com/tesslio/snyk-linear-sync/internal/model"
 )
@@ -61,11 +62,30 @@ func drainWorkKey(kind jobKind, desired model.DesiredIssue, existing model.Exist
 	return "issue:" + existing.ID
 }
 
+// drainInheritedPending carries only this issue's ownership and prior creates
+// for its fingerprints. Sharing a fingerprint never transfers another issue's
+// pending work. Several create aliases can converge on one issue after rebind.
+func drainInheritedPending(op DrainOperation, before DrainPending) DrainPendingEntry {
+	entry := DrainPendingEntry{SinceGeneration: before.Generation + 1, FingerprintSHA256s: slices.Clone(op.FingerprintSHA256s)}
+	inherit := func(key string) {
+		if prior, ok := before.Entries[key]; ok {
+			entry.SinceGeneration = min(entry.SinceGeneration, prior.SinceGeneration)
+			entry.UnverifiedGenerations = max(entry.UnverifiedGenerations, prior.UnverifiedGenerations)
+		}
+	}
+	inherit(op.WorkKey)
+	for _, fingerprint := range op.FingerprintSHA256s {
+		inherit("create:" + fingerprint)
+	}
+	return entry
+}
+
 // selectDrain requires full-plan validation first, then partitions whole causal
 // components. Neither fingerprint aliases nor source ordering can split a group.
 func selectDrain(plan *ReconciliationPlan, jobs []job, before DrainPending, limits DrainLimits, findings []model.Finding, canonical map[string]model.ExistingIssue) (drainSelection, error) {
 	out := drainSelection{selected: []DrainOperation{}, deferred: []DrainOperation{}, pending: DrainPending{Version: drainVersion, Generation: before.Generation + 1, Entries: map[string]DrainPendingEntry{}}}
-	if err := validateReviewedPlan(plan); err != nil {
+	operations, err := drainPlanOperations(plan)
+	if err != nil {
 		return out, err
 	}
 	if err := validateBoundJobs(plan, jobs); err != nil {
@@ -73,6 +93,22 @@ func selectDrain(plan *ReconciliationPlan, jobs []job, before DrainPending, limi
 	}
 	if before.Version != drainVersion || before.Generation < 0 {
 		return out, errors.New("drain-pending-invalid")
+	}
+	// Check every previous entry before selection, including work that may no
+	// longer appear in the plan. A replan is not evidence of a verified effect.
+	for key, prior := range before.Entries {
+		if prior.SinceGeneration < 1 || prior.SinceGeneration > before.Generation || prior.UnverifiedGenerations < 0 || len(prior.FingerprintSHA256s) == 0 {
+			return out, errors.New("drain-pending-invalid")
+		}
+		if !strings.HasPrefix(key, "issue:") && !strings.HasPrefix(key, "create:") {
+			return out, errors.New("drain-pending-invalid")
+		}
+		if strings.HasPrefix(key, "create:") && (len(prior.FingerprintSHA256s) != 1 || key != "create:"+prior.FingerprintSHA256s[0]) {
+			return out, errors.New("drain-pending-invalid")
+		}
+		if prior.UnverifiedGenerations >= 3 {
+			return out, errors.New("drain-stalled-effect")
+		}
 	}
 	ceilings := map[string]int64{"create": limits.MaxCreates, "update": limits.MaxUpdates, "resolve": limits.MaxResolves, "cancel-duplicate": limits.MaxCancelDuplicates}
 	if limits.MaxIssueChanges < 1 || limits.MaxIssueChanges > 100 {
@@ -97,17 +133,9 @@ func selectDrain(plan *ReconciliationPlan, jobs []job, before DrainPending, limi
 			hashes = append(hashes, planTextDigest(e.Fingerprint))
 			slices.Sort(hashes)
 		}
-		age := out.pending.Generation
-		if prior, ok := before.Entries[key]; ok {
-			if prior.SinceGeneration < 1 || prior.SinceGeneration > before.Generation || prior.UnverifiedGenerations < 0 {
-				return errors.New("drain-pending-invalid")
-			}
-			if prior.UnverifiedGenerations >= 3 {
-				return errors.New("drain-stalled-effect")
-			}
-			age = prior.SinceGeneration
-		}
-		work[key] = drainWork{DrainOperation{key, string(kind), hashes}, d, e, u, age}
+		op := DrainOperation{key, string(kind), hashes}
+		prior := drainInheritedPending(op, before)
+		work[key] = drainWork{op, d, e, u, prior.SinceGeneration}
 		return nil
 	}
 	for _, j := range jobs {
@@ -119,6 +147,38 @@ func selectDrain(plan *ReconciliationPlan, jobs []job, before DrainPending, limi
 		for _, u := range j.updateBatch {
 			if err := add(j.kind, u.Desired, u.Existing, u); err != nil {
 				return out, err
+			}
+		}
+	}
+	for _, op := range operations {
+		w, ok := work[op.WorkKey]
+		if !ok || w.op.Kind != op.Kind || !slices.Equal(w.op.FingerprintSHA256s, op.FingerprintSHA256s) {
+			return out, errors.New("drain-plan-operation-mismatch")
+		}
+	}
+	// Issue ownership cannot migrate by fingerprint. Every old alias must
+	// still be covered by that same issue operation. Creates may become issue
+	// operations, but cannot vanish just because planning now sees a ticket.
+	coveredCreates := map[string]bool{}
+	for _, w := range work {
+		for _, fingerprint := range w.op.FingerprintSHA256s {
+			coveredCreates["create:"+fingerprint] = true
+		}
+	}
+	for key, prior := range before.Entries {
+		if strings.HasPrefix(key, "create:") {
+			if !coveredCreates[key] {
+				return out, errors.New("drain-pending-lost")
+			}
+			continue
+		}
+		w, ok := work[key]
+		if !ok {
+			return out, errors.New("drain-pending-lost")
+		}
+		for _, fingerprint := range prior.FingerprintSHA256s {
+			if !slices.Contains(w.op.FingerprintSHA256s, fingerprint) {
+				return out, errors.New("drain-pending-lost")
 			}
 		}
 	}
@@ -251,8 +311,7 @@ func selectDrain(plan *ReconciliationPlan, jobs []job, before DrainPending, limi
 			out.selected = append(out.selected, w.op)
 		} else {
 			out.deferred = append(out.deferred, w.op)
-			old := before.Entries[k]
-			out.pending.Entries[k] = DrainPendingEntry{w.age, w.op.FingerprintSHA256s, old.UnverifiedGenerations}
+			out.pending.Entries[k] = drainInheritedPending(w.op, before)
 		}
 	}
 	// Stable action order and sorted targets; batches are always at most ten.
@@ -302,8 +361,8 @@ func selectDrain(plan *ReconciliationPlan, jobs []job, before DrainPending, limi
 }
 
 // finishDrainPending keeps deferred ages unchanged and advances only the stall
-// counter of selected work whose fresh effect did not verify. A later clean
-// replan may legitimately remove work that no longer exists.
+// cumulative counter of selected work whose fresh effect did not verify.
+// Only fresh verification removes work; replanning alone cannot discharge it.
 func finishDrainPending(selection drainSelection, before DrainPending, verified map[string]bool) DrainPending {
 	after := selection.pending
 	entries := make(map[string]DrainPendingEntry, len(after.Entries)+len(selection.selected))
@@ -313,12 +372,9 @@ func finishDrainPending(selection drainSelection, before DrainPending, verified 
 		if verified[op.WorkKey] {
 			continue
 		}
-		prior, existed := before.Entries[op.WorkKey]
-		since := after.Generation
-		if existed {
-			since = prior.SinceGeneration
-		}
-		after.Entries[op.WorkKey] = DrainPendingEntry{SinceGeneration: since, FingerprintSHA256s: slices.Clone(op.FingerprintSHA256s), UnverifiedGenerations: prior.UnverifiedGenerations + 1}
+		entry := drainInheritedPending(op, before)
+		entry.UnverifiedGenerations++
+		after.Entries[op.WorkKey] = entry
 	}
 	return after
 }

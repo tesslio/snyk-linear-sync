@@ -73,3 +73,37 @@ type DrainResult struct {
 	Created               map[string]string      `json:"created"`
 	AuxiliaryComments     DrainAuxiliaryComments `json:"auxiliary_comments"`
 }
+
+// Initialization is a separate receipt variant. It never invents an execution
+// plan, jobs digest, restored generation, or null placeholders for those fields.
+type DrainInitializationAttempt struct {
+	Version            int                 `json:"version"`
+	Kind               string              `json:"kind"`
+	Status             string              `json:"status"`
+	StartedAt          string              `json:"started_at"`
+	ProducerRunID      string              `json:"producer_run_id"`
+	ProducerRunAttempt int64               `json:"producer_run_attempt"`
+	Generation         int64               `json:"generation"`
+	Initialization     DrainInitialization `json:"initialization"`
+}
+type DrainInitializationResult struct {
+	Version                     int         `json:"version"`
+	Kind                        string      `json:"kind"`
+	Status                      string      `json:"status"`
+	FinishedAt                  string      `json:"finished_at"`
+	ProducerRunID               string      `json:"producer_run_id"`
+	ProducerRunAttempt          int64       `json:"producer_run_attempt"`
+	Generation                  int64       `json:"generation"`
+	InitializationAttemptSHA256 string      `json:"initialization_attempt_sha256"`
+	PendingAfterSHA256          string      `json:"pending_after_sha256"`
+	HashEvidenceSHA256          string      `json:"hash_evidence_sha256"`
+	CacheStatus                 string      `json:"cache_status"`
+	LinearWritesAttempted       bool        `json:"linear_writes_attempted"`
+	Refreshed                   DrainKeySet `json:"refreshed"`
+	Withheld                    DrainKeySet `json:"withheld"`
+	Saved                       DrainKeySet `json:"saved"`
+	Arrivals                    DrainKeySet `json:"arrivals"`
+}
+
+const drainReceiptByteCeiling = 32 << 20
+const drainPlanByteCeiling = 128 << 20
