@@ -63,6 +63,9 @@ type Snapshot struct {
 	SchemaSignature string
 	SnykHashes      map[string]string
 	LinearHashes    map[string]string
+	// The protocol layer validates canonical shape and receipt bindings.
+	BoundedDrainPending      json.RawMessage
+	BoundedDrainHashEvidence json.RawMessage
 }
 
 type Store struct {
@@ -106,9 +109,9 @@ func (s *Store) Load(ctx context.Context) (Snapshot, error) {
 	}
 
 	query, args, err := s.builder.
-		Select("value").
+		Select("key", "value").
 		From("sync_meta").
-		Where(sq.Eq{"key": "schema_signature"}).
+		Where(sq.Eq{"key": []string{"schema_signature", "bounded_drain_pending", "bounded_drain_hash_evidence"}}).
 		ToSql()
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("build cache schema signature query: %w", err)
@@ -119,13 +122,29 @@ func (s *Store) Load(ctx context.Context) (Snapshot, error) {
 		return Snapshot{}, fmt.Errorf("load cache schema signature: %w", err)
 	}
 	for rows.Next() {
-		if err := rows.Scan(&snapshot.SchemaSignature); err != nil {
+		var key, value string
+		if err := rows.Scan(&key, &value); err != nil {
 			_ = rows.Close()
 			return Snapshot{}, fmt.Errorf("scan cache schema signature: %w", err)
 		}
+		switch key {
+		case "schema_signature":
+			snapshot.SchemaSignature = value
+		case "bounded_drain_pending":
+			snapshot.BoundedDrainPending = json.RawMessage(value)
+		case "bounded_drain_hash_evidence":
+			snapshot.BoundedDrainHashEvidence = json.RawMessage(value)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return Snapshot{}, fmt.Errorf("read cache metadata: %w", err)
 	}
 	if err := rows.Close(); err != nil {
 		return Snapshot{}, fmt.Errorf("close cache schema signature rows: %w", err)
+	}
+	if err := validateDrainMetadata(snapshot); err != nil {
+		return Snapshot{}, err
 	}
 
 	query, args, err = s.builder.
@@ -181,13 +200,52 @@ func (s *Store) Load(ctx context.Context) (Snapshot, error) {
 	return snapshot, nil
 }
 
+func validateDrainMetadata(snapshot Snapshot) error {
+	drain := strings.HasSuffix(snapshot.SchemaSignature, "+drain-v1")
+	pending := snapshot.BoundedDrainPending != nil
+	evidence := snapshot.BoundedDrainHashEvidence != nil
+	if drain != pending || drain != evidence {
+		return errors.New("drain cache signature and evidence rows must be present together")
+	}
+	if drain && (!json.Valid(snapshot.BoundedDrainPending) || !json.Valid(snapshot.BoundedDrainHashEvidence)) {
+		return errors.New("drain cache metadata must contain valid JSON")
+	}
+	return nil
+}
+
 func (s *Store) Save(ctx context.Context, snapshot Snapshot) error {
+	if err := validateDrainMetadata(snapshot); err != nil {
+		return err
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin cache transaction: %w", err)
 	}
 	// Rollback also runs on shadowed error paths; after Commit it is a no-op.
 	defer func() { _ = tx.Rollback() }()
+
+	// A damaged drain generation must not silently become a legacy cache.
+	// Keep this fence in the same transaction as the replacement hashes.
+	if !strings.HasSuffix(snapshot.SchemaSignature, "+drain-v1") {
+		var count int
+		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM sync_meta WHERE key IN ('bounded_drain_pending', 'bounded_drain_hash_evidence') OR (key = 'schema_signature' AND value LIKE '%+drain-v1')`).Scan(&count); err != nil {
+			return fmt.Errorf("check drain cache fence: %w", err)
+		}
+		if count != 0 {
+			return errors.New("refusing to overwrite drain cache with a legacy snapshot")
+		}
+	}
+	for key, value := range map[string]json.RawMessage{
+		"bounded_drain_pending":       snapshot.BoundedDrainPending,
+		"bounded_drain_hash_evidence": snapshot.BoundedDrainHashEvidence,
+	} {
+		if value == nil {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO sync_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`, key, string(value)); err != nil {
+			return fmt.Errorf("save drain cache metadata: %w", err)
+		}
+	}
 
 	query, args, err := s.builder.
 		Insert("sync_meta").

@@ -814,3 +814,27 @@ any buffered jobs. The result receipt retains the existing failed-before-writes
 status. Omitting this option preserves existing manual bounded behavior. The
 option does not change the settings digest, count limits, job binding, retry
 policy or cache-publication requirements.
+
+### Create response safety
+
+Create requests are never automatically repeated after a transport or partial
+GraphQL failure. Acknowledged issue IDs survive partial responses so callers can
+inspect what landed. Guarded execution stops on every partial or uncertain
+outcome; ordinary execution retries only explicitly rejected aliases from a
+complete error-free response, once.
+
+### Bounded drain development
+
+The separate drain protocol primitives support deterministic whole-group
+selection of at most 100 total issue mutations, persistent pending ages, fresh
+ID-based effect verification, and atomic hash evidence. They are not yet wired
+to an execution flag. Existing bounded mode still refuses an oversized complete
+plan; this change alone does not activate incremental draining. Drain caches
+use a separate signature and cannot be overwritten by this version's legacy
+cache writer. Consumer provenance checks and namespace fences remain required.
+
+The proposed 100-operation cap counts creates, updates (including reopens),
+resolves and duplicate cancellations. It does not mean 100 API mutations:
+subscription cleanup and optional comments are additional effects. Runtime
+integration also requires evidence for changed same-fingerprint membership,
+which a matched issue's unchanged hash cannot detect by itself.

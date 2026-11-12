@@ -29,11 +29,9 @@ type SnykClient interface {
 
 type LinearClient interface {
 	LoadSnapshot(ctx context.Context) ([]model.ExistingIssue, error)
-	// CreateIssues returns the indices (into desired) of items whose alias
-	// failed, so the caller retries only those instead of the whole batch.
-	// A non-nil error means no per-alias data is available (e.g. a
-	// transport failure) and every item must be retried individually.
-	CreateIssues(ctx context.Context, desired []model.DesiredIssue) ([]int, error)
+	// CreateIssues preserves acknowledged IDs even on a partial/uncertain error.
+	// Only a nil error permits retrying explicitly unacknowledged aliases.
+	CreateIssues(ctx context.Context, desired []model.DesiredIssue) ([]model.CreateOutcome, error)
 	UpdateIssues(ctx context.Context, updates []model.IssueUpdate) error
 	// PostComments returns the indices (into updates) whose comment failed
 	// to post, so the caller retries only those instead of the whole batch.
@@ -1091,7 +1089,9 @@ func (s *Service) executeReviewedJob(ctx context.Context, j job) error {
 	}
 	switch j.kind {
 	case jobCreateBatch:
-		failed, err := s.linear.CreateIssues(ctx, j.desiredBatch)
+		outcomes, err := s.linear.CreateIssues(ctx, j.desiredBatch)
+		failed, shapeErr := failedCreateOutcomes(outcomes, len(j.desiredBatch))
+		err = errors.Join(err, shapeErr)
 		if err != nil {
 			return fmt.Errorf("reviewed create failed or has uncertain outcome; stopped without retry (batch size=%d, failed indexes=%v): %w", len(j.desiredBatch), failed, err)
 		}
@@ -1128,40 +1128,23 @@ func (s *Service) executeJob(ctx context.Context, job job, result *RunResult) er
 		if s.cfg.DryRun {
 			return nil
 		}
-		failedIdx, err := s.linear.CreateIssues(ctx, job.desiredBatch)
-		if err != nil {
-			// No per-alias data at all (e.g. a transport failure): fall back
-			// to retrying every item individually, same as before.
-			s.logger.Warn("batch create failed, retrying issues individually",
-				slog.Int("batch_size", len(job.desiredBatch)),
-				slog.Any("error", err),
-			)
-			for _, desired := range job.desiredBatch {
-				if _, err := s.linear.CreateIssues(ctx, []model.DesiredIssue{desired}); err != nil {
-					atomic.AddInt64(&result.FailedOps, 1)
-					s.logger.Error("failed to create issue",
-						slog.String("fingerprint", desired.Fingerprint),
-						slog.Any("error", err),
-					)
-				}
+		outcomes, err := s.linear.CreateIssues(ctx, job.desiredBatch)
+		failedIdx, shapeErr := failedCreateOutcomes(outcomes, len(job.desiredBatch))
+		if err = errors.Join(err, shapeErr); err != nil {
+			atomic.AddInt64(&result.FailedOps, int64(len(failedIdx)))
+			return fmt.Errorf("create failed or has uncertain outcome; stopped without retry: %w", err)
+		}
+		for _, idx := range failedIdx {
+			desired := job.desiredBatch[idx]
+			retryOutcomes, retryErr := s.linear.CreateIssues(ctx, []model.DesiredIssue{desired})
+			stillFailed, shapeErr := failedCreateOutcomes(retryOutcomes, 1)
+			if retryErr = errors.Join(retryErr, shapeErr); retryErr != nil {
+				atomic.AddInt64(&result.FailedOps, 1)
+				return fmt.Errorf("create retry failed or has uncertain outcome: %w", retryErr)
 			}
-		} else if len(failedIdx) > 0 {
-			// Partial failure: the batch call told us exactly which items
-			// failed. Only retry those — the rest were already created and
-			// retrying them too would produce duplicate tickets.
-			s.logger.Warn("batch create had partial failures, retrying only the failed issues",
-				slog.Int("failed_count", len(failedIdx)),
-				slog.Int("batch_size", len(job.desiredBatch)),
-			)
-			for _, idx := range failedIdx {
-				desired := job.desiredBatch[idx]
-				if _, err := s.linear.CreateIssues(ctx, []model.DesiredIssue{desired}); err != nil {
-					atomic.AddInt64(&result.FailedOps, 1)
-					s.logger.Error("failed to create issue",
-						slog.String("fingerprint", desired.Fingerprint),
-						slog.Any("error", err),
-					)
-				}
+			if len(stillFailed) != 0 {
+				atomic.AddInt64(&result.FailedOps, 1)
+				s.logger.Error("failed to create issue", slog.String("fingerprint", desired.Fingerprint))
 			}
 		}
 		return nil
@@ -2751,4 +2734,32 @@ func sourceRegionString(finding model.Finding) string {
 		return fmt.Sprintf("line %d:%d-%d", finding.SourceLineStart, finding.SourceColumnStart, finding.SourceColumnEnd)
 	}
 	return fmt.Sprintf("line %d:%d to %d:%d", finding.SourceLineStart, finding.SourceColumnStart, finding.SourceLineEnd, finding.SourceColumnEnd)
+}
+
+// failedCreateOutcomes rejects incomplete or misbound responses before callers
+// consider retries. Order is part of the CreateIssues interface contract.
+func failedCreateOutcomes(outcomes []model.CreateOutcome, count int) ([]int, error) {
+	failed := make([]int, 0)
+	var err error
+	seenIDs := make(map[string]bool)
+	if len(outcomes) != count {
+		err = errors.New("create outcome count differs from inputs")
+	}
+	for i := range count {
+		if i >= len(outcomes) {
+			failed = append(failed, i)
+			continue
+		}
+		o := outcomes[i]
+		if o.Index != i || o.Acknowledged && strings.TrimSpace(o.ID) == "" || !o.Acknowledged && o.ID != "" || o.ID != "" && seenIDs[o.ID] {
+			err = errors.New("invalid create alias acknowledgement")
+		}
+		if o.ID != "" {
+			seenIDs[o.ID] = true
+		}
+		if !o.Acknowledged || strings.TrimSpace(o.ID) == "" {
+			failed = append(failed, i)
+		}
+	}
+	return failed, err
 }

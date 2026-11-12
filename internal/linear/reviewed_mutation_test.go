@@ -61,8 +61,8 @@ func TestReviewedMutationRequiresCompleteAcknowledgments(t *testing.T) {
 				update := model.IssueUpdate{Existing: model.ExistingIssue{ID: "issue-1"}, Desired: model.DesiredIssue{State: model.StateTodo}, Diff: &model.IssueDiff{TitleChanged: true}}
 				switch operation {
 				case "create":
-					failed, err := client.CreateIssues(ctx, []model.DesiredIssue{update.Desired})
-					if err == nil && len(failed) == 0 {
+					outcomes, err := client.CreateIssues(ctx, []model.DesiredIssue{update.Desired})
+					if err == nil && len(outcomes) == 1 && outcomes[0].Acknowledged {
 						t.Fatal("accepted missing create acknowledgment or ID")
 					}
 				case "update":
@@ -95,8 +95,8 @@ func TestReviewedCreateStopsAfterPartialOrUncertainCleanup(t *testing.T) {
 				return `{"data":{}}`
 			})
 			client.cfg.UnsubscribeActor = true
-			failed, err := client.CreateIssues(httpx.WithoutRetries(t.Context()), []model.DesiredIssue{{State: model.StateTodo}})
-			if err == nil && len(failed) == 0 {
+			outcomes, err := client.CreateIssues(httpx.WithoutRetries(t.Context()), []model.DesiredIssue{{State: model.StateTodo}})
+			if err == nil && len(outcomes) == 1 && outcomes[0].Acknowledged {
 				t.Fatal("concealed uncertain create or cleanup response")
 			}
 			if partial && cleanup != 0 || !partial && cleanup != 1 {
