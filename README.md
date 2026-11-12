@@ -751,6 +751,16 @@ are created exclusively with mode `0600`:
   `batches`. The receipt is capped at 4 KiB. The plan and receipt files and directory entries are synced before
   dispatch. Exactly one `msg="bound plan written" plan_sha256=<raw file hash>`
   line is logged after binding and before dispatch. Raw source snapshots and buffered payloads are not persisted.
+- `PATH.receipts/refusal.json`: emitted only when a complete, validated plan and
+  its buffered jobs exceed one or more limits. Schema version `1`, status
+  `limits_exceeded`, the four aggregate counts (`creates`, `updates`, `resolves`,
+  `cancel_duplicates`), their four `max_*` limits, and `exceeded`: the nonempty
+  list of over-limit categories in that order. It is capped at 4 KiB, contains
+  no identifiers, hashes or raw source data, and is not an execution attempt.
+  Rejection creates no plan or attempt file, performs no Linear writes and saves
+  no sync hashes. The error also reports the counts and limits. Invalid plan or
+  job evidence fails without this diagnostic. A refusal write failure still
+  fails closed and is reported alongside the limit error.
 - `PATH.receipts/result.json`: schema version `1`, `finished_at`, the same plan/job hashes,
   `status`, `linear_writes_attempted`, `batches_attempted`,
   `batches_acknowledged`, and `cache_status`. It is capped at 4 KiB and contains
@@ -778,7 +788,7 @@ evidence, not independent verification of every remote outcome.
 Loader ignore memory and cold-start metadata can change before the write gate,
 as in preview mode. Always run on a disposable copy of the trusted cache and
 publish nothing on failure. Retain the exact plan, `PATH.receipts/attempt.json`
-and any `PATH.receipts/result.json` privately for at most seven days, including
+and any `PATH.receipts/refusal.json` or `PATH.receipts/result.json` privately for at most seven days, including
 on failure, before removing job scratch. Retain no database or raw log as a plan
 artifact. A missing final receipt means an interrupted or uncertain attempt.
 Keep the completed cache separately and publish it only after independent exact
