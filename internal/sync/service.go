@@ -666,11 +666,18 @@ func (s *Service) Run(ctx context.Context) (result RunResult, runErr error) {
 
 	g, workerCtx := errgroup.WithContext(runCtx)
 	var prepared []job
-	enqueue := func(j job) { jobs <- j }
+	enqueue := func(j job) error {
+		select {
+		case jobs <- j:
+			return nil
+		case <-workerCtx.Done():
+			return workerCtx.Err()
+		}
+	}
 	if reviewed != nil || bound != nil {
 		// Planning is single-threaded in guarded mode. No mutation workers exist
 		// until the entire candidate plan has passed comparison.
-		enqueue = func(j job) {
+		enqueue = func(j job) error {
 			prepared = append(prepared, j)
 			switch j.kind {
 			case jobCreateBatch:
@@ -682,11 +689,15 @@ func (s *Service) Run(ctx context.Context) (result RunResult, runErr error) {
 			case jobCancelDuplicate:
 				result.CancelledDuplicates += int64(len(j.updateBatch))
 			}
+			return nil
 		}
 	} else {
 		for i := 0; i < s.cfg.Sync.Workers; i++ {
 			g.Go(func() error {
 				for job := range jobs {
+					if err := workerCtx.Err(); err != nil {
+						return err
+					}
 					if err := s.executeJob(workerCtx, job, &result); err != nil {
 						return err
 					}
@@ -698,14 +709,14 @@ func (s *Service) Run(ctx context.Context) (result RunResult, runErr error) {
 
 	if s.cfg.ReplaySafe {
 		baseEnqueue := enqueue
-		enqueue = func(j job) {
+		enqueue = func(j job) error {
 			for _, update := range j.updateBatch {
 				if update.Diff != nil {
 					slices.Sort(update.Diff.LabelsAdded)
 					slices.Sort(update.Diff.LabelsRemoved)
 				}
 			}
-			baseEnqueue(j)
+			return baseEnqueue(j)
 		}
 	}
 
@@ -736,7 +747,9 @@ func (s *Service) Run(ctx context.Context) (result RunResult, runErr error) {
 				plan.add("create", "no-reusable-ticket", fingerprint, nil, &desired)
 				createBatch = append(createBatch, desired)
 				if len(createBatch) == createBatchSize {
-					enqueue(job{kind: jobCreateBatch, desiredBatch: append([]model.DesiredIssue(nil), createBatch...)})
+					if err := enqueue(job{kind: jobCreateBatch, desiredBatch: append([]model.DesiredIssue(nil), createBatch...)}); err != nil {
+						return err
+					}
 					s.logQueueProgress(&queuedJobs, int64(len(createBatch)))
 					createBatch = createBatch[:0]
 				}
@@ -769,7 +782,9 @@ func (s *Service) Run(ctx context.Context) (result RunResult, runErr error) {
 				plan.add("update", "managed-fields-differ", fingerprint, &existing, &desired)
 				updateBatch = append(updateBatch, update)
 				if len(updateBatch) == createBatchSize {
-					enqueue(job{kind: jobUpdate, updateBatch: append([]model.IssueUpdate(nil), updateBatch...)})
+					if err := enqueue(job{kind: jobUpdate, updateBatch: append([]model.IssueUpdate(nil), updateBatch...)}); err != nil {
+						return err
+					}
 					s.logQueueProgress(&queuedJobs, int64(len(updateBatch)))
 					updateBatch = updateBatch[:0]
 				}
@@ -778,11 +793,15 @@ func (s *Service) Run(ctx context.Context) (result RunResult, runErr error) {
 			}
 		}
 		if len(createBatch) > 0 {
-			enqueue(job{kind: jobCreateBatch, desiredBatch: append([]model.DesiredIssue(nil), createBatch...)})
+			if err := enqueue(job{kind: jobCreateBatch, desiredBatch: append([]model.DesiredIssue(nil), createBatch...)}); err != nil {
+				return err
+			}
 			s.logQueueProgress(&queuedJobs, int64(len(createBatch)))
 		}
 		if len(updateBatch) > 0 {
-			enqueue(job{kind: jobUpdate, updateBatch: append([]model.IssueUpdate(nil), updateBatch...)})
+			if err := enqueue(job{kind: jobUpdate, updateBatch: append([]model.IssueUpdate(nil), updateBatch...)}); err != nil {
+				return err
+			}
 			s.logQueueProgress(&queuedJobs, int64(len(updateBatch)))
 		}
 
@@ -839,7 +858,9 @@ func (s *Service) Run(ctx context.Context) (result RunResult, runErr error) {
 				plan.add("resolve", "finding-absent", fingerprint, &existing, &resolved)
 				resolveBatch = append(resolveBatch, resolvedUpdate)
 				if len(resolveBatch) == createBatchSize {
-					enqueue(job{kind: jobResolve, updateBatch: append([]model.IssueUpdate(nil), resolveBatch...)})
+					if err := enqueue(job{kind: jobResolve, updateBatch: append([]model.IssueUpdate(nil), resolveBatch...)}); err != nil {
+						return err
+					}
 					s.logQueueProgress(&queuedJobs, int64(len(resolveBatch)))
 					resolveBatch = resolveBatch[:0]
 				}
@@ -848,7 +869,9 @@ func (s *Service) Run(ctx context.Context) (result RunResult, runErr error) {
 			}
 		}
 		if len(resolveBatch) > 0 {
-			enqueue(job{kind: jobResolve, updateBatch: append([]model.IssueUpdate(nil), resolveBatch...)})
+			if err := enqueue(job{kind: jobResolve, updateBatch: append([]model.IssueUpdate(nil), resolveBatch...)}); err != nil {
+				return err
+			}
 			s.logQueueProgress(&queuedJobs, int64(len(resolveBatch)))
 		}
 
@@ -880,14 +903,18 @@ func (s *Service) Run(ctx context.Context) (result RunResult, runErr error) {
 				plan.add("cancel-duplicate", "duplicate-fingerprint", duplicate.Fingerprint, &duplicate, &desired)
 				cancelBatch = append(cancelBatch, cancelUpdate)
 				if len(cancelBatch) == createBatchSize {
-					enqueue(job{kind: jobCancelDuplicate, updateBatch: append([]model.IssueUpdate(nil), cancelBatch...)})
+					if err := enqueue(job{kind: jobCancelDuplicate, updateBatch: append([]model.IssueUpdate(nil), cancelBatch...)}); err != nil {
+						return err
+					}
 					s.logQueueProgress(&queuedJobs, int64(len(cancelBatch)))
 					cancelBatch = cancelBatch[:0]
 				}
 			}
 		}
 		if len(cancelBatch) > 0 {
-			enqueue(job{kind: jobCancelDuplicate, updateBatch: append([]model.IssueUpdate(nil), cancelBatch...)})
+			if err := enqueue(job{kind: jobCancelDuplicate, updateBatch: append([]model.IssueUpdate(nil), cancelBatch...)}); err != nil {
+				return err
+			}
 			s.logQueueProgress(&queuedJobs, int64(len(cancelBatch)))
 		}
 

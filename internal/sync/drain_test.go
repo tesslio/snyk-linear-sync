@@ -257,3 +257,33 @@ func TestDrainPerKindCeilingAppliesToSelectedOnly(t *testing.T) {
 		t.Fatal("per-kind partition mismatch")
 	}
 }
+
+func TestDrainEvidenceBoundCountsPendingWorkBeforeFingerprintCollapse(t *testing.T) {
+	fp := "snyk:project-a:issue-a"
+	digest := planTextDigest(fp)
+	operations := make([]DrainOperation, drainEvidenceEntryCeiling+101)
+	for i := range operations {
+		operations[i] = DrainOperation{fmt.Sprintf("issue:%d", i), "cancel-duplicate", []string{digest}}
+	}
+	pre := map[string]string{fp: strings.Repeat("a", 64)}
+	// Even the 100 selected effects can remain unverified, so the exact
+	// admission ceiling applies to all work, not just deferred operations.
+	if _, err := drainEvidenceBound(pre, nil, operations[:drainEvidenceEntryCeiling]); err != nil {
+		t.Fatalf("ceiling rejected: %v", err)
+	}
+	for _, n := range []int{drainEvidenceEntryCeiling + 1, len(operations)} {
+		if _, err := drainEvidenceBound(pre, nil, operations[:n]); err == nil {
+			t.Fatalf("accepted %d potentially pending operations sharing one fingerprint", n)
+		}
+	}
+}
+
+func TestDrainEvidenceBoundIncludesPendingBytesOutsideKnownFingerprints(t *testing.T) {
+	operations := make([]DrainOperation, 2000)
+	for i := range operations {
+		operations[i] = DrainOperation{fmt.Sprintf("issue:%04d", i) + strings.Repeat("x", drainFingerprintByteCeiling-10), "update", []string{strings.Repeat("a", 64)}}
+	}
+	if _, err := drainEvidenceBound(nil, nil, operations); err == nil {
+		t.Fatal("oversized pending row omitted from preflight")
+	}
+}

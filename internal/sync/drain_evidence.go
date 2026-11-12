@@ -68,6 +68,11 @@ func drainDigest(value any) (string, error) {
 // Preflight sizes a worst-case map using all known keys and all work keys. It
 // excludes concurrent arrivals, which are never persisted as trusted hashes.
 func drainEvidenceBound(pre map[string]string, jobs []job, operations []DrainOperation) (int, error) {
+	// Every operation may remain pending if selected effects fail verification.
+	// Fingerprint collapse must not hide distinct pending work entries.
+	if len(operations) > drainEvidenceEntryCeiling {
+		return 0, errors.New("drain-evidence-oversized")
+	}
 	known := map[string]bool{}
 	for f := range pre {
 		known[f] = true
@@ -85,8 +90,12 @@ func drainEvidenceBound(pre map[string]string, jobs []job, operations []DrainOpe
 	}
 	// JSON string escaping expands each input byte by no more than six bytes.
 	worst := 8192
+	pendingWorst := 8192
 	keysByFingerprint := map[string]int{}
 	for _, op := range operations {
+		// Bound the canonical pending row independently of whether a
+		// fingerprint is present in the refreshed evidence.
+		pendingWorst += 6*len(op.WorkKey) + 160 + 67*len(op.FingerprintSHA256s)
 		for _, fp := range op.FingerprintSHA256s {
 			keysByFingerprint[fp] += 6*len(op.WorkKey) + 4
 		}
@@ -97,6 +106,7 @@ func drainEvidenceBound(pre map[string]string, jobs []job, operations []DrainOpe
 		}
 		worst += 18*len(f) + 512 + keysByFingerprint[planTextDigest(f)]
 	}
+	worst = max(worst, pendingWorst)
 	if worst > drainEvidenceByteCeiling {
 		return worst, errors.New("drain-evidence-oversized")
 	}

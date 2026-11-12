@@ -821,7 +821,8 @@ Create requests are never automatically repeated after a transport or partial
 GraphQL failure. Acknowledged issue IDs survive partial responses so callers can
 inspect what landed. Guarded execution stops on every partial or uncertain
 outcome; ordinary execution retries only explicitly rejected aliases from a
-complete error-free response, once.
+complete error-free response, once. An uncertain create stops the ordinary run
+without stranding blocked queue sends or publishing its cache.
 
 ### Bounded drain development
 
@@ -832,6 +833,8 @@ to an execution flag. Existing bounded mode still refuses an oversized complete
 plan; this change alone does not activate incremental draining. Drain caches
 use a separate signature and cannot be overwritten by this version's legacy
 cache writer. Consumer provenance checks and namespace fences remain required.
+Preflight bounds all potentially pending work entries and their encoded size,
+not only distinct fingerprints, since selected effects may remain unverified.
 
 The proposed 100-operation cap counts creates, updates (including reopens),
 resolves and duplicate cancellations. It does not mean 100 API mutations:

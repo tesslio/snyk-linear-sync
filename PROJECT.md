@@ -668,7 +668,9 @@ Concurrent arrivals are counted but omitted from saved hashes. Deferred,
 unverified and unrelated drifted keys are withheld, and saved hashes are exactly
 the refreshed evidence minus the withheld set. An evidence-backed empty map is
 valid. Entry and byte bounds are checked before dispatch, with a no-save,
-uncertain-result overflow backstop after writes.
+uncertain-result overflow backstop after writes. Preflight counts every work
+operation as potentially pending, including selected work that may fail effect
+verification, and includes pending-row bytes even when fingerprints collapse.
 
 These protocol primitives are not yet connected to an execution flag. Producer
 artifact admission, version-2 receipt integration, and generation initialization
@@ -684,6 +686,8 @@ create mutation request is sent once. Guarded execution never retries partial
 or uncertain outcomes. Ordinary execution retries only explicitly rejected
 aliases from a complete error-free response, once; missing aliases, empty IDs,
 transport errors and partial GraphQL errors stop without retrying the batch.
+Worker failure cancels blocked queue sends, returns the error, and skips cache
+publication; cancellation is also checked before another queued job executes.
 
 The cap counts issue reconciliation operations, not every API mutation.
 Subscription cleanup after creates and auxiliary comments are separate effects;
