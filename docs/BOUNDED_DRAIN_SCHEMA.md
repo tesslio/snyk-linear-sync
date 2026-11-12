@@ -87,7 +87,9 @@ reconstruct those private payloads from the redacted plan.
 
 Use P for `pre_write`: canonical pre-write Linear hashes after matched-ID
 overrides. Let A be fingerprint keys selected operations may introduce, derived
-from their desired fingerprints. Let Q be the complete mandatory fresh post-write
+from their desired fingerprints: use the current `fingerprint_sha256` of each
+selected mutation record, not its `previous_fingerprint_sha256` or all aliases.
+The retained full plan supplies this distinction without exposing raw payloads. Let Q be the complete mandatory fresh post-write
 read after matched-ID and acknowledged-create-ID overrides. Define:
 
 - R (`refreshed`) = Q restricted to keys(P) union A.
@@ -137,7 +139,12 @@ hashes. Attempt and result also agree on the jobs digest.
 keys. `created` maps selected create work keys to acknowledged issue IDs;
 every verified create has an ID, but an acknowledged ID is not itself proof of
 the desired effect. Batch acknowledgments cannot exceed attempted batches or
-the attempt's planned batches. Cache admission requires a saved result whose
+the attempt's planned batches. The planned batch count is exactly the sum,
+over the four kinds, of ceil(selected count for that kind / 10). Private payloads
+are not needed to recompute this. An empty selection has zero batches.
+For normal receipts, `linear_writes_attempted` equals
+`batches_attempted > 0` for issue dispatch; auxiliary effects remain separately
+accounted for before runtime wiring. Cache admission requires a saved result whose
 status is success or partial_or_uncertain and fully consistent evidence.
 Failures that lack committed evidence do not authorize a new generation.
 
@@ -193,7 +200,11 @@ ownership through a shared fingerprint; two unrelated issue IDs must not borrow
 each other's age. Missing restored work must refuse rather than silently vanish
 without a separately specified verified completion proof. Three unverified
 selections while pending prevent further progress, including deferrals between
-them; the stall rule must not be described as consecutive wall-clock runs.
+them; the stall rule must not be described as consecutive wall-clock runs. Persist
+and admit the third unverified checkpoint (counter 3), so its failure history
+is durable. It is the subsequent selection/attempt from that restored state
+that must refuse. Retention of the third checkpoint must not be confused with
+authorization to dispatch another generation.
 
 A self-consistent cache or fixture is not authenticated producer evidence.
 Missing producer receipts always refuse, with no generation reset or legacy

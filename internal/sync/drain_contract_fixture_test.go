@@ -279,3 +279,44 @@ func TestDrainPlanProjectionBindsBothAliases(t *testing.T) {
 		t.Fatal("equal prior alias was not deduplicated", err)
 	}
 }
+
+func TestDrainThirdUnverifiedCheckpointRemainsAdmissible(t *testing.T) {
+	pending, evidence, snapshot := admissionFixture(3)
+	pending.Entries["issue:issue-1"] = DrainPendingEntry{1, []string{planTextDigest("finding-a")}, 3}
+	evidence.Withheld["finding-a"] = DrainWithheld{"unverified", []string{"issue:issue-1"}}
+	snapshot.LinearHashes = map[string]string{}
+	snapshot = admissionEncode(t, pending, evidence, snapshot)
+	restored, _, err := validateDrainSnapshot(snapshot)
+	if err != nil {
+		t.Fatalf("third failed verification must remain durable: %v", err)
+	}
+	plan, jobs := drainFixture(t, 0)
+	if _, err := selectDrain(plan, jobs, restored, drainDefaultLimits(), nil, nil); err == nil || err.Error() != "drain-stalled-effect" {
+		t.Fatalf("stalled restored generation allowed another selection: %v", err)
+	}
+}
+
+func TestDrainEvidenceExcludesPreviousAliasOutsidePrewrite(t *testing.T) {
+	old, current := "snyk:project-old:issue-1", "snyk:project-a:issue-1"
+	desired := model.DesiredIssue{Fingerprint: current}
+	existing := model.ExistingIssue{ID: "issue-1", Fingerprint: old}
+	op := DrainOperation{"issue:issue-1", "update", []string{planTextDigest(old), planTextDigest(current)}}
+	slices.Sort(op.FingerprintSHA256s)
+	evidence, saved, arrivals, err := buildDrainEvidence(
+		map[string]string{current: planTextDigest("before")},
+		map[string]string{current: planTextDigest("after"), old: planTextDigest("concurrent old alias")},
+		[]DrainOperation{op}, nil, []job{{kind: jobUpdate, updateBatch: []model.IssueUpdate{{Existing: existing, Desired: desired}}}},
+		map[string]bool{op.WorkKey: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := evidence.Refreshed[old]; ok {
+		t.Fatal("previous alias was treated as introduced")
+	}
+	if _, ok := saved[old]; ok {
+		t.Fatal("previous alias arrival was saved")
+	}
+	if !slices.Equal(arrivals, []string{planTextDigest(old)}) {
+		t.Fatal("missing previous-alias arrival")
+	}
+}
