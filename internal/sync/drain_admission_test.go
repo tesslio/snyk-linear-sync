@@ -20,7 +20,7 @@ func admissionFixture(generation int64) (DrainPending, DrainHashEvidence, cache.
 		e.DeferredOpsSHA256 = hash
 		e.SettingsSHA256 = hash
 	}
-	s := cache.Snapshot{SchemaSignature: "v1+drain-v1", LinearHashes: map[string]string{"finding-a": hash}}
+	s := cache.Snapshot{SchemaSignature: managedSchemaSignature() + "+drain-v1", LinearHashes: map[string]string{"finding-a": hash}}
 	return p, e, s
 }
 
@@ -199,5 +199,14 @@ func TestDrainAdmissionSharedAliasRequiresEveryPendingKey(t *testing.T) {
 		if _, _, err := validateDrainSnapshot(admissionEncode(t, p, e, s)); err == nil {
 			t.Fatalf("accepted invalid aliases %v", keys)
 		}
+	}
+}
+
+func TestDrainAdmissionRejectsDifferentManagedSchema(t *testing.T) {
+	p, e, s := admissionFixture(1)
+	snapshot := admissionEncode(t, p, e, s)
+	snapshot.SchemaSignature = "different-managed-schema+drain-v1"
+	if _, _, err := validateDrainSnapshot(snapshot); err == nil {
+		t.Fatal("different managed schema admitted")
 	}
 }

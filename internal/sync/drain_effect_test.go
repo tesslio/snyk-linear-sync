@@ -203,3 +203,32 @@ func TestDrainCreateRequiresActualCreateOnlyLabels(t *testing.T) {
 		t.Fatal("present create-only label did not verify")
 	}
 }
+
+func TestDrainUpdateVerifiesRemovedLabelsAgainstPreWriteOwnership(t *testing.T) {
+	cfg := minimalCfg()
+	desired := desiredIssue(cfg, planFixtureFinding("issue-1"))
+	original := storedIssue("issue-1", "SNYK-1", cfg.Linear.States.Todo, desired)
+	original.ManagedLabels = []string{"Old-Managed"}
+	original.Labels = []model.IssueLabel{{ID: "label-old", Name: "old-managed"}, {ID: "label-human", Name: "human-protected"}}
+	actual := storedIssue("issue-1", "SNYK-1", cfg.Linear.States.Todo, desired)
+	actual.Labels = original.Labels
+	if needsUpdate(actual, desired, cfg.Linear.States) {
+		t.Fatal("fixture must hide removed label's ownership in refreshed metadata")
+	}
+	jobs := []job{{kind: jobUpdate, updateBatch: []model.IssueUpdate{{Existing: original, Desired: desired}}}}
+	key := drainWorkKey(jobUpdate, desired, original)
+	if got := verifyDrainEffects(jobs, nil, []model.ExistingIssue{original}, []model.ExistingIssue{actual}, cfg.Linear.States); got[key] {
+		t.Fatal("retained old managed label verified after metadata removed ownership")
+	}
+	actual.Labels = []model.IssueLabel{{ID: "label-human", Name: "human-protected"}}
+	if got := verifyDrainEffects(jobs, nil, []model.ExistingIssue{original}, []model.ExistingIssue{actual}, cfg.Linear.States); !got[key] {
+		t.Fatal("removed managed label with unrelated protected label preserved did not verify")
+	}
+	// Reappearance of an old managed label is dirty even if absent at planning.
+	original.Labels = nil
+	actual.Labels = []model.IssueLabel{{ID: "label-old", Name: "OLD-MANAGED"}}
+	jobs[0].updateBatch[0].Existing = original
+	if got := verifyDrainEffects(jobs, nil, []model.ExistingIssue{original}, []model.ExistingIssue{actual}, cfg.Linear.States); got[key] {
+		t.Fatal("reappearing old managed label verified")
+	}
+}

@@ -128,7 +128,11 @@ func verifyDrainEffects(jobs []job, created map[string]string, before, after []m
 			key := drainWorkKey(j.kind, u.Desired, u.Existing)
 			actual, ok := newByID[u.Existing.ID]
 			preserved := !u.Desired.PreserveState || u.Existing.StateID != "" && actual.StateID == u.Existing.StateID && (u.Existing.ArchivedAt == nil) == (actual.ArchivedAt == nil)
-			verified[key] = ok && preserved && actual.Fingerprint == u.Desired.Fingerprint && drainEffectMatches(actual, u.Desired, states)
+			// The refreshed metadata may already omit a formerly managed
+			// label even if Linear failed to remove the actual label. Bind
+			// removal expectations to the pre-write issue, not that metadata.
+			removed := drainExpectedLabelsRemoved(actual, u.Existing, u.Desired)
+			verified[key] = ok && preserved && removed && actual.Fingerprint == u.Desired.Fingerprint && drainEffectMatches(actual, u.Desired, states)
 		}
 		for _, d := range j.desiredBatch {
 			key := drainWorkKey(j.kind, d, model.ExistingIssue{})
@@ -201,6 +205,23 @@ func drainEffectMatches(actual model.ExistingIssue, desired model.DesiredIssue, 
 func drainHasActualLabels(actual model.ExistingIssue, desired []string) bool {
 	for _, label := range model.NormalizeManagedLabelNames(desired) {
 		if !model.HasLabelNamed(actual.Labels, label) {
+			return false
+		}
+	}
+	return true
+}
+
+// Only formerly managed labels no longer requested are removal targets.
+// Unmanaged labels (including protected control labels) are not removal targets.
+// This matches desiredLabelIDs' prior-managed filtering, even when an old label
+// was absent at planning time but is present in the fresh response.
+func drainExpectedLabelsRemoved(actual, before model.ExistingIssue, desired model.DesiredIssue) bool {
+	wanted := map[string]bool{}
+	for _, label := range model.NormalizeManagedLabelNames(desired.ManagedLabels) {
+		wanted[label] = true
+	}
+	for _, label := range model.NormalizeManagedLabelNames(before.ManagedLabels) {
+		if !wanted[label] && model.HasLabelNamed(actual.Labels, label) {
 			return false
 		}
 	}

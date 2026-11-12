@@ -76,7 +76,7 @@ func validateDrainSnapshot(snapshot cache.Snapshot) (DrainPending, DrainHashEvid
 	invalid := func() (DrainPending, DrainHashEvidence, error) {
 		return DrainPending{}, DrainHashEvidence{}, errors.New("drain-evidence-invalid")
 	}
-	if !strings.HasSuffix(snapshot.SchemaSignature, "+drain-v1") {
+	if snapshot.SchemaSignature != managedSchemaSignature()+"+drain-v1" {
 		return invalid()
 	}
 	if err := decodeCanonicalDrain(snapshot.BoundedDrainPending, &pending); err != nil {
