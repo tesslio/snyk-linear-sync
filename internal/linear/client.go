@@ -303,36 +303,34 @@ func (c *Client) StateID(state model.IssueState) (string, error) {
 // CreateIssues creates the given issues in Linear as a single batched
 // GraphQL mutation using aliased issueCreate calls.
 //
-// It returns the indices (into desired) of items whose alias reported
-// success: false. A GraphQL alias failing does not mean its sibling aliases
-// in the same request failed too — Linear already created those issues, and
-// the caller must not recreate them (doing so would produce duplicate
-// tickets). The caller should retry only the returned indices individually.
-//
-// A non-nil error means the request itself could not be completed (e.g. a
-// transport/HTTP failure) and no per-alias results are available at all. In
-// that case the caller cannot tell which, if any, items succeeded and must
-// fall back to retrying every item in desired individually — that is
-// unavoidable without idempotency keys on the mutation.
-func (c *Client) CreateIssues(ctx context.Context, desired []model.DesiredIssue) ([]int, error) {
+// Outcomes preserve every acknowledged alias, including when a sibling or the
+// request fails. A nil error means every unacknowledged alias explicitly
+// reported success:false without an issue ID, so an ordinary caller may retry
+// only those aliases. Missing responses, missing success IDs and all transport
+// or GraphQL errors are uncertain: callers must not retry them automatically.
+func (c *Client) CreateIssues(ctx context.Context, desired []model.DesiredIssue) ([]model.CreateOutcome, error) {
+	outcomes := make([]model.CreateOutcome, len(desired))
+	for i := range outcomes {
+		outcomes[i].Index = i
+	}
 	if len(desired) == 0 {
-		return nil, nil
+		return outcomes, nil
 	}
 	if err := c.resolveTeam(ctx); err != nil {
-		return nil, err
+		return outcomes, err
 	}
 	if err := c.ensureStatesLoaded(ctx); err != nil {
-		return nil, err
+		return outcomes, err
 	}
 	if err := c.ensureManagedLabelsResolved(ctx, managedLabelsFromDesiredIssues(desired)); err != nil {
-		return nil, err
+		return outcomes, err
 	}
 
 	op := gqlclient.NewOperation(createIssuesMutation(len(desired)))
 	for i, issue := range desired {
 		stateID, err := c.StateID(issue.State)
 		if err != nil {
-			return nil, err
+			return outcomes, err
 		}
 
 		title := issue.Title
@@ -352,32 +350,50 @@ func (c *Client) CreateIssues(ctx context.Context, desired []model.DesiredIssue)
 	}
 
 	resp := map[string]struct {
-		Success bool `json:"success"`
+		Success *bool `json:"success"`
 		Issue   struct {
 			ID         string `json:"id"`
 			Identifier string `json:"identifier"`
 		} `json:"issue"`
 	}{}
-	if err := c.execute(ctx, op, &resp); err != nil {
-		return nil, fmt.Errorf("create Linear issues: %w", err)
-	}
-
-	var failed []int
+	// Creates are not idempotent. Even an undecodable response or transport
+	// failure can follow a committed mutation, so disable all request retries.
+	execErr := c.execute(httpx.WithoutRetries(ctx), op, &resp)
+	uncertain := execErr != nil
+	partial := false
+	seenIDs := make(map[string]bool)
 	for i := range desired {
-		alias := fmt.Sprintf("issueCreate%d", i)
-		if result, ok := resp[alias]; !ok || !result.Success || httpx.RetriesDisabled(ctx) && strings.TrimSpace(result.Issue.ID) == "" {
-			failed = append(failed, i)
+		result, present := resp[fmt.Sprintf("issueCreate%d", i)]
+		id := strings.TrimSpace(result.Issue.ID)
+		if id != "" {
+			if seenIDs[id] {
+				uncertain = true
+			}
+			seenIDs[id] = true
+		}
+		outcomes[i] = model.CreateOutcome{Index: i, ID: id, Identifier: result.Issue.Identifier,
+			Acknowledged: present && result.Success != nil && *result.Success && id != ""}
+		if !outcomes[i].Acknowledged {
+			partial = true
+			if !present || result.Success == nil || *result.Success || id != "" {
+				uncertain = true
+			}
 		}
 	}
-	if httpx.RetriesDisabled(ctx) && len(failed) != 0 {
-		// Even cleanup is a later mutation. Stop after an uncertain or partial
-		// create response rather than extending a guarded operation's effects.
-		return failed, nil
+	if uncertain {
+		if execErr != nil {
+			return outcomes, fmt.Errorf("create Linear issues has uncertain outcome: %w", execErr)
+		}
+		return outcomes, fmt.Errorf("create Linear issues has missing or inconsistent alias acknowledgement")
+	}
+	if httpx.RetriesDisabled(ctx) && partial {
+		// Even cleanup is a later mutation. Stop after a partial response.
+		return outcomes, nil
 	}
 
 	if err := c.issueUnsubscribeCreatedIssues(ctx, resp); err != nil {
 		if httpx.RetriesDisabled(ctx) {
-			return nil, fmt.Errorf("issues created but subscription cleanup failed or has uncertain outcome: %w", err)
+			return outcomes, fmt.Errorf("issues created but subscription cleanup failed or has uncertain outcome: %w", err)
 		}
 		// The issues above were already created successfully; unsubscribing
 		// the actor is best-effort cleanup (it only stops the sync's own
@@ -390,7 +406,7 @@ func (c *Client) CreateIssues(ctx context.Context, desired []model.DesiredIssue)
 		)
 	}
 
-	return failed, nil
+	return outcomes, nil
 }
 
 func (c *Client) UpdateIssues(ctx context.Context, updates []model.IssueUpdate) error {
@@ -1035,7 +1051,7 @@ query resolveTeam($key: String!) {
 }
 
 func (c *Client) issueUnsubscribeCreatedIssues(ctx context.Context, created map[string]struct {
-	Success bool `json:"success"`
+	Success *bool `json:"success"`
 	Issue   struct {
 		ID         string `json:"id"`
 		Identifier string `json:"identifier"`
@@ -1911,6 +1927,10 @@ func (c *Client) execute(ctx context.Context, op *gqlclient.Operation, out any) 
 		if err := c.gql.Execute(ctx, op, response.Interface()); err != nil {
 			lastErr = err
 			if httpx.RetriesDisabled(ctx) || !isLinearRateLimitError(err) {
+				// Preserve decoded acknowledgements on the final attempt. In
+				// particular, create callers need IDs from partial responses.
+				// The error still forbids using partial reads as complete data.
+				destination.Elem().Set(response.Elem())
 				return err
 			}
 

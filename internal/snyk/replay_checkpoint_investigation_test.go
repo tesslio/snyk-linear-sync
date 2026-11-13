@@ -26,10 +26,15 @@ type checkpointLinear struct{ writes int }
 func (l *checkpointLinear) LoadSnapshot(context.Context) ([]model.ExistingIssue, error) {
 	return []model.ExistingIssue{}, nil
 }
-func (l *checkpointLinear) CreateIssues(_ context.Context, d []model.DesiredIssue) ([]int, error) {
+func (l *checkpointLinear) CreateIssues(_ context.Context, d []model.DesiredIssue) ([]model.CreateOutcome, error) {
 	l.writes += len(d)
-	return nil, nil
+	out := make([]model.CreateOutcome, len(d))
+	for i := range d {
+		out[i] = model.CreateOutcome{Index: i, ID: fmt.Sprintf("created-%d", i), Acknowledged: true}
+	}
+	return out, nil
 }
+
 func (l *checkpointLinear) UpdateIssues(_ context.Context, d []model.IssueUpdate) error {
 	l.writes += len(d)
 	return nil

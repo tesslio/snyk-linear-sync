@@ -3,6 +3,7 @@ package sync
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -312,7 +313,7 @@ type reviewedContextLinear struct {
 	afterUpdate func()
 }
 
-func (l *reviewedContextLinear) CreateIssues(ctx context.Context, desired []model.DesiredIssue) ([]int, error) {
+func (l *reviewedContextLinear) CreateIssues(ctx context.Context, desired []model.DesiredIssue) ([]model.CreateOutcome, error) {
 	if !httpx.RetriesDisabled(ctx) {
 		l.t.Fatal("guarded create allows lower-layer retries")
 	}
@@ -373,10 +374,21 @@ type reviewedFailureLinear struct {
 	createCalls, updateCalls, commentCalls int
 }
 
-func (l *reviewedFailureLinear) CreateIssues(context.Context, []model.DesiredIssue) ([]int, error) {
+func (l *reviewedFailureLinear) CreateIssues(_ context.Context, desired []model.DesiredIssue) ([]model.CreateOutcome, error) {
 	l.createCalls++
-	return l.failed, l.createErr
+	outcomes := make([]model.CreateOutcome, len(desired))
+	for i := range desired {
+		outcomes[i] = model.CreateOutcome{Index: i, ID: fmt.Sprintf("created-%d", i), Acknowledged: true}
+		for _, failed := range l.failed {
+			if failed == i {
+				outcomes[i].ID = ""
+				outcomes[i].Acknowledged = false
+			}
+		}
+	}
+	return outcomes, l.createErr
 }
+
 func (l *reviewedFailureLinear) UpdateIssues(context.Context, []model.IssueUpdate) error {
 	l.updateCalls++
 	return l.updateErr

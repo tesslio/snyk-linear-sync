@@ -82,7 +82,7 @@ func (l *boundLinear) LoadSnapshot(ctx context.Context) ([]model.ExistingIssue, 
 	return l.snapshot, l.err
 }
 
-func (l *boundLinear) CreateIssues(ctx context.Context, d []model.DesiredIssue) ([]int, error) {
+func (l *boundLinear) CreateIssues(ctx context.Context, d []model.DesiredIssue) ([]model.CreateOutcome, error) {
 	l.before()
 	return l.fakeLinear.CreateIssues(ctx, d)
 }

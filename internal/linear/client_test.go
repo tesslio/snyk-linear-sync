@@ -986,8 +986,8 @@ func TestCreateIssuesRemovesActorAfterCreateWhenLinearAutoSubscribesThem(t *test
 	if err != nil {
 		t.Fatalf("CreateIssues() error = %v", err)
 	}
-	if len(failed) != 0 {
-		t.Fatalf("CreateIssues() failed indices = %v, want none", failed)
+	if len(failed) != 1 || !failed[0].Acknowledged || failed[0].ID == "" {
+		t.Fatalf("CreateIssues() outcomes = %v, want acknowledged issue ID", failed)
 	}
 
 	if len(requests) != 2 {
@@ -1333,13 +1333,13 @@ func TestBuildChangeCommentReturnsEmptyWhenDiffIsNil(t *testing.T) {
 	}
 }
 
-// TestCreateIssuesPartialAliasFailureReturnsOnlyFailedIndices verifies that
+// TestCreateIssuesPartialAliasFailureReturnsOutcomes verifies that
 // when one aliased issueCreate in a batched mutation reports success: false
-// while its siblings succeed, CreateIssues reports only the failed index
+// while its siblings succeed, CreateIssues reports each alias outcome
 // instead of an error for the whole batch. Treating a partial failure as a
 // whole-batch failure made the caller recreate the already-created siblings,
 // producing duplicate tickets.
-func TestCreateIssuesPartialAliasFailureReturnsOnlyFailedIndices(t *testing.T) {
+func TestCreateIssuesPartialAliasFailureReturnsOutcomes(t *testing.T) {
 	client := &Client{
 		cfg: config.LinearConfig{
 			TeamID: "team-1",
@@ -1378,8 +1378,8 @@ func TestCreateIssuesPartialAliasFailureReturnsOnlyFailedIndices(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateIssues() error = %v, want nil (partial failure is not a batch error)", err)
 	}
-	if len(failed) != 1 || failed[0] != 1 {
-		t.Fatalf("CreateIssues() failed indices = %v, want [1]", failed)
+	if len(failed) != 2 || !failed[0].Acknowledged || failed[0].ID != "issue-1" || failed[1].Acknowledged {
+		t.Fatalf("CreateIssues() outcomes = %v, want acknowledged issue-1 and failed index 1", failed)
 	}
 }
 
@@ -1428,8 +1428,8 @@ func TestCreateIssuesUnsubscribeFailureDoesNotFailCreates(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateIssues() error = %v, want nil (unsubscribe is best-effort)", err)
 	}
-	if len(failed) != 0 {
-		t.Fatalf("CreateIssues() failed indices = %v, want none", failed)
+	if len(failed) != 1 || !failed[0].Acknowledged || failed[0].ID == "" {
+		t.Fatalf("CreateIssues() outcomes = %v, want acknowledged issue ID", failed)
 	}
 }
 

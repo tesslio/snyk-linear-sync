@@ -636,3 +636,72 @@ any buffered jobs. The result receipt retains the existing failed-before-writes
 status. Omitting this option preserves existing manual bounded behavior. The
 option does not change the settings digest, count limits, job binding, retry
 policy or cache-publication requirements.
+
+### Bounded drain protocol primitives
+
+[The offline interchange contract](docs/BOUNDED_DRAIN_SCHEMA.md) specifies
+producer/consumer bytes, evidence semantics and initialization receipts. Runtime
+provenance, membership proof and auxiliary-effect accounting remain separate
+integration gates.
+
+The drain protocol uses a separate `<managed-schema>+drain-v1` cache signature
+and the `bounded_drain_pending` and `bounded_drain_hash_evidence` metadata rows.
+Both rows, the signature, and both hash tables are committed in one SQLite
+transaction. A legacy save cannot overwrite a drain generation, including a
+partially damaged generation. This does not retrofit fences into older binaries;
+callers must isolate the drain cache namespace and reject it in legacy routes.
+
+The selector validates the complete plan and its jobs before selecting whole
+causal groups. Work keys are `issue:<id>` or `create:<fingerprint-sha256>`.
+Duplicate issue targets refuse. Duplicate cancellation follows its canonical
+copy's mutation; an identity rebind follows creates that lost the same nonempty
+identity. Shared coarse fingerprints alone do not create dependencies. Groups
+are ordered by oldest pending generation then smallest work key. The total
+budget is at most 100 and independent per-kind ceilings still apply. Selected
+jobs are rebuilt in stable batches of at most ten and revalidated.
+
+Deferred and unverified operations retain their first pending generation and
+withhold every affected fingerprint. Three selected-but-unverified generations
+while work remains pending
+refuse further progress; intervening deferrals preserve the counter. Missing
+restored work refuses rather than silently resetting its age. A create-to-issue
+handoff preserves age and the unverified counter; unrelated issue targets do
+not inherit ownership through shared fingerprints. Verification uses freshly
+read issue IDs and desired managed fields;
+create acknowledgements preserve those IDs even on partial errors. An unchanged
+retained terminal copy is allowed when the newly created ticket is canonical.
+
+Evidence is built after matched and acknowledged-create ID hash overrides. It
+contains only pre-write keys and keys selected operations may introduce.
+Concurrent arrivals are counted but omitted from saved hashes. Deferred,
+unverified and unrelated drifted keys are withheld, and saved hashes are exactly
+the refreshed evidence minus the withheld set. An evidence-backed empty map is
+valid. Entry and byte bounds are checked before dispatch, with a no-save,
+uncertain-result overflow backstop after writes. Preflight counts every work
+operation as potentially pending, including selected work that may fail effect
+verification, and includes pending-row bytes even when fingerprints collapse.
+
+These protocol primitives are not yet connected to an execution flag. Producer
+artifact admission, version-2 receipt integration, and generation initialization
+must be completed and reviewed before drain execution is available. Structural
+cache validation alone does not prove producer provenance. Missing producer
+receipts must refuse without resetting pending ages or initializing a new cache.
+
+### Acknowledged create outcomes
+
+Create batches return one indexed outcome per input, retaining acknowledged IDs
+and identifiers even when another alias or response processing fails. Each
+create mutation request is sent once. Guarded execution never retries partial
+or uncertain outcomes. Ordinary execution retries only explicitly rejected
+aliases from a complete error-free response, once; missing aliases, empty IDs,
+transport errors and partial GraphQL errors stop without retrying the batch.
+Worker failure cancels blocked queue sends, returns the error, and skips cache
+publication; cancellation is also checked before another queued job executes.
+
+The cap counts issue reconciliation operations, not every API mutation.
+Subscription cleanup after creates and auxiliary comments are separate effects;
+future execution receipts must report them explicitly. Before runtime wiring,
+the evidence contract must also represent same-fingerprint membership drift:
+matched-ID hash overrides alone can hide a new competing copy even when the
+canonical issue hash did not change. This remains a required integration gate,
+not a case that the current collapsed hash evidence can prove safe.

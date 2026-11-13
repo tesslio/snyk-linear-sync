@@ -29,11 +29,9 @@ type SnykClient interface {
 
 type LinearClient interface {
 	LoadSnapshot(ctx context.Context) ([]model.ExistingIssue, error)
-	// CreateIssues returns the indices (into desired) of items whose alias
-	// failed, so the caller retries only those instead of the whole batch.
-	// A non-nil error means no per-alias data is available (e.g. a
-	// transport failure) and every item must be retried individually.
-	CreateIssues(ctx context.Context, desired []model.DesiredIssue) ([]int, error)
+	// CreateIssues preserves acknowledged IDs even on a partial/uncertain error.
+	// Only a nil error permits retrying explicitly unacknowledged aliases.
+	CreateIssues(ctx context.Context, desired []model.DesiredIssue) ([]model.CreateOutcome, error)
 	UpdateIssues(ctx context.Context, updates []model.IssueUpdate) error
 	// PostComments returns the indices (into updates) whose comment failed
 	// to post, so the caller retries only those instead of the whole batch.
@@ -668,11 +666,18 @@ func (s *Service) Run(ctx context.Context) (result RunResult, runErr error) {
 
 	g, workerCtx := errgroup.WithContext(runCtx)
 	var prepared []job
-	enqueue := func(j job) { jobs <- j }
+	enqueue := func(j job) error {
+		select {
+		case jobs <- j:
+			return nil
+		case <-workerCtx.Done():
+			return workerCtx.Err()
+		}
+	}
 	if reviewed != nil || bound != nil {
 		// Planning is single-threaded in guarded mode. No mutation workers exist
 		// until the entire candidate plan has passed comparison.
-		enqueue = func(j job) {
+		enqueue = func(j job) error {
 			prepared = append(prepared, j)
 			switch j.kind {
 			case jobCreateBatch:
@@ -684,11 +689,15 @@ func (s *Service) Run(ctx context.Context) (result RunResult, runErr error) {
 			case jobCancelDuplicate:
 				result.CancelledDuplicates += int64(len(j.updateBatch))
 			}
+			return nil
 		}
 	} else {
 		for i := 0; i < s.cfg.Sync.Workers; i++ {
 			g.Go(func() error {
 				for job := range jobs {
+					if err := workerCtx.Err(); err != nil {
+						return err
+					}
 					if err := s.executeJob(workerCtx, job, &result); err != nil {
 						return err
 					}
@@ -700,14 +709,14 @@ func (s *Service) Run(ctx context.Context) (result RunResult, runErr error) {
 
 	if s.cfg.ReplaySafe {
 		baseEnqueue := enqueue
-		enqueue = func(j job) {
+		enqueue = func(j job) error {
 			for _, update := range j.updateBatch {
 				if update.Diff != nil {
 					slices.Sort(update.Diff.LabelsAdded)
 					slices.Sort(update.Diff.LabelsRemoved)
 				}
 			}
-			baseEnqueue(j)
+			return baseEnqueue(j)
 		}
 	}
 
@@ -738,7 +747,9 @@ func (s *Service) Run(ctx context.Context) (result RunResult, runErr error) {
 				plan.add("create", "no-reusable-ticket", fingerprint, nil, &desired)
 				createBatch = append(createBatch, desired)
 				if len(createBatch) == createBatchSize {
-					enqueue(job{kind: jobCreateBatch, desiredBatch: append([]model.DesiredIssue(nil), createBatch...)})
+					if err := enqueue(job{kind: jobCreateBatch, desiredBatch: append([]model.DesiredIssue(nil), createBatch...)}); err != nil {
+						return err
+					}
 					s.logQueueProgress(&queuedJobs, int64(len(createBatch)))
 					createBatch = createBatch[:0]
 				}
@@ -771,7 +782,9 @@ func (s *Service) Run(ctx context.Context) (result RunResult, runErr error) {
 				plan.add("update", "managed-fields-differ", fingerprint, &existing, &desired)
 				updateBatch = append(updateBatch, update)
 				if len(updateBatch) == createBatchSize {
-					enqueue(job{kind: jobUpdate, updateBatch: append([]model.IssueUpdate(nil), updateBatch...)})
+					if err := enqueue(job{kind: jobUpdate, updateBatch: append([]model.IssueUpdate(nil), updateBatch...)}); err != nil {
+						return err
+					}
 					s.logQueueProgress(&queuedJobs, int64(len(updateBatch)))
 					updateBatch = updateBatch[:0]
 				}
@@ -780,11 +793,15 @@ func (s *Service) Run(ctx context.Context) (result RunResult, runErr error) {
 			}
 		}
 		if len(createBatch) > 0 {
-			enqueue(job{kind: jobCreateBatch, desiredBatch: append([]model.DesiredIssue(nil), createBatch...)})
+			if err := enqueue(job{kind: jobCreateBatch, desiredBatch: append([]model.DesiredIssue(nil), createBatch...)}); err != nil {
+				return err
+			}
 			s.logQueueProgress(&queuedJobs, int64(len(createBatch)))
 		}
 		if len(updateBatch) > 0 {
-			enqueue(job{kind: jobUpdate, updateBatch: append([]model.IssueUpdate(nil), updateBatch...)})
+			if err := enqueue(job{kind: jobUpdate, updateBatch: append([]model.IssueUpdate(nil), updateBatch...)}); err != nil {
+				return err
+			}
 			s.logQueueProgress(&queuedJobs, int64(len(updateBatch)))
 		}
 
@@ -841,7 +858,9 @@ func (s *Service) Run(ctx context.Context) (result RunResult, runErr error) {
 				plan.add("resolve", "finding-absent", fingerprint, &existing, &resolved)
 				resolveBatch = append(resolveBatch, resolvedUpdate)
 				if len(resolveBatch) == createBatchSize {
-					enqueue(job{kind: jobResolve, updateBatch: append([]model.IssueUpdate(nil), resolveBatch...)})
+					if err := enqueue(job{kind: jobResolve, updateBatch: append([]model.IssueUpdate(nil), resolveBatch...)}); err != nil {
+						return err
+					}
 					s.logQueueProgress(&queuedJobs, int64(len(resolveBatch)))
 					resolveBatch = resolveBatch[:0]
 				}
@@ -850,7 +869,9 @@ func (s *Service) Run(ctx context.Context) (result RunResult, runErr error) {
 			}
 		}
 		if len(resolveBatch) > 0 {
-			enqueue(job{kind: jobResolve, updateBatch: append([]model.IssueUpdate(nil), resolveBatch...)})
+			if err := enqueue(job{kind: jobResolve, updateBatch: append([]model.IssueUpdate(nil), resolveBatch...)}); err != nil {
+				return err
+			}
 			s.logQueueProgress(&queuedJobs, int64(len(resolveBatch)))
 		}
 
@@ -882,14 +903,18 @@ func (s *Service) Run(ctx context.Context) (result RunResult, runErr error) {
 				plan.add("cancel-duplicate", "duplicate-fingerprint", duplicate.Fingerprint, &duplicate, &desired)
 				cancelBatch = append(cancelBatch, cancelUpdate)
 				if len(cancelBatch) == createBatchSize {
-					enqueue(job{kind: jobCancelDuplicate, updateBatch: append([]model.IssueUpdate(nil), cancelBatch...)})
+					if err := enqueue(job{kind: jobCancelDuplicate, updateBatch: append([]model.IssueUpdate(nil), cancelBatch...)}); err != nil {
+						return err
+					}
 					s.logQueueProgress(&queuedJobs, int64(len(cancelBatch)))
 					cancelBatch = cancelBatch[:0]
 				}
 			}
 		}
 		if len(cancelBatch) > 0 {
-			enqueue(job{kind: jobCancelDuplicate, updateBatch: append([]model.IssueUpdate(nil), cancelBatch...)})
+			if err := enqueue(job{kind: jobCancelDuplicate, updateBatch: append([]model.IssueUpdate(nil), cancelBatch...)}); err != nil {
+				return err
+			}
 			s.logQueueProgress(&queuedJobs, int64(len(cancelBatch)))
 		}
 
@@ -1091,7 +1116,9 @@ func (s *Service) executeReviewedJob(ctx context.Context, j job) error {
 	}
 	switch j.kind {
 	case jobCreateBatch:
-		failed, err := s.linear.CreateIssues(ctx, j.desiredBatch)
+		outcomes, err := s.linear.CreateIssues(ctx, j.desiredBatch)
+		failed, shapeErr := failedCreateOutcomes(outcomes, len(j.desiredBatch))
+		err = errors.Join(err, shapeErr)
 		if err != nil {
 			return fmt.Errorf("reviewed create failed or has uncertain outcome; stopped without retry (batch size=%d, failed indexes=%v): %w", len(j.desiredBatch), failed, err)
 		}
@@ -1128,40 +1155,23 @@ func (s *Service) executeJob(ctx context.Context, job job, result *RunResult) er
 		if s.cfg.DryRun {
 			return nil
 		}
-		failedIdx, err := s.linear.CreateIssues(ctx, job.desiredBatch)
-		if err != nil {
-			// No per-alias data at all (e.g. a transport failure): fall back
-			// to retrying every item individually, same as before.
-			s.logger.Warn("batch create failed, retrying issues individually",
-				slog.Int("batch_size", len(job.desiredBatch)),
-				slog.Any("error", err),
-			)
-			for _, desired := range job.desiredBatch {
-				if _, err := s.linear.CreateIssues(ctx, []model.DesiredIssue{desired}); err != nil {
-					atomic.AddInt64(&result.FailedOps, 1)
-					s.logger.Error("failed to create issue",
-						slog.String("fingerprint", desired.Fingerprint),
-						slog.Any("error", err),
-					)
-				}
+		outcomes, err := s.linear.CreateIssues(ctx, job.desiredBatch)
+		failedIdx, shapeErr := failedCreateOutcomes(outcomes, len(job.desiredBatch))
+		if err = errors.Join(err, shapeErr); err != nil {
+			atomic.AddInt64(&result.FailedOps, int64(len(failedIdx)))
+			return fmt.Errorf("create failed or has uncertain outcome; stopped without retry: %w", err)
+		}
+		for _, idx := range failedIdx {
+			desired := job.desiredBatch[idx]
+			retryOutcomes, retryErr := s.linear.CreateIssues(ctx, []model.DesiredIssue{desired})
+			stillFailed, shapeErr := failedCreateOutcomes(retryOutcomes, 1)
+			if retryErr = errors.Join(retryErr, shapeErr); retryErr != nil {
+				atomic.AddInt64(&result.FailedOps, 1)
+				return fmt.Errorf("create retry failed or has uncertain outcome: %w", retryErr)
 			}
-		} else if len(failedIdx) > 0 {
-			// Partial failure: the batch call told us exactly which items
-			// failed. Only retry those — the rest were already created and
-			// retrying them too would produce duplicate tickets.
-			s.logger.Warn("batch create had partial failures, retrying only the failed issues",
-				slog.Int("failed_count", len(failedIdx)),
-				slog.Int("batch_size", len(job.desiredBatch)),
-			)
-			for _, idx := range failedIdx {
-				desired := job.desiredBatch[idx]
-				if _, err := s.linear.CreateIssues(ctx, []model.DesiredIssue{desired}); err != nil {
-					atomic.AddInt64(&result.FailedOps, 1)
-					s.logger.Error("failed to create issue",
-						slog.String("fingerprint", desired.Fingerprint),
-						slog.Any("error", err),
-					)
-				}
+			if len(stillFailed) != 0 {
+				atomic.AddInt64(&result.FailedOps, 1)
+				s.logger.Error("failed to create issue", slog.String("fingerprint", desired.Fingerprint))
 			}
 		}
 		return nil
@@ -2751,4 +2761,32 @@ func sourceRegionString(finding model.Finding) string {
 		return fmt.Sprintf("line %d:%d-%d", finding.SourceLineStart, finding.SourceColumnStart, finding.SourceColumnEnd)
 	}
 	return fmt.Sprintf("line %d:%d to %d:%d", finding.SourceLineStart, finding.SourceColumnStart, finding.SourceLineEnd, finding.SourceColumnEnd)
+}
+
+// failedCreateOutcomes rejects incomplete or misbound responses before callers
+// consider retries. Order is part of the CreateIssues interface contract.
+func failedCreateOutcomes(outcomes []model.CreateOutcome, count int) ([]int, error) {
+	failed := make([]int, 0)
+	var err error
+	seenIDs := make(map[string]bool)
+	if len(outcomes) != count {
+		err = errors.New("create outcome count differs from inputs")
+	}
+	for i := range count {
+		if i >= len(outcomes) {
+			failed = append(failed, i)
+			continue
+		}
+		o := outcomes[i]
+		if o.Index != i || o.Acknowledged && strings.TrimSpace(o.ID) == "" || !o.Acknowledged && o.ID != "" || o.ID != "" && seenIDs[o.ID] {
+			err = errors.New("invalid create alias acknowledgement")
+		}
+		if o.ID != "" {
+			seenIDs[o.ID] = true
+		}
+		if !o.Acknowledged || strings.TrimSpace(o.ID) == "" {
+			failed = append(failed, i)
+		}
+	}
+	return failed, err
 }

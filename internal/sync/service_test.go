@@ -68,18 +68,20 @@ func (f *fakeLinear) LoadSnapshot(context.Context) ([]model.ExistingIssue, error
 	return f.snapshot, nil
 }
 
-func (f *fakeLinear) CreateIssues(_ context.Context, desired []model.DesiredIssue) ([]int, error) {
+func (f *fakeLinear) CreateIssues(_ context.Context, desired []model.DesiredIssue) ([]model.CreateOutcome, error) {
 	f.createCallBatches = append(f.createCallBatches, append([]model.DesiredIssue(nil), desired...))
-	var failed []int
+	outcomes := make([]model.CreateOutcome, len(desired))
 	for i, d := range desired {
+		outcomes[i].Index = i
 		if f.createFailFingerprints[d.Fingerprint] > 0 {
 			f.createFailFingerprints[d.Fingerprint]--
-			failed = append(failed, i)
 			continue
 		}
 		f.created = append(f.created, d)
+		outcomes[i].ID = fmt.Sprintf("created-%d", len(f.created))
+		outcomes[i].Acknowledged = true
 	}
-	return failed, nil
+	return outcomes, nil
 }
 
 func (f *fakeLinear) UpdateIssues(_ context.Context, updates []model.IssueUpdate) error {
