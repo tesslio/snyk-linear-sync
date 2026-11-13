@@ -167,6 +167,18 @@ func (s *Service) Run(ctx context.Context) (result RunResult, runErr error) {
 	if err := s.cfg.ValidateBound(); err != nil {
 		return result, err
 	}
+	var drain *drainRun
+	if s.cfg.PlanAndExecuteDrain {
+		if s.cache == nil {
+			return result, errors.New("drain requires an admitted cache")
+		}
+		var err error
+		drain, err = reserveDrainRun(s.cfg)
+		if err != nil {
+			return result, err
+		}
+		defer func() { runErr = drain.finish(runErr) }()
+	}
 	var bound *boundRun
 	if s.cfg.PlanAndExecuteBound {
 		var err error
@@ -187,7 +199,7 @@ func (s *Service) Run(ctx context.Context) (result RunResult, runErr error) {
 		}()
 	}
 
-	if s.cfg.PlanJSON != "" && ((!s.cfg.DryRun && !s.cfg.PlanAndExecuteBound) || s.cfg.PlanJSON == "-") {
+	if s.cfg.PlanJSON != "" && ((!s.cfg.DryRun && !s.cfg.PlanAndExecuteBound && !s.cfg.PlanAndExecuteDrain) || s.cfg.PlanJSON == "-") {
 		return RunResult{}, fmt.Errorf("plan export requires dry-run and a private file path")
 	}
 	// Read and validate accepted bytes once, before snapshot loading or workers.
@@ -220,6 +232,9 @@ func (s *Service) Run(ctx context.Context) (result RunResult, runErr error) {
 	)
 	cacheEnabled := s.cache != nil && !s.cfg.Cache.BypassCache
 	cacheSignature := managedSchemaSignature()
+	if drain != nil {
+		cacheSignature += "+drain-v1"
+	}
 	cacheSnapshot := cache.Snapshot{
 		SnykHashes:   map[string]string{},
 		LinearHashes: map[string]string{},
@@ -231,6 +246,11 @@ func (s *Service) Run(ctx context.Context) (result RunResult, runErr error) {
 		loaded, err := s.cache.Load(ctx)
 		if err != nil {
 			return RunResult{}, err
+		}
+		if drain != nil {
+			if err := drain.admit(s.cfg, loaded); err != nil {
+				return result, err
+			}
 		}
 		if loaded.SchemaSignature != "" && loaded.SchemaSignature != cacheSignature {
 			cacheEnabled = false
@@ -674,7 +694,7 @@ func (s *Service) Run(ctx context.Context) (result RunResult, runErr error) {
 			return workerCtx.Err()
 		}
 	}
-	if reviewed != nil || bound != nil {
+	if reviewed != nil || bound != nil || drain != nil {
 		// Planning is single-threaded in guarded mode. No mutation workers exist
 		// until the entire candidate plan has passed comparison.
 		enqueue = func(j job) error {
@@ -921,7 +941,7 @@ func (s *Service) Run(ctx context.Context) (result RunResult, runErr error) {
 		return nil
 	}
 
-	if reviewed != nil || bound != nil {
+	if reviewed != nil || bound != nil || drain != nil {
 		if err := produceJobs(); err != nil {
 			return result, err
 		}
@@ -930,6 +950,11 @@ func (s *Service) Run(ctx context.Context) (result RunResult, runErr error) {
 		}
 		currentPlan, err := plan.finish(result, guard)
 		if err != nil {
+			return result, err
+		}
+		if drain != nil {
+			result.Plan = currentPlan
+			err := s.executeDrain(runCtx, drain, currentPlan, prepared, findings, matchedExisting, existingIssues, snykHashes)
 			return result, err
 		}
 		if bound != nil {

@@ -681,9 +681,9 @@ uncertain-result overflow backstop after writes. Preflight counts every work
 operation as potentially pending, including selected work that may fail effect
 verification, and includes pending-row bytes even when fingerprints collapse.
 
-These protocol primitives are not yet connected to an execution flag. Producer
-artifact admission, version-2 receipt integration, and generation initialization
-must be completed and reviewed before drain execution is available. Structural
+The protocol primitives are connected to the explicit opt-in execution flag
+described below. Producer artifact admission and generation initialization
+remain caller responsibilities and must be reviewed before deployment. Structural
 cache validation alone does not prove producer provenance. Missing producer
 receipts must refuse without resetting pending ages or initializing a new cache.
 
@@ -700,8 +700,53 @@ publication; cancellation is also checked before another queued job executes.
 
 The cap counts issue reconciliation operations, not every API mutation.
 Subscription cleanup after creates and auxiliary comments are separate effects;
-future execution receipts must report them explicitly. Before runtime wiring,
-the evidence contract must also represent same-fingerprint membership drift:
+drain receipts account for comments and drain mode forbids subscription cleanup.
+The producer must also detect same-fingerprint membership drift:
 matched-ID hash overrides alone can hide a new competing copy even when the
-canonical issue hash did not change. This remains a required integration gate,
-not a case that the current collapsed hash evidence can prove safe.
+canonical issue hash did not change. Drain execution conservatively refuses checkpoint publication for unexplained
+membership changes, rather than treating collapsed hash evidence as proof.
+
+## Opt-in drain execution boundary
+
+The explicit `--plan-and-execute-drain` route reuses the actual single-snapshot
+planner, buffers its complete intent, selects whole causal groups oldest first
+under a shared maximum of 100 operations and four per-kind ceilings, and binds
+only the selected buffered payloads before executing them. The ordinary and
+all-or-nothing bounded routes retain their existing defaults and semantics.
+
+The caller supplies authenticated prior pending/evidence digests and the expected
+settings digest. The producer rejects absent/damaged/legacy state, repeated run
+identity, non-first attempts and stalled state before loading sources. A digest
+is a binding, not provenance: independent exact producer/cache admission,
+freshness, a durable single-writer lease and a cross-path attempt-one guard
+remain the caller's responsibility. No initializer or fallback is provided.
+
+After dispatch stops, even on a partial response, the mandatory fresh read
+verifies intended effects by ID. Only admitted fresh evidence can atomically
+advance pending ages/counters and both hash maps. Changed same-fingerprint
+membership must be explained by acknowledged selected creates or verified
+selected rebinds, otherwise publication refuses. This conservative refusal
+avoids extending the frozen offline withholding schema or trusting canonical
+content hashes as membership evidence. Concurrent unrelated arrivals never
+become cache hits.
+
+Issue mutation batches and optional one-shot comment calls have separate receipt
+counters. Subscription cleanup is refused for this mode rather than hiding its
+writes inside create acknowledgements. Uncertain mutations are never retried;
+failed comments are never replayed. A partial checkpoint does not turn an
+uncertain process result into success. The caller may publish only complete,
+independently validated saved receipts and the exact matching cache bytes.
+Runtime initialization, external admission, namespace and live activation remain
+outside this change. Synthetic tests use the real Service.Run planner and SQLite
+across generations; no test contacts a live service.
+
+An attempted create without a complete, valid acknowledged ID mapping refuses
+checkpoint publication even if a fresh read could show no new issue. Absence
+is not proof of non-creation. The caller must retain the failed attempt and
+require reconciliation before another attempt; it must not replay the old cache
+automatically. Fully acknowledged creates may advance only after the normal
+fresh effect and membership checks.
+
+If a comment was attempted but its underlying issue update remains unverified,
+checkpoint publication also refuses. Reconciliation is required rather than
+allowing a later generation to repeat that comment with the update.
