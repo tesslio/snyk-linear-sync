@@ -62,7 +62,7 @@ func run(cfg config.Config, logger *slog.Logger) error {
 		return err
 	}
 
-	if cfg.PlanJSON != "" && !cfg.PlanAndExecuteBound {
+	if cfg.PlanJSON != "" && !cfg.PlanAndExecuteBound && !cfg.PlanAndExecuteDrain {
 		if err := syncsvc.WritePlanJSON(cfg.PlanJSON, result.Plan); err != nil {
 			return err
 		}

@@ -832,9 +832,9 @@ sets. It is an offline compatibility contract, not an enabled execution route.
 
 The separate drain protocol primitives support deterministic whole-group
 selection of at most 100 total issue mutations, persistent pending ages, fresh
-ID-based effect verification, and atomic hash evidence. They are not yet wired
-to an execution flag. Existing bounded mode still refuses an oversized complete
-plan; this change alone does not activate incremental draining. Drain caches
+ID-based effect verification, and atomic hash evidence. They are exposed only through
+the explicit opt-in drain execution mode described below. Existing bounded mode
+still refuses an oversized complete plan; existing workflows remain unchanged. Drain caches
 use a separate signature and cannot be overwritten by this version's legacy
 cache writer. Consumer provenance checks and namespace fences remain required.
 Preflight bounds all potentially pending work entries and their encoded size,
@@ -850,3 +850,76 @@ Pending ages and unverified counters survive deferral. Missing restored work
 refuses rather than silently resetting its age; only a create-to-issue handoff
 can transfer ownership through a fingerprint. Three unverified selections while
 work remains pending stop further progress, even with intervening deferrals.
+
+### Opt-in drain execution (not deployed)
+
+`--plan-and-execute-drain` selects at most 100 total issue operations from the
+complete fresh plan rather than rejecting an oversized plan. This is a separate,
+explicit execution mode. No existing workflow or default enables it. It requires
+`--replay-safe`, a cache already initialized and independently admitted under the
+separate drain protocol, an immutable team UUID, a new private `--plan-json`
+path, all four per-kind ceilings, and these explicit options:
+
+- `--max-issue-changes` from 1 through 100;
+- `--drain-run-id`, a positive canonical decimal string of at most twenty digits;
+- `--drain-run-attempt 1`;
+- `--drain-prior-evidence-sha256` and `--drain-prior-pending-sha256`, obtained from
+  the caller's authenticated admission of the exact restored cache;
+- `--expected-settings-sha256`, binding the reviewed reconciliation settings.
+
+The supplied hashes bind the local state to that admission; they do not prove
+its origin. The caller must authenticate producer receipts, full plan, exact
+cache bytes and destination, enforce freshness and a durable single-writer and
+attempt-one guard, and retain receipts privately. There is no automatic
+initialization, legacy fallback, generation reset or retry by using a new output
+path. The mode refuses dry-run, the older bounded/reviewed modes, bypassing the
+cache and clearing cold-start protection. `LINEAR_UNSUBSCRIBE_ACTOR` must be
+explicitly false: hidden create-cleanup mutations are not supported by this
+execution contract. This requirement does not change ordinary-mode defaults.
+
+Whole causal groups are selected oldest pending first, with deterministic ties.
+Creates, updates (including reopens), resolves and duplicate cancellations all
+consume the same budget; optional comments are separate effects. A group that
+cannot fit the total or its kind ceiling refuses instead of being starved.
+Deferred aliases are withheld from the saved Linear hashes, so an unchanged
+source on the next run still plans their work. Missing pending work refuses;
+a no-op replan is not independent proof that an uncertain old effect finished.
+
+The exact full plan and canonical version-2 attempt are durably written before
+dispatch. Only selected payloads execute, once, in batches of at most ten.
+Partial or uncertain mutations stop later batches without retry. A fresh Linear
+read then verifies effects by issue ID and can commit a conservative partial
+checkpoint. The process still exits unsuccessfully for an uncertain outcome or
+unverified effects; only the caller's admission of a complete saved receipt may
+authorize publishing that checkpoint. A missing result is never publishable.
+
+Unexplained membership changes for known fingerprints refuse cache publication,
+including competing tickets hidden by canonical-ID hash overrides. Only
+acknowledged selected creates and independently verified selected rebinds may
+explain membership changes. Unrelated new fingerprints are excluded as arrivals.
+The prior checkpoint remains authoritative after a failed refresh or cache save.
+Pending ages, counters, hash evidence and sync hashes commit in one transaction;
+the third unverified checkpoint is retained and subsequent execution refuses.
+
+Optional comments use `auxiliary_comments.policy: per-batch-once`: update-batch
+comment calls and complete acknowledgements are counted separately from issue
+batches. A failed or uncertain comment is never retried, including in a later
+generation whose issue effect already verified. When comments are disabled,
+the policy is `disabled` with zero counters. These counters describe calls to
+the batched comment interface; that interface can omit comments with no diff.
+No durable comment retry queue is implied.
+
+This implementation does not supply the caller's provenance admission,
+initialization route, production namespace, single-writer lease or activation
+workflow. Those gates must be implemented and reviewed before deployment.
+
+An attempted create without a complete, valid acknowledged ID mapping refuses
+checkpoint publication even if a fresh read could show no new issue. Absence
+is not proof of non-creation. The caller must retain the failed attempt and
+require reconciliation before another attempt; it must not replay the old cache
+automatically. Fully acknowledged creates may advance only after the normal
+fresh effect and membership checks.
+
+If a comment was attempted but its underlying issue update remains unverified,
+checkpoint publication also refuses. Reconciliation is required rather than
+allowing a later generation to repeat that comment with the update.

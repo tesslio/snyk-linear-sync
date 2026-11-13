@@ -144,13 +144,12 @@ over the four kinds, of ceil(selected count for that kind / 10). Private payload
 are not needed to recompute this. An empty selection has zero batches.
 For normal receipts, `linear_writes_attempted` equals
 `batches_attempted > 0` for issue dispatch; auxiliary effects remain separately
-accounted for before runtime wiring. Cache admission requires a saved result whose
+accounted for by the auxiliary policy described below. Cache admission requires a saved result whose
 status is success or partial_or_uncertain and fully consistent evidence.
 Failures that lack committed evidence do not authorize a new generation.
 
 Auxiliary comments and create subscription cleanup are additional API effects,
-not issue operations. Their retry and receipt accounting must be finalized
-before runtime wiring; the issue cap does not bound every API mutation.
+not issue operations. The opt-in runtime policy below specifies their retry and receipt accounting; the issue cap does not bound every API mutation.
 
 ## Generation zero: distinct initialization receipts
 
@@ -240,3 +239,36 @@ pre-write key, and an excluded concurrent arrival. Negative cases reject number
 or leading-zero run IDs, empty refreshed evidence, and withholding outside R.
 This is an offline compatibility suite, not an authenticated producer, runtime
 integration test, or complete test of every future receipt failure mode.
+
+## Opt-in producer implementation
+
+The explicit, undeployed `--plan-and-execute-drain` producer preserves the field
+sets above. It binds supplied admitted prior-row digests and expected settings;
+external authenticated provenance, exact-cache binding, freshness and durable
+single-writer/attempt-one enforcement are still caller gates. There is no
+producer initialization route or implicit fallback.
+
+For membership safety this implementation refuses publication when the known
+fingerprint member sets change without an acknowledged selected create or a
+verified selected rebind explaining the change. It does not add a new W reason
+or silently admit a competing issue through a canonical hash override.
+
+`auxiliary_comments.policy` is `disabled` (zero counters) or `per-batch-once`.
+Counters describe update-batch comment-interface invocations and their complete
+acknowledgements, separately from issue batch acknowledgements. The interface
+can omit items without a meaningful diff. An uncertain comment stops later
+issue dispatch and is not retried in this or later generations. Create
+subscription cleanup is unsupported and must be disabled explicitly for this
+mode; ordinary-mode behavior is unchanged. Consumers must keep auxiliary
+uncertainty visible even when all issue effects verified and cache status saved.
+
+An attempted create without a complete, valid acknowledged ID mapping refuses
+checkpoint publication even if a fresh read could show no new issue. Absence
+is not proof of non-creation. The caller must retain the failed attempt and
+require reconciliation before another attempt; it must not replay the old cache
+automatically. Fully acknowledged creates may advance only after the normal
+fresh effect and membership checks.
+
+If a comment was attempted but its underlying issue update remains unverified,
+checkpoint publication also refuses. Reconciliation is required rather than
+allowing a later generation to repeat that comment with the update.

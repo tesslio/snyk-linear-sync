@@ -49,6 +49,12 @@ const (
 type Config struct {
 	DryRun                                                   bool
 	PlanAndExecuteBound                                      bool
+	PlanAndExecuteDrain                                      bool
+	MaxIssueChanges                                          *int64
+	DrainRunID                                               string
+	DrainRunAttempt                                          int64
+	DrainPriorEvidenceSHA256                                 string
+	DrainPriorPendingSHA256                                  string
 	ExpectedSettingsSHA256                                   string
 	MaxCreates, MaxUpdates, MaxResolves, MaxCancelDuplicates *int64
 	// PlanJSON exports a private complete plan in dry-run or bounded execution.
@@ -155,12 +161,18 @@ func Load(args []string) (Config, error) {
 
 	expectedSettings := fs.String("expected-settings-sha256", "", "require matching settings and no deferred creates before bounded execution")
 	bound := fs.Bool("plan-and-execute-bound", false, "plan once, bind private receipts, then execute within explicit limits")
+	drain := fs.Bool("plan-and-execute-drain", false, "explicit opt-in bounded drain of an admitted generation")
+	maxIssueChanges := boundFlag(fs, "max-issue-changes", "maximum total selected issue operations, from 1 through 100")
+	drainRunID := fs.String("drain-run-id", "", "canonical decimal producer run ID")
+	drainRunAttempt := boundFlag(fs, "drain-run-attempt", "producer run attempt, must be 1")
+	drainPriorEvidence := fs.String("drain-prior-evidence-sha256", "", "admitted prior hash evidence digest")
+	drainPriorPending := fs.String("drain-prior-pending-sha256", "", "admitted prior pending digest")
 	maxCreates := boundFlag(fs, "max-creates", "maximum creates for bounded execution (required)")
 	maxUpdates := boundFlag(fs, "max-updates", "maximum updates including reopens (required)")
 	maxResolves := boundFlag(fs, "max-resolves", "maximum resolves (required)")
 	maxCancelDuplicates := boundFlag(fs, "max-cancel-duplicates", "maximum duplicate cancellations for bounded execution (required)")
 	dryRun := fs.Bool("dry-run", false, "plan changes without mutating Linear")
-	planJSON := fs.String("plan-json", "", "write a private JSON plan to a new file (requires --dry-run or --plan-and-execute-bound)")
+	planJSON := fs.String("plan-json", "", "write a private JSON plan to a new file (requires --dry-run, --plan-and-execute-bound, or --plan-and-execute-drain)")
 	reviewedPlanJSON := fs.String("reviewed-plan-json", "", "require this complete private dry-run reconciliation plan before live writes")
 	reviewedPlanSHA256 := fs.String("reviewed-plan-sha256", "", "independently reviewed SHA-256 of the exact approved plan file bytes")
 	replaySafe := fs.Bool("replay-safe", false, "use v2 deterministic ordering and mandatory fresh source reads")
@@ -175,6 +187,16 @@ func Load(args []string) (Config, error) {
 	}
 	supplied := map[string]bool{}
 	fs.Visit(func(f *flag.Flag) { supplied[f.Name] = true })
+	if !supplied["max-issue-changes"] {
+		maxIssueChanges = nil
+	}
+	if !*drain {
+		for _, name := range []string{"max-issue-changes", "drain-run-id", "drain-run-attempt", "drain-prior-evidence-sha256", "drain-prior-pending-sha256"} {
+			if supplied[name] {
+				return Config{}, errors.New("drain options require --plan-and-execute-drain")
+			}
+		}
+	}
 	if !supplied["max-creates"] {
 		maxCreates = nil
 	}
@@ -210,19 +232,25 @@ func Load(args []string) (Config, error) {
 	}
 
 	cfg := Config{
-		DryRun:                  *dryRun,
-		PlanAndExecuteBound:     *bound,
-		ExpectedSettingsSHA256:  *expectedSettings,
-		MaxCreates:              maxCreates,
-		MaxUpdates:              maxUpdates,
-		MaxResolves:             maxResolves,
-		MaxCancelDuplicates:     maxCancelDuplicates,
-		PlanJSON:                strings.TrimSpace(*planJSON),
-		ReviewedPlanJSON:        strings.TrimSpace(*reviewedPlanJSON),
-		ReviewedPlanSHA256:      strings.ToLower(strings.TrimSpace(*reviewedPlanSHA256)),
-		ReplaySafe:              *replaySafe,
-		ObservationCheckpoint:   strings.TrimSpace(*observationCheckpoint),
-		ObservationSourceSHA256: strings.ToLower(strings.TrimSpace(*observationSourceSHA256)),
+		DryRun:                   *dryRun,
+		PlanAndExecuteBound:      *bound,
+		PlanAndExecuteDrain:      *drain,
+		MaxIssueChanges:          maxIssueChanges,
+		DrainRunID:               *drainRunID,
+		DrainRunAttempt:          *drainRunAttempt,
+		DrainPriorEvidenceSHA256: *drainPriorEvidence,
+		DrainPriorPendingSHA256:  *drainPriorPending,
+		ExpectedSettingsSHA256:   *expectedSettings,
+		MaxCreates:               maxCreates,
+		MaxUpdates:               maxUpdates,
+		MaxResolves:              maxResolves,
+		MaxCancelDuplicates:      maxCancelDuplicates,
+		PlanJSON:                 strings.TrimSpace(*planJSON),
+		ReviewedPlanJSON:         strings.TrimSpace(*reviewedPlanJSON),
+		ReviewedPlanSHA256:       strings.ToLower(strings.TrimSpace(*reviewedPlanSHA256)),
+		ReplaySafe:               *replaySafe,
+		ObservationCheckpoint:    strings.TrimSpace(*observationCheckpoint),
+		ObservationSourceSHA256:  strings.ToLower(strings.TrimSpace(*observationSourceSHA256)),
 		Log: LogConfig{
 			ErrorFile: getEnv("ERROR_LOG_FILE", defaultErrorLogFile),
 		},
@@ -289,8 +317,8 @@ func (c Config) Validate() error {
 	if err := c.ValidateBound(); err != nil {
 		errs = append(errs, err)
 	}
-	if c.ReplaySafe && c.ObservationCheckpoint == "" && c.PlanJSON == "" && c.ReviewedPlanJSON == "" && !c.PlanAndExecuteBound {
-		errs = append(errs, errors.New("--replay-safe requires plan export, reviewed execution, bounded execution, or observation checkpoint"))
+	if c.ReplaySafe && c.ObservationCheckpoint == "" && c.PlanJSON == "" && c.ReviewedPlanJSON == "" && !c.PlanAndExecuteBound && !c.PlanAndExecuteDrain {
+		errs = append(errs, errors.New("--replay-safe requires plan export, reviewed execution, bounded or drain execution, or observation checkpoint"))
 	}
 	if (c.ObservationCheckpoint == "") != (c.ObservationSourceSHA256 == "") {
 		errs = append(errs, errors.New("--observation-checkpoint and --observation-source-sha256 must be supplied together"))
@@ -307,8 +335,8 @@ func (c Config) Validate() error {
 			errs = append(errs, errors.New("observation checkpoint requires source SHA-256"))
 		}
 	}
-	if c.PlanJSON != "" && !c.DryRun && !c.PlanAndExecuteBound {
-		errs = append(errs, errors.New("--plan-json requires --dry-run"))
+	if c.PlanJSON != "" && !c.DryRun && !c.PlanAndExecuteBound && !c.PlanAndExecuteDrain {
+		errs = append(errs, errors.New("--plan-json requires --dry-run or explicit bounded/drain execution"))
 	}
 	if c.PlanJSON == "-" {
 		errs = append(errs, errors.New("--plan-json requires a private file path, not stdout"))
@@ -531,6 +559,12 @@ func parseLabelMap(envName, raw string) (map[string]string, error) {
 
 // ValidateBound is also called by Service.Run, before any loader or cache access.
 func (c Config) ValidateBound() error {
+	if c.PlanAndExecuteDrain {
+		return c.ValidateDrain()
+	}
+	if c.MaxIssueChanges != nil || c.DrainRunID != "" || c.DrainRunAttempt != 0 || c.DrainPriorEvidenceSHA256 != "" || c.DrainPriorPendingSHA256 != "" {
+		return errors.New("drain options require --plan-and-execute-drain")
+	}
 	if !c.PlanAndExecuteBound {
 		if c.ExpectedSettingsSHA256 != "" || c.MaxCreates != nil || c.MaxUpdates != nil || c.MaxResolves != nil || c.MaxCancelDuplicates != nil {
 			return errors.New("bounded options require --plan-and-execute-bound")
