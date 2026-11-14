@@ -304,7 +304,7 @@ Default offsets:
 
 ## Performance Model
 
-The adaptive transport honors zero-delay retry instructions. It closes original request bodies when replay uses a fresh body or cancellation prevents dispatch; once the original body is dispatched, the base transport owns its closure.
+The adaptive transport treats a zero-second `Retry-After` as zero delay for that header, instead of substituting the default backoff. Request-limit headers and shared rate-limit windows retain precedence and can still delay dispatch, including the fallback delay when a request-limit reset is absent or invalid. It closes original request bodies when replay uses a fresh body or cancellation prevents dispatch; once the original body is dispatched, the base transport owns its closure.
 
 The project is designed for thousands of issues.
 
