@@ -114,12 +114,13 @@ func findRegion(alias string) (snyksdk.Region, bool) {
 }
 
 func (c *Client) decodeJSON(resp *http.Response, into any) (failure error) {
+	validationFailed := false
 	defer func() {
 		if failure != nil {
 			family := diagnostic.Family(failure)
 			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 				family = "http_status"
-			} else if family == "unknown" {
+			} else if validationFailed {
 				family = "invalid_response"
 			}
 			diagnostic.ResponseFailure(c.logger, resp, family)
@@ -137,6 +138,7 @@ func (c *Client) decodeJSON(resp *http.Response, into any) (failure error) {
 			return fmt.Errorf("read complete Snyk response: %w", err)
 		}
 		if err := validateFreshJSON(body, into); err != nil {
+			validationFailed = true
 			return err
 		}
 		return json.Unmarshal(body, into)
