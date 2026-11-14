@@ -1,0 +1,121 @@
+[
+  {
+    "name": "rest-503-exhausted",
+    "diagnostic": {
+      "version": 1,
+      "provider": "snyk",
+      "stage": "snyk_rest",
+      "endpoint": "/rest/orgs/{org}/issues",
+      "method": "GET",
+      "phase": "transport",
+      "status": 503,
+      "family": "http_status",
+      "attempt_scope": "transport",
+      "attempts": 5,
+      "retry_exhausted": true,
+      "elapsed_ms": 0
+    }
+  },
+  {
+    "name": "oauth-503",
+    "diagnostic": {
+      "version": 1,
+      "provider": "snyk",
+      "stage": "snyk_oauth",
+      "endpoint": "/oauth2/token",
+      "method": "POST",
+      "phase": "operation",
+      "status": 503,
+      "family": "http_status",
+      "attempt_scope": "token_source",
+      "attempts": null,
+      "retry_exhausted": null,
+      "elapsed_ms": 0
+    }
+  },
+  {
+    "name": "sdk-timeout",
+    "diagnostic": {
+      "version": 1,
+      "provider": "snyk",
+      "stage": "snyk_sdk",
+      "endpoint": "/rest/orgs/{org}/projects",
+      "method": "GET",
+      "phase": "transport",
+      "status": null,
+      "family": "timeout",
+      "attempt_scope": "transport",
+      "attempts": 1,
+      "retry_exhausted": false,
+      "elapsed_ms": 0
+    }
+  },
+  {
+    "name": "v1-truncated-body",
+    "diagnostic": {
+      "version": 1,
+      "provider": "snyk",
+      "stage": "snyk_v1",
+      "endpoint": "/v1/org/{org}/project/{project}/ignores",
+      "method": "GET",
+      "phase": "response_read",
+      "status": 200,
+      "family": "truncated_response",
+      "attempt_scope": "transport",
+      "attempts": 1,
+      "retry_exhausted": false,
+      "elapsed_ms": 0
+    }
+  },
+  {
+    "name": "rest-validation",
+    "diagnostic": {
+      "version": 1,
+      "provider": "snyk",
+      "stage": "snyk_rest",
+      "endpoint": "/rest/orgs/{org}/issues",
+      "method": "GET",
+      "phase": "response_validation",
+      "status": 200,
+      "family": "invalid_response",
+      "attempt_scope": "transport",
+      "attempts": null,
+      "retry_exhausted": null,
+      "elapsed_ms": null
+    }
+  },
+  {
+    "name": "linear-graphql",
+    "diagnostic": {
+      "version": 1,
+      "provider": "linear",
+      "stage": "linear_graphql",
+      "endpoint": "/graphql",
+      "method": "POST",
+      "phase": "operation",
+      "status": null,
+      "family": "graphql",
+      "attempt_scope": "graphql_execute",
+      "attempts": 1,
+      "retry_exhausted": false,
+      "elapsed_ms": 0
+    }
+  },
+  {
+    "name": "unknown",
+    "diagnostic": {
+      "version": 1,
+      "provider": "unknown",
+      "stage": "unknown",
+      "endpoint": "unknown",
+      "method": "unknown",
+      "phase": "unknown",
+      "status": null,
+      "family": "unknown",
+      "attempt_scope": "unknown",
+      "attempts": null,
+      "retry_exhausted": null,
+      "elapsed_ms": null
+    }
+  }
+]

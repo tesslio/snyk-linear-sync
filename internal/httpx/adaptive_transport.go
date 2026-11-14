@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"sync"
 	"time"
+
+	"github.com/tesslio/snyk-linear-sync/internal/diagnostic"
 )
 
 const defaultBackoff = 2 * time.Second
@@ -43,7 +45,28 @@ func NewAdaptiveTransport(name string, maxConcurrent int, logger *slog.Logger, b
 	}
 }
 
-func (t *AdaptiveTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+func (t *AdaptiveTransport) RoundTrip(req *http.Request) (response *http.Response, failure error) {
+	start := time.Now()
+	evidence := diagnostic.Request(t.name, req)
+	evidence.Phase = "transport"
+	attempts := 0
+	evidence.RetryExhausted = new(false)
+	defer func() {
+		evidence.Attempts = new(attempts)
+		if response != nil {
+			evidence.Status = new(response.StatusCode)
+		}
+		if failure != nil {
+			evidence.Family = diagnostic.Family(failure)
+			diagnostic.Emit(t.logger, evidence, start)
+		} else if response != nil {
+			if response.StatusCode < 200 || response.StatusCode >= 300 {
+				evidence.Family = "http_status"
+				diagnostic.Emit(t.logger, evidence, start)
+			}
+			diagnostic.ObserveBody(response, evidence, start, t.logger)
+		}
+	}()
 	if err := t.acquire(req.Context()); err != nil {
 		return nil, err
 	}
@@ -60,6 +83,7 @@ func (t *AdaptiveTransport) RoundTrip(req *http.Request) (*http.Response, error)
 			return nil, err
 		}
 
+		attempts++
 		resp, err := t.base.RoundTrip(currentReq)
 		if err != nil {
 			return nil, err
@@ -74,6 +98,7 @@ func (t *AdaptiveTransport) RoundTrip(req *http.Request) (*http.Response, error)
 		}
 
 		if RetriesDisabled(req.Context()) || !canRetry(req) || attempt >= 4 {
+			evidence.RetryExhausted = new(!RetriesDisabled(req.Context()) && canRetry(req) && attempt >= 4)
 			return resp, nil
 		}
 

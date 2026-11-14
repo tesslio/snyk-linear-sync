@@ -19,6 +19,7 @@ import (
 	linearapi "github.com/guillermo/linear/linear-api"
 
 	"github.com/tesslio/snyk-linear-sync/internal/config"
+	"github.com/tesslio/snyk-linear-sync/internal/diagnostic"
 	"github.com/tesslio/snyk-linear-sync/internal/httpx"
 	"github.com/tesslio/snyk-linear-sync/internal/model"
 )
@@ -1905,7 +1906,24 @@ func commentCreateMutation(size int) string {
 	return builder.String()
 }
 
-func (c *Client) execute(ctx context.Context, op *gqlclient.Operation, out any) error {
+func (c *Client) execute(ctx context.Context, op *gqlclient.Operation, out any) (failure error) {
+	start := time.Now()
+	attempts := 0
+	exhausted := false
+	defer func() {
+		if failure != nil {
+			record := diagnostic.Record{Provider: "linear", Stage: "linear_graphql", Endpoint: "/graphql", Method: "POST", Phase: "operation", Scope: "graphql_execute", Family: diagnostic.Family(failure), Attempts: new(attempts), RetryExhausted: new(exhausted)}
+			var httpError *gqlclient.HTTPError
+			var graphQLError *gqlclient.Error
+			if errors.As(failure, &httpError) {
+				record.Status = new(httpError.StatusCode)
+				record.Family = "http_status"
+			} else if errors.As(failure, &graphQLError) {
+				record.Family = "graphql"
+			}
+			diagnostic.Emit(c.log, record, start)
+		}
+	}()
 	var lastErr error
 	destination := reflect.ValueOf(out)
 	if destination.Kind() != reflect.Pointer || destination.IsNil() {
@@ -1924,6 +1942,7 @@ func (c *Client) execute(ctx context.Context, op *gqlclient.Operation, out any) 
 		// retry's response: omitted fields must remain absent, not look complete
 		// because a failed earlier attempt happened to populate them.
 		response := reflect.New(destination.Type().Elem())
+		attempts++
 		if err := c.gql.Execute(ctx, op, response.Interface()); err != nil {
 			lastErr = err
 			if httpx.RetriesDisabled(ctx) || !isLinearRateLimitError(err) {
@@ -1955,6 +1974,7 @@ func (c *Client) execute(ctx context.Context, op *gqlclient.Operation, out any) 
 		return nil
 	}
 
+	exhausted = true
 	return lastErr
 }
 

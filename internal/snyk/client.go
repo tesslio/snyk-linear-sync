@@ -19,6 +19,7 @@ import (
 
 	"github.com/tesslio/snyk-linear-sync/internal/cache"
 	"github.com/tesslio/snyk-linear-sync/internal/config"
+	"github.com/tesslio/snyk-linear-sync/internal/diagnostic"
 	"github.com/tesslio/snyk-linear-sync/internal/httpx"
 )
 
@@ -65,6 +66,7 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Client, 
 	httpClient := &http.Client{
 		Transport: &httpx.BearerTransport{
 			Base:        baseTransport,
+			Logger:      logger,
 			TokenSource: oauthCfg.TokenSource(ctx),
 		},
 	}
@@ -111,7 +113,18 @@ func findRegion(alias string) (snyksdk.Region, bool) {
 	return snyksdk.Region{}, false
 }
 
-func (c *Client) decodeJSON(resp *http.Response, into any) error {
+func (c *Client) decodeJSON(resp *http.Response, into any) (failure error) {
+	defer func() {
+		if failure != nil {
+			family := diagnostic.Family(failure)
+			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+				family = "http_status"
+			} else if family == "unknown" {
+				family = "invalid_response"
+			}
+			diagnostic.ResponseFailure(c.logger, resp, family)
+		}
+	}()
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(resp.Body)

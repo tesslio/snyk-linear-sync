@@ -17,6 +17,7 @@ import (
 	snyksdk "github.com/pavel-snyk/snyk-sdk-go/v2/snyk"
 
 	"github.com/tesslio/snyk-linear-sync/internal/cache"
+	"github.com/tesslio/snyk-linear-sync/internal/diagnostic"
 	"github.com/tesslio/snyk-linear-sync/internal/model"
 )
 
@@ -1130,6 +1131,9 @@ func (c *Client) fetchProjectIgnoresWithRetry(ctx context.Context, projectID str
 
 		body, readErr := io.ReadAll(resp.Body)
 		resp.Body.Close()
+		if readErr != nil {
+			diagnostic.ResponseFailure(c.logger, resp, diagnostic.Family(readErr))
+		}
 		if c.requireFresh && readErr != nil {
 			return nil, fmt.Errorf("read complete Snyk ignores response: %w", readErr)
 		}
@@ -1166,11 +1170,13 @@ func (c *Client) fetchProjectIgnoresWithRetry(ctx context.Context, projectID str
 
 		if c.requireFresh {
 			if err := validateFreshIgnores(body); err != nil {
+				diagnostic.ResponseFailure(c.logger, resp, "invalid_response")
 				return nil, err
 			}
 		}
 		var attemptIgnores v1ProjectIgnores
 		if err := json.Unmarshal(body, &attemptIgnores); err != nil {
+			diagnostic.ResponseFailure(c.logger, resp, "invalid_response")
 			lastErr = fmt.Errorf("decode v1 ignores: %w", err)
 			lastErrNotFound = false
 			c.logger.Warn("v1 ignores decode failed, retrying",
@@ -1489,8 +1495,10 @@ func (c *Client) listProjects(ctx context.Context) ([]projectRef, error) {
 	opts := &snyksdk.ListProjectsOptions{}
 
 	for {
-		page, resp, err := c.sdk.Projects.List(ctx, c.orgID, opts)
+		start := time.Now()
+		page, resp, err := c.sdk.Projects.List(diagnostic.SDKContext(ctx), c.orgID, opts)
 		if err != nil {
+			diagnostic.Emit(c.logger, diagnostic.Record{Provider: "snyk", Stage: "snyk_sdk", Endpoint: "/rest/orgs/{org}/projects", Method: "GET", Phase: "operation", Scope: "sdk_call", Attempts: new(1), Family: diagnostic.Family(err)}, start)
 			return nil, fmt.Errorf("list Snyk projects: %w", err)
 		}
 
