@@ -304,6 +304,8 @@ Default offsets:
 
 ## Performance Model
 
+The adaptive transport honors zero-delay retry instructions. It closes original request bodies when replay uses a fresh body or cancellation prevents dispatch; once the original body is dispatched, the base transport owns its closure.
+
 The project is designed for thousands of issues.
 
 It uses:

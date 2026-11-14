@@ -44,6 +44,12 @@ func NewAdaptiveTransport(name string, maxConcurrent int, logger *slog.Logger, b
 }
 
 func (t *AdaptiveTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	originalHandedOff := false
+	defer func() {
+		if req.Body != nil && !originalHandedOff {
+			_ = req.Body.Close()
+		}
+	}()
 	if err := t.acquire(req.Context()); err != nil {
 		return nil, err
 	}
@@ -60,6 +66,11 @@ func (t *AdaptiveTransport) RoundTrip(req *http.Request) (*http.Response, error)
 			return nil, err
 		}
 
+		// Replayable requests use a fresh body; otherwise the base transport
+		// takes ownership of the original, including on error.
+		if req.GetBody == nil {
+			originalHandedOff = true
+		}
 		resp, err := t.base.RoundTrip(currentReq)
 		if err != nil {
 			return nil, err
@@ -188,7 +199,7 @@ func isRequestRateLimitedResponse(resp *http.Response) bool {
 func retryAfter(header http.Header, attempt int) time.Duration {
 	raw := header.Get("Retry-After")
 	if raw != "" {
-		if seconds, err := strconv.Atoi(raw); err == nil && seconds > 0 {
+		if seconds, err := strconv.Atoi(raw); err == nil && seconds >= 0 {
 			return time.Duration(seconds) * time.Second
 		}
 		if when, err := http.ParseTime(raw); err == nil {
