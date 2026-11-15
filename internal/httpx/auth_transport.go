@@ -1,7 +1,12 @@
 package httpx
 
 import (
+	"errors"
+	"log/slog"
 	"net/http"
+	"time"
+
+	"github.com/tesslio/snyk-linear-sync/internal/diagnostic"
 
 	"golang.org/x/oauth2"
 )
@@ -9,11 +14,20 @@ import (
 type BearerTransport struct {
 	Base        http.RoundTripper
 	TokenSource oauth2.TokenSource
+	Logger      *slog.Logger
 }
 
 func (t *BearerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	start := time.Now()
 	token, err := t.TokenSource.Token()
 	if err != nil {
+		r := diagnostic.Record{Provider: "snyk", Stage: "snyk_oauth", Endpoint: "/oauth2/token", Method: "POST", Phase: "operation", Scope: "token_source", Family: diagnostic.Family(err)}
+		var retrieval *oauth2.RetrieveError
+		if errors.As(err, &retrieval) && retrieval.Response != nil {
+			r.Status = new(retrieval.Response.StatusCode)
+			r.Family = "http_status"
+		}
+		diagnostic.Emit(t.Logger, r, start)
 		return nil, err
 	}
 

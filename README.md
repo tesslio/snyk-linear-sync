@@ -850,3 +850,16 @@ Pending ages and unverified counters survive deferral. Missing restored work
 refuses rather than silently resetting its age; only a create-to-issue handoff
 can transfer ownership through a fingerprint. Three unverified selections while
 work remains pending stop further progress, even with intervening deferrals.
+
+### Safe external failure diagnostics
+
+Instrumented external failures emit a versioned `diagnostic_json` log field with
+fixed provider/stage/endpoint labels, failure family, observed status, scoped
+attempt counts and elapsed time. See [the version 1 contract and fixtures](docs/failure-diagnostics-v1.md).
+Only validated diagnostic objects are suitable for retained evidence; ordinary
+logs and returned errors can contain private values. These records do not change
+retries or establish the final sync outcome.
+
+Body-read failures retain the `response_read` phase, separate from decode and
+validation failures. Joined error branches preserve cancellation and timeout
+precedence regardless of branch order.

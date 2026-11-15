@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/tesslio/snyk-linear-sync/internal/cache"
 	"github.com/tesslio/snyk-linear-sync/internal/config"
+	"github.com/tesslio/snyk-linear-sync/internal/diagnostic"
 	"github.com/tesslio/snyk-linear-sync/internal/httpx"
 )
 
@@ -65,6 +67,7 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Client, 
 	httpClient := &http.Client{
 		Transport: &httpx.BearerTransport{
 			Base:        baseTransport,
+			Logger:      logger,
 			TokenSource: oauthCfg.TokenSource(ctx),
 		},
 	}
@@ -111,27 +114,65 @@ func findRegion(alias string) (snyksdk.Region, bool) {
 	return snyksdk.Region{}, false
 }
 
-func (c *Client) decodeJSON(resp *http.Response, into any) error {
+func (c *Client) decodeJSON(resp *http.Response, into any) (failure error) {
+	validationFailed := false
+	readFailed := false
+	defer func() {
+		if failure != nil && !readFailed {
+			family := diagnostic.Family(failure)
+			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+				family = "http_status"
+			} else if validationFailed {
+				family = "invalid_response"
+			}
+			diagnostic.ResponseFailure(c.logger, resp, family)
+		}
+	}()
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
+		body, readErr := io.ReadAll(resp.Body)
+		diagnostic.ResponseReadFailure(c.logger, resp, readErr)
 		return fmt.Errorf("snyk API %s %s failed with %d: %s", resp.Request.Method, resp.Request.URL, resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 
 	if c.requireFresh {
 		body, err := io.ReadAll(resp.Body)
 		if err != nil {
+			readFailed = true
+			diagnostic.ResponseReadFailure(c.logger, resp, err)
 			return fmt.Errorf("read complete Snyk response: %w", err)
 		}
 		if err := validateFreshJSON(body, into); err != nil {
+			validationFailed = true
 			return err
 		}
 		return json.Unmarshal(body, into)
 	}
-	if err := json.NewDecoder(resp.Body).Decode(into); err != nil {
+	reader := &responseReader{Reader: resp.Body}
+	err := json.NewDecoder(reader).Decode(into)
+	if reader.failure != nil {
+		diagnostic.ResponseReadFailure(c.logger, resp, reader.failure)
+	}
+	if err != nil {
+		readFailed = reader.failure != nil && errors.Is(err, reader.failure)
 		return fmt.Errorf("decode Snyk API response: %w", err)
 	}
 	return nil
+}
+
+// Track actual I/O failures separately from errors produced by the streaming
+// decoder. Do not buffer or change the decoder's reads or returned errors.
+type responseReader struct {
+	io.Reader
+	failure error
+}
+
+func (r *responseReader) Read(p []byte) (int, error) {
+	n, err := r.Reader.Read(p)
+	if err != nil && err != io.EOF {
+		r.failure = err
+	}
+	return n, err
 }
 
 // SourceReads describes successful reads in the most recent strict snapshot.
