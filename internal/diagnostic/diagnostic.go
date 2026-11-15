@@ -42,8 +42,7 @@ func Family(err error) string {
 	if errors.Is(err, context.DeadlineExceeded) {
 		return "timeout"
 	}
-	var ne net.Error
-	if errors.As(err, &ne) && ne.Timeout() {
+	if hasTimeout(err) {
 		return "timeout"
 	}
 	if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) {
@@ -54,10 +53,33 @@ func Family(err error) string {
 	if errors.As(err, &syntax) || errors.As(err, &typeError) {
 		return "invalid_response"
 	}
+	var ne net.Error
 	if errors.As(err, &ne) {
 		return "network"
 	}
 	return "unknown"
+}
+
+// errors.As finds only the first matching error. Inspect every unwrap branch
+// before allowing a lower-priority family to win, including beneath net.Errors
+// whose own Timeout method returns false.
+func hasTimeout(err error) bool {
+	if err == nil {
+		return false
+	}
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return true
+	}
+	switch e := err.(type) {
+	case interface{ Unwrap() []error }:
+		if slices.ContainsFunc(e.Unwrap(), hasTimeout) {
+			return true
+		}
+	case interface{ Unwrap() error }:
+		return hasTimeout(e.Unwrap())
+	}
+	return false
 }
 
 type sdkKey struct{}
@@ -167,7 +189,27 @@ func ObserveBody(resp *http.Response, r Record, start time.Time, logger *slog.Lo
 		resp.Body = &body{ReadCloser: resp.Body, record: r, start: start, logger: logger}
 	}
 }
+
+// ResponseReadFailure reports an actual non-EOF body read failure, unless the
+// transport's body observer already reported it. Decode/validation failures use
+// ResponseFailure, even when their family is truncated_response.
+func ResponseReadFailure(logger *slog.Logger, resp *http.Response, err error) {
+	if err == nil || err == io.EOF {
+		return
+	}
+	if resp != nil {
+		if b, ok := resp.Body.(*body); ok && b.reported {
+			return
+		}
+	}
+	responseFailure(logger, resp, "response_read", Family(err))
+}
+
 func ResponseFailure(logger *slog.Logger, resp *http.Response, family string) {
+	responseFailure(logger, resp, "response_validation", family)
+}
+
+func responseFailure(logger *slog.Logger, resp *http.Response, phase, family string) {
 	r := Request("snyk", nil)
 	var start time.Time
 	if resp != nil {
@@ -177,6 +219,6 @@ func ResponseFailure(logger *slog.Logger, resp *http.Response, family string) {
 			r, start = b.record, b.start
 		}
 	}
-	r.Phase, r.Family = "response_validation", family
+	r.Phase, r.Family = phase, family
 	Emit(logger, r, start)
 }

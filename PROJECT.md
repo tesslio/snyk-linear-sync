@@ -714,3 +714,7 @@ Attempt counts are scoped to the boundary that observed them; unavailable facts
 remain unknown. Diagnostics are observational: retries, complete-source checks,
 mutation authorization, lineage and cache safeguards retain their existing behavior.
 Consumers own validation, bounded retention and truthful final-outcome reporting.
+
+Body-read failures retain the `response_read` phase, separate from decode and
+validation failures. Joined error branches preserve cancellation and timeout
+precedence regardless of branch order.

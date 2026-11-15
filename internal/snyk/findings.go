@@ -1132,7 +1132,7 @@ func (c *Client) fetchProjectIgnoresWithRetry(ctx context.Context, projectID str
 		body, readErr := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if readErr != nil {
-			diagnostic.ResponseFailure(c.logger, resp, diagnostic.Family(readErr))
+			diagnostic.ResponseReadFailure(c.logger, resp, readErr)
 		}
 		if c.requireFresh && readErr != nil {
 			return nil, fmt.Errorf("read complete Snyk ignores response: %w", readErr)

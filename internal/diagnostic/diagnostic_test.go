@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -106,5 +107,46 @@ func TestConsumerFixturesAndTextEncoding(t *testing.T) {
 				t.Fatalf("fixture changed: %+v", actual)
 			}
 		})
+	}
+}
+
+// Every permutation must select the same highest-priority family, regardless of
+// whether a non-timeout net.Error masks later siblings or nested children.
+func TestFamilyTimeoutAcrossJoinedBranches(t *testing.T) {
+	branches := []error{
+		&net.DNSError{Err: "SYNTHETIC_SECRET"},
+		&net.DNSError{Err: "SYNTHETIC_SECRET", IsTimeout: true},
+		io.ErrUnexpectedEOF,
+	}
+	for i := range branches {
+		for j := range branches {
+			if i == j {
+				continue
+			}
+			k := 3 - i - j
+			for _, err := range []error{
+				errors.Join(branches[i], branches[j], branches[k]),
+				fmt.Errorf("SYNTHETIC_SECRET: %w", errors.Join(branches[i], errors.Join(branches[j], branches[k]))),
+				&url.Error{Op: "SYNTHETIC_SECRET", URL: "SYNTHETIC_SECRET", Err: errors.Join(branches[i], branches[j], branches[k])},
+			} {
+				if got := Family(err); got != "timeout" {
+					t.Fatalf("order %d %d %d: %s", i, j, k, got)
+				}
+				if got := Family(errors.Join(err, context.Canceled)); got != "canceled" {
+					t.Fatalf("cancellation precedence: %s", got)
+				}
+				var logs bytes.Buffer
+				Emit(slog.New(slog.NewJSONHandler(&logs, nil)), Record{Family: Family(err)}, time.Time{})
+				if strings.Contains(logs.String(), "SYNTHETIC_SECRET") {
+					t.Fatal("error text leaked")
+				}
+			}
+		}
+	}
+	if got := Family(errors.Join(branches[0], io.EOF)); got != "truncated_response" {
+		t.Fatalf("non-timeout precedence: %s", got)
+	}
+	if got := Family(errors.Join(branches[0], errors.New("SYNTHETIC_SECRET"))); got != "network" {
+		t.Fatalf("non-timeout network: %s", got)
 	}
 }

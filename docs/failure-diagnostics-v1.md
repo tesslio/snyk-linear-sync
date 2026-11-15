@@ -69,8 +69,14 @@ onto closed allowlists even when callers provide unexpected strings.
   decode/fresh-response validation and v1 ignore validation, SDK List failures,
   and Linear Execute failures are covered. This is not exhaustive coverage of
   every higher-level pagination, acknowledgment or reconciliation validation.
+- Body I/O failures use `response_read`; decode/validation failures use
+  `response_validation`, including incomplete JSON received with clean EOF.
+  A read already reported by the transport body observer is not emitted again
+  by the Snyk response handler. Legacy decoding after a read failure can still
+  produce a separate, genuine validation failure.
 - Wrapped/joined typed errors classify cancellation before timeout, truncation,
-  JSON validation, then network errors. Plain arbitrary errors remain unknown.
+  JSON validation, then network errors, across all branches regardless of order.
+  Plain arbitrary errors remain unknown.
   Some SDK/library errors flatten nested errors into strings; the operation
   record remains unknown rather than guessing. Lower-level transport/read records
   can still supply evidence. Linear typed HTTP and GraphQL failures are classified

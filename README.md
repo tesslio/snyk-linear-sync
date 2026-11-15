@@ -859,3 +859,7 @@ attempt counts and elapsed time. See [the version 1 contract and fixtures](docs/
 Only validated diagnostic objects are suitable for retained evidence; ordinary
 logs and returned errors can contain private values. These records do not change
 retries or establish the final sync outcome.
+
+Body-read failures retain the `response_read` phase, separate from decode and
+validation failures. Joined error branches preserve cancellation and timeout
+precedence regardless of branch order.
