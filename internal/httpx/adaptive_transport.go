@@ -13,7 +13,9 @@ import (
 	"github.com/tesslio/snyk-linear-sync/internal/diagnostic"
 )
 
-const defaultBackoff = 2 * time.Second
+// defaultBackoff is the first retry delay; it doubles per attempt. A
+// variable so tests can shorten it.
+var defaultBackoff = 2 * time.Second
 
 type AdaptiveTransport struct {
 	name   string
@@ -93,7 +95,12 @@ func (t *AdaptiveTransport) RoundTrip(req *http.Request) (response *http.Respons
 			t.noteBlock(delay)
 		}
 
-		if !shouldRetry(resp.StatusCode) && !isRequestRateLimitedResponse(resp) {
+		// Only retryable statuses are retried. A "no requests remaining"
+		// header on a successful response must not cause a re-send: the
+		// request that used the last unit of the window succeeded, and
+		// re-sending a mutation would duplicate it. Its only effect is the
+		// noteBlock above, which delays the next request.
+		if !shouldRetry(resp.StatusCode) {
 			return resp, nil
 		}
 
@@ -195,19 +202,6 @@ func canRetry(req *http.Request) bool {
 
 func shouldRetry(status int) bool {
 	return status == http.StatusTooManyRequests || status == http.StatusBadGateway || status == http.StatusServiceUnavailable || status == http.StatusGatewayTimeout
-}
-
-func isRequestRateLimitedResponse(resp *http.Response) bool {
-	if resp == nil {
-		return false
-	}
-
-	if resp.StatusCode == http.StatusTooManyRequests {
-		return true
-	}
-
-	_, limited := requestLimitDelay(resp.Header)
-	return limited
 }
 
 func retryAfter(header http.Header, attempt int) time.Duration {
