@@ -293,6 +293,8 @@ Due dates are normally derived from the Snyk issue creation timestamp, not from 
 
 Issues ignored "until fix is available" have no due date. The SLA clock is paused while the issue is blocked on an upstream fix. When a fix becomes available, Snyk flips `ignored=false`; the sync records the day it first saw that in its ignore memory, and from then on the due date is that day + severity offset ("fix availability"), so every run computes the same date. An ignore of this kind that reaches its own expiry with no fix is treated as an expired snooze: the expiry stays the base and the reason says so. A revoked ignore until fix available is dated the same way as a fix arrival, from the day the sync first saw it un-ignored.
 
+A finding whose `updated_at` is more than its SLA window after `created_at` is dated from `updated_at` instead (Snyk reuses an issue for a later occurrence and keeps the original `created_at`). Because routine re-scans also move `updated_at`, a ticket that already has a due date keeps it while this base applies. The exception is a ticket the sync reopens after cancelling it for a permanent ignore: when Snyk stops reporting the ignore, the reopened ticket takes the date a new ticket would get, since nobody was expected to act while the finding was ignored. The check reads the ticket itself (configured Cancelled state, and the `Status` line the sync last wrote), so a ticket closed by a person or another automation keeps its date when it is reopened.
+
 Every base is taken as a UTC calendar date, so the result does not depend on the host's time zone.
 
 Default offsets:

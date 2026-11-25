@@ -5712,6 +5712,91 @@ func TestRunReopensTicketClosedWhileSnykStillReportsOpen(t *testing.T) {
 	}
 }
 
+// TestRunReopenAfterPermanentIgnoreEndsRestartsDueDate covers a finding that
+// outlived its SLA window while Snyk reported it as permanently ignored. When
+// the ignore ends, the reopened ticket must be dated like the fresh ticket it
+// stands in for, not keep the date it had before the ignore, which would
+// reopen it already overdue. A ticket closed by hand keeps its date, so
+// closing an overdue ticket never buys a new deadline.
+func TestRunReopenAfterPermanentIgnoreEndsRestartsDueDate(t *testing.T) {
+	created := time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)
+	closed := time.Date(2026, time.January, 10, 0, 0, 0, 0, time.UTC)
+	const oldDueDate = "2026-01-31" // created_at + the 30-day high SLA
+	const newDueDate = "2026-07-01" // updated_at + the 30-day high SLA
+
+	open := model.Finding{
+		Fingerprint:  model.Fingerprint("project-a", "issue-1", "src/app.py"),
+		SnykIssueID:  "issue-1",
+		SnykIssueKey: "SNYK-100",
+		ProjectID:    "project-a",
+		ProjectName:  "owner/repo(main)",
+		IssueTitle:   "Path Traversal",
+		Severity:     "high",
+		Status:       model.FindingOpen,
+		CreatedAt:    created,
+		UpdatedAt:    time.Date(2026, time.June, 1, 0, 0, 0, 0, time.UTC),
+	}
+	ignored := open
+	ignored.Status = model.FindingIgnored
+
+	for _, tc := range []struct {
+		name        string
+		stateName   string
+		lastWritten model.Finding
+		wantDueDate string
+		wantChanged bool
+	}{
+		{name: "cancelled by the sync for a permanent ignore", stateName: "Cancelled", lastWritten: ignored, wantDueDate: newDueDate, wantChanged: true},
+		{name: "cancelled by hand while open", stateName: "Cancelled", lastWritten: open, wantDueDate: oldDueDate},
+		{name: "marked done by hand while open", stateName: "Done", lastWritten: open, wantDueDate: oldDueDate},
+		{name: "ignored ticket moved to done by hand", stateName: "Done", lastWritten: ignored, wantDueDate: oldDueDate},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := minimalCfg()
+			existing := storedIssue("existing-1", "SNYK-500", tc.stateName, desiredIssue(cfg, tc.lastWritten))
+			existing.DueDate = oldDueDate
+			existing.CreatedAt = &created
+			existing.ClosedAt = &closed
+			linear := &fakeLinear{snapshot: []model.ExistingIssue{existing}}
+			snyk := fakeSnyk{snapshot: model.SnykSnapshot{
+				Findings:   []model.Finding{open},
+				ProjectIDs: map[string]struct{}{"project-a": {}},
+			}}
+
+			result, err := New(cfg, discardLogger(), snyk, linear, nil).Run(context.Background())
+			if err != nil {
+				t.Fatalf("Run() error = %v", err)
+			}
+			if len(linear.created) != 0 || result.Reopened != 1 || len(linear.updates) != 1 {
+				t.Fatalf("created = %d, reopened = %d, updates = %d, want 0, 1, 1", len(linear.created), result.Reopened, len(linear.updates))
+			}
+			u := linear.updates[0]
+			if u.Desired.DueDate != tc.wantDueDate || u.Diff.DueDateChanged != tc.wantChanged {
+				t.Fatalf("due date = %q (changed %v), want %q (changed %v); reason %q", u.Desired.DueDate, u.Diff.DueDateChanged, tc.wantDueDate, tc.wantChanged, u.Desired.DueDateReason)
+			}
+
+			// Next run: the ticket is open again and the date must hold, even
+			// though a routine re-scan moved updated_at.
+			rescanned := open
+			rescanned.UpdatedAt = open.UpdatedAt.AddDate(0, 0, 1)
+			reopened := storedIssue("existing-1", "SNYK-500", "Todo", u.Desired)
+			reopened.CreatedAt = &created
+			linear2 := &fakeLinear{snapshot: []model.ExistingIssue{reopened}}
+			snyk2 := fakeSnyk{snapshot: model.SnykSnapshot{
+				Findings:   []model.Finding{rescanned},
+				ProjectIDs: map[string]struct{}{"project-a": {}},
+			}}
+			result2, err := New(cfg, discardLogger(), snyk2, linear2, nil).Run(context.Background())
+			if err != nil {
+				t.Fatalf("run 2: Run() error = %v", err)
+			}
+			if result2.PlannedUpdates != 0 || len(linear2.updates) != 0 {
+				t.Fatalf("run 2: PlannedUpdates = %d, updates = %d, want none (due date must not churn)", result2.PlannedUpdates, len(linear2.updates))
+			}
+		})
+	}
+}
+
 func TestRunDoesNotReopenClosedTicketWhenUnsafe(t *testing.T) {
 	created := time.Date(2026, time.August, 1, 0, 0, 0, 0, time.UTC)
 	closed := time.Date(2026, time.September, 1, 0, 0, 0, 0, time.UTC)

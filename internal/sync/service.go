@@ -595,7 +595,18 @@ func (s *Service) Run(ctx context.Context) (result RunResult, runErr error) {
 			// already has a due date, keep it fixed instead of re-deriving it
 			// from a moving updated_at. A ticket that never had a due date
 			// set still gets one (the condition below is false).
-			if desired.DueDateUsedUpdatedAtFallback && existing.DueDate != "" {
+			//
+			// A ticket reopened because a permanent ignore ended is the
+			// exception. The reopen stands in for the fresh ticket the sync
+			// would otherwise create, and that ticket would be dated from
+			// the re-detection. The date the ticket kept from before the
+			// ignore says nothing about the time the team has had to act:
+			// nobody was expected to while Snyk reported the finding as
+			// ignored. Keeping it would reopen the ticket already overdue.
+			// Once reopened, the ticket is open again and the new date is
+			// held by this same rule on later runs.
+			ignoreEnded := desired.Reopen && kind == matchExact && closedForPermanentIgnore(existing, s.cfg.Linear.States)
+			if desired.DueDateUsedUpdatedAtFallback && existing.DueDate != "" && !ignoreEnded {
 				desired.DueDate = existing.DueDate
 				desired.DueDateBase = existing.DueDate
 				desired.DueDateReason = "kept existing due date to avoid churn from Snyk updated_at re-detection"
@@ -1369,6 +1380,38 @@ func storedCluster(description string) string {
 		}
 	}
 	return ""
+}
+
+// storedStatus returns the Snyk status a ticket's description already shows
+// (the "Status: `...`" line the sync renders above the metadata block), or
+// "" when it shows none.
+func storedStatus(description string) string {
+	if start := findMetadataBlockStart(description); start >= 0 {
+		description = description[:start]
+	}
+	for line := range strings.SplitSeq(description, "\n") {
+		rest, ok := strings.CutPrefix(strings.TrimSpace(line), "Status: `")
+		if !ok {
+			continue
+		}
+		if value, _, ok := strings.Cut(rest, "`"); ok {
+			return markdownEscapePattern.ReplaceAllString(value, "$1")
+		}
+	}
+	return ""
+}
+
+// closedForPermanentIgnore reports whether the sync itself cancelled a ticket
+// because Snyk reported its finding as permanently ignored: the ticket is in
+// the configured Cancelled state and the description the sync last wrote
+// shows that status. A ticket closed by a person or another automation keeps
+// the status of the open finding it was tracking, so closing a ticket by hand
+// never qualifies.
+func closedForPermanentIgnore(existing model.ExistingIssue, states config.StateConfig) bool {
+	if model.NormalizeWorkflowStateName(existing.StateName) != model.NormalizeWorkflowStateName(states.Cancelled) {
+		return false
+	}
+	return storedStatus(existing.Description) == statusDisplayName(model.FindingIgnored)
 }
 
 // issueDescriptionWithIdentity renders the managed description with an
